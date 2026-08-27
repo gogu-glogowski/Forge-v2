@@ -13,6 +13,7 @@ forge-core = { path = "../forge-core" }
 forge-doctor = { path = "../forge-doctor" }
 forge-domain = { path = "../forge-domain" }
 forge-hardware = { path = "../forge-hardware" }
+forge-images = { path = "../forge-images" }
 forge-libvirt = { path = "../forge-libvirt" }
 forge-profiles = { path = "../forge-profiles" }
 forge-storage = { path = "../forge-storage" }

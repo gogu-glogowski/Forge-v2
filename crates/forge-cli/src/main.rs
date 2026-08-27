@@ -37,11 +37,100 @@ fn main() -> ExitCode {
         ["vm", "define", "fedora-lab"] => define_vm(false),
         ["vm", "define", "fedora-lab", "--dry-run"] => define_vm(true),
         ["domain", "render", profile_name] => render_domain(profile_name),
+        ["image", "list"] => image_list(),
+        ["image", "inspect", "fedora"] => image_inspect(),
+        ["image", "fetch", "fedora"] => image_fetch(),
         _ => {
             print_usage();
             ExitCode::from(2)
         }
     }
+}
+
+fn image_directories() -> Result<forge_images::ImageDirectories, ExitCode> {
+    forge_images::default_directories().ok_or_else(|| {
+        eprintln!("cannot determine Forge image directories: HOME is unavailable");
+        ExitCode::from(2)
+    })
+}
+
+fn image_list() -> ExitCode {
+    let Ok(directories) = image_directories() else {
+        return ExitCode::from(2);
+    };
+    match forge_images::list(&directories) {
+        Ok(images) => {
+            println!("DISTRO\tRELEASE\tARCH\tSTATUS");
+            for image in images {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    image.distro, image.release, image.architecture, image.status
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("image listing failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn image_inspect() -> ExitCode {
+    let Ok(directories) = image_directories() else {
+        return ExitCode::from(2);
+    };
+    match forge_images::inspect(&directories) {
+        Ok(metadata) => {
+            print_image_metadata(&metadata);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("image inspection failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn image_fetch() -> ExitCode {
+    let Ok(directories) = image_directories() else {
+        return ExitCode::from(2);
+    };
+    println!("Fetching official Fedora Cloud Base 44 x86_64 image...");
+    let mut fetcher = forge_images::SystemArtifactFetcher;
+    match forge_images::fetch_fedora(&directories, &mut fetcher) {
+        Ok(metadata) => {
+            print_image_metadata(&metadata);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Fedora image fetch failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn print_image_metadata(metadata: &forge_images::ImageMetadata) {
+    println!("Distro: {}", metadata.distro);
+    println!("Release: {}", metadata.release);
+    println!("Architecture: {}", metadata.architecture);
+    println!("Source: {}", metadata.source_url);
+    println!("Local path: {}", metadata.local_path.display());
+    println!(
+        "Expected SHA-256: {}",
+        metadata.expected_checksum.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "Actual SHA-256: {}",
+        metadata.actual_checksum.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "Verified at: {}",
+        metadata
+            .verified_at_unix_seconds
+            .map_or_else(|| "never".to_owned(), |value| value.to_string())
+    );
+    println!("Status: {}", metadata.status);
 }
 
 fn define_vm(dry_run: bool) -> ExitCode {
@@ -270,6 +359,9 @@ fn print_usage() {
     eprintln!("  forge vm list");
     eprintln!("  forge vm define fedora-lab [--dry-run]");
     eprintln!("  forge domain render fedora-lab");
+    eprintln!("  forge image list");
+    eprintln!("  forge image inspect fedora");
+    eprintln!("  forge image fetch fedora");
 }
 
 fn print_report(report: &DoctorReport) {
