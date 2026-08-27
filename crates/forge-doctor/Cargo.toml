@@ -1,0 +1,13 @@
+[package]
+name = "forge-doctor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-core = { path = "../forge-core" }
+forge-hardware = { path = "../forge-hardware" }
+forge-host = { path = "../forge-host" }
+
+[lints]
+workspace = true
