@@ -3,7 +3,7 @@ use super::{
     ReconciliationStatus, ResourceRole, STATE_DIRECTORY_MODE, STATE_FILE_MODE, StateError,
     read_manifest, reconcile, write_manifest_atomic,
 };
-use forge_core::InstanceName;
+use forge_core::{FirstBootSuccessPolicy, InstanceName};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
@@ -477,13 +477,47 @@ pub fn execute_managed_recovery(
 }
 
 fn validate_recovery_health(health: &RecoveryObservability) -> Result<(), StateError> {
+    validate_recovery_evidence(
+        &FirstBootSuccessPolicy::CloudInitManaged {
+            expected_user: "forge".to_owned(),
+            require_guest_agent: true,
+        },
+        &InstanceName::new("fedora-lab").expect("compatibility identity is valid"),
+        health,
+    )
+}
+
+/// Validates fresh guest evidence according to the selected profile policy.
+/// Storage and domain identity checks remain mandatory in the surrounding recovery plan.
+///
+/// # Errors
+///
+/// Refuses incomplete evidence required by the selected success policy.
+pub fn validate_recovery_evidence(
+    policy: &FirstBootSuccessPolicy,
+    instance: &InstanceName,
+    health: &RecoveryObservability,
+) -> Result<(), StateError> {
+    if matches!(policy, FirstBootSuccessPolicy::ManualGuest) {
+        return Ok(());
+    }
     if !health.domain_running {
         return recovery_refusal("domain is not running");
+    }
+    if matches!(policy, FirstBootSuccessPolicy::BootOnly) {
+        return Ok(());
     }
     if health.ip_address.is_none() {
         return recovery_refusal("typed IP discovery is incomplete");
     }
-    if !health.qga_channel || !health.qga_available {
+    let FirstBootSuccessPolicy::CloudInitManaged {
+        expected_user,
+        require_guest_agent,
+    } = policy
+    else {
+        unreachable!("manual and boot-only policies returned above")
+    };
+    if *require_guest_agent && (!health.qga_channel || !health.qga_available) {
         return recovery_refusal("QGA channel and successful guest-ping are required");
     }
     if !health.ssh_host_identity_verified {
@@ -496,10 +530,10 @@ fn validate_recovery_health(health: &RecoveryObservability) -> Result<(), StateE
         return recovery_refusal("cloud-init is not Done");
     }
     if !health.forge_user_confirmed {
-        return recovery_refusal("forge user identity is not confirmed");
+        return recovery_refusal(&format!("expected user {expected_user} is not confirmed"));
     }
-    if health.hostname.as_deref() != Some("fedora-lab") {
-        return recovery_refusal("guest hostname is not fedora-lab");
+    if health.hostname.as_deref() != Some(instance.as_str()) {
+        return recovery_refusal("guest hostname does not match the instance identity");
     }
     Ok(())
 }
@@ -645,20 +679,16 @@ pub fn plan_managed_rebuild(
             "a Preparing generation already requires recovery".to_owned(),
         ));
     }
-    let token = generation_id.strip_prefix("gen-").ok_or_else(|| {
-        StateError::InvalidObservedState("generation ID is not a Forge UUID v4 identity".to_owned())
+    let instance = InstanceName::new(&index.domain_name).map_err(|error| {
+        StateError::InvalidObservedState(format!("invalid managed instance identity: {error}"))
     })?;
-    let uuid = uuid::Uuid::parse_str(token)
-        .map_err(|_| StateError::InvalidObservedState("generation ID is not a UUID".to_owned()))?;
-    if uuid.get_version_num() != 4 {
-        return Err(StateError::InvalidObservedState(
-            "generation ID is not UUID v4".to_owned(),
-        ));
-    }
-    let overlay_name = format!("fedora-lab-{token}.qcow2");
-    let seed_name = format!("fedora-lab-{token}-seed.iso");
+    let resources = plan_generation_resources(&instance, generation_id, true)?;
+    let overlay_name = resources.overlay;
+    let seed_name = resources.seed.ok_or_else(|| {
+        StateError::InvalidObservedState("managed NoCloud rebuild requires a seed".to_owned())
+    })?;
     Ok(ManagedRebuildPlan {
-        generation_id,
+        generation_id: resources.generation_id,
         overlay_path: format!("{pool_path}/{overlay_name}"),
         seed_path: format!("{pool_path}/{seed_name}"),
         overlay_name,
@@ -679,6 +709,34 @@ pub fn plan_managed_rebuild(
             "failed first boot: preserve the previous generation and never cleanup it".to_owned(),
         ],
         mutation: false,
+    })
+}
+
+/// Produces exact generation-scoped names without inspecting or mutating libvirt.
+///
+/// # Errors
+///
+/// Refuses generation identities that are not Forge-prefixed UUID v4 values.
+pub fn plan_generation_resources(
+    instance: &InstanceName,
+    generation_id: String,
+    needs_seed: bool,
+) -> Result<forge_core::GenerationResourceNames, StateError> {
+    let token = generation_id.strip_prefix("gen-").ok_or_else(|| {
+        StateError::InvalidObservedState("generation ID is not a Forge UUID v4 identity".to_owned())
+    })?;
+    let uuid = uuid::Uuid::parse_str(token)
+        .map_err(|_| StateError::InvalidObservedState("generation ID is not a UUID".to_owned()))?;
+    if uuid.get_version_num() != 4 {
+        return Err(StateError::InvalidObservedState(
+            "generation ID is not UUID v4".to_owned(),
+        ));
+    }
+    let prefix = format!("{}-{token}", instance.as_str());
+    Ok(forge_core::GenerationResourceNames {
+        generation_id,
+        overlay: format!("{prefix}.qcow2"),
+        seed: needs_seed.then(|| format!("{prefix}-seed.iso")),
     })
 }
 
@@ -2066,5 +2124,56 @@ mod tests {
         assert!(execute_cleanup_candidate(&mut backend, &plan, &plan.candidates[0]).is_err());
         assert!(backend.deletes.is_empty());
         assert!(backend.durable.cleanup_progress.is_empty());
+    }
+
+    #[test]
+    fn generation_resource_names_use_instance_identity_and_optional_role() {
+        let id = "gen-123e4567-e89b-42d3-a456-426614174000".to_owned();
+        let first =
+            plan_generation_resources(&InstanceName::new("factory-one").unwrap(), id.clone(), true)
+                .unwrap();
+        let second =
+            plan_generation_resources(&InstanceName::new("factory-two").unwrap(), id, false)
+                .unwrap();
+        assert!(first.overlay.starts_with("factory-one-"));
+        assert!(first.seed.unwrap().starts_with("factory-one-"));
+        assert!(second.overlay.starts_with("factory-two-"));
+        assert!(second.seed.is_none());
+    }
+
+    #[test]
+    fn recovery_guest_evidence_is_selected_by_profile_policy() {
+        let instance = InstanceName::new("manual-one").unwrap();
+        let empty = RecoveryObservability {
+            domain_running: false,
+            ip_address: None,
+            qga_channel: false,
+            qga_available: false,
+            ssh_host_identity_verified: false,
+            ssh_host_identity: None,
+            ssh_authenticated: false,
+            cloud_init_done: false,
+            forge_user_confirmed: false,
+            hostname: None,
+        };
+        assert!(
+            validate_recovery_evidence(&FirstBootSuccessPolicy::ManualGuest, &instance, &empty)
+                .is_ok()
+        );
+        assert!(
+            validate_recovery_evidence(&FirstBootSuccessPolicy::BootOnly, &instance, &empty)
+                .is_err()
+        );
+        assert!(
+            validate_recovery_evidence(
+                &FirstBootSuccessPolicy::CloudInitManaged {
+                    expected_user: "forge".to_owned(),
+                    require_guest_agent: true,
+                },
+                &instance,
+                &empty
+            )
+            .is_err()
+        );
     }
 }

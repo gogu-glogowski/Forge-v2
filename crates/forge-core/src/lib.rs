@@ -266,6 +266,20 @@ pub enum ProvisioningPolicy {
     None,
 }
 
+/// Evidence required before a newly created generation may become Active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirstBootSuccessPolicy {
+    /// Boot and require the complete managed cloud-init observation flow.
+    CloudInitManaged {
+        expected_user: String,
+        require_guest_agent: bool,
+    },
+    /// Boot and prove only that the domain reached the running state.
+    BootOnly,
+    /// Define a persistent guest for explicit operation through tools such as Virt-Manager.
+    ManualGuest,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkPolicy {
     DefaultNat,
@@ -308,9 +322,17 @@ pub struct VmProfile {
     pub image_source: ImageSourcePolicy,
     pub image_verification: ImageVerificationPolicy,
     pub provisioning: ProvisioningPolicy,
+    pub first_boot_success: FirstBootSuccessPolicy,
     pub network_policy: NetworkPolicy,
     pub graphics_policy: GraphicsPolicy,
     pub persistence: PersistencePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationResourceNames {
+    pub generation_id: String,
+    pub overlay: String,
+    pub seed: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

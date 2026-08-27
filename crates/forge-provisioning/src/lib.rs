@@ -1404,6 +1404,7 @@ mod tests {
             },
             image_verification: forge_core::ImageVerificationPolicy::Sha256Digest,
             provisioning: ProvisioningPolicy::None,
+            first_boot_success: forge_core::FirstBootSuccessPolicy::ManualGuest,
             network_policy: NetworkPolicy::Isolated,
             graphics_policy: forge_core::GraphicsPolicy::Virtual,
             persistence: PersistencePolicy::Persistent,
@@ -1429,6 +1430,10 @@ mod tests {
         profile.provisioning = ProvisioningPolicy::NoCloud {
             default_user: "forge".to_owned(),
             guest_agent: true,
+        };
+        profile.first_boot_success = forge_core::FirstBootSuccessPolicy::CloudInitManaged {
+            expected_user: "forge".to_owned(),
+            require_guest_agent: true,
         };
         profile.network_policy = NetworkPolicy::DefaultNat;
         assert_eq!(

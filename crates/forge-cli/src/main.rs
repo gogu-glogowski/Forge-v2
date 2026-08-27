@@ -38,6 +38,9 @@ fn main() -> ExitCode {
         ["profile", "show", profile_name] => show_profile(profile_name),
         ["profile", "plan", profile_name] => plan_profile(profile_name),
         ["vm", "plan", profile_name, instance_name] => plan_instance(profile_name, instance_name),
+        ["vm", "create", profile_name, instance_name, "--dry-run"] => {
+            create_vm_dry_run(profile_name, instance_name)
+        }
         ["hypervisor", "info"] => hypervisor_info(),
         ["vm", "list"] => vm_list(),
         ["vm", "status", instance] => lifecycle_status(instance),
@@ -2453,6 +2456,7 @@ fn show_profile(profile_name: &str) -> ExitCode {
     println!("Image source: {:?}", profile.image_source);
     println!("Image verification: {:?}", profile.image_verification);
     println!("Provisioning: {:?}", profile.provisioning);
+    println!("First-boot success: {:?}", profile.first_boot_success);
     println!("Network: {:?}", profile.network_policy);
     println!("Graphics: {:?}", profile.graphics_policy);
     println!("Persistence: {:?}", profile.persistence);
@@ -2536,6 +2540,129 @@ fn plan_instance(profile_name: &str, instance_name: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn create_vm_dry_run(profile_name: &str, instance_name: &str) -> ExitCode {
+    let Some(profile) = forge_profiles::find(profile_name) else {
+        eprintln!("unknown VM profile: {profile_name}");
+        return ExitCode::from(2);
+    };
+    let instance = match InstanceName::new(instance_name) {
+        Ok(instance) => instance,
+        Err(error) => {
+            eprintln!("invalid instance name: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let hardware = match forge_hardware::collect() {
+        Ok(hardware) => hardware,
+        Err(error) => {
+            eprintln!("hardware detection failed: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let identity = forge_profiles::InstanceIdentity {
+        name: instance.clone(),
+        profile_id: profile.id.clone(),
+    };
+    let instance_plan = match forge_profiles::plan_instance(&hardware, &profile, identity) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("cannot plan instance creation: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if matches!(
+        instance_plan.lifecycle,
+        forge_profiles::LifecyclePlan::DisposableUnimplemented
+    ) {
+        eprintln!("refusing create: disposable lifecycle is explicitly unimplemented");
+        return ExitCode::from(1);
+    }
+    let generation_id = forge_state::new_generation_id();
+    let needs_seed = matches!(
+        profile.provisioning,
+        forge_core::ProvisioningPolicy::NoCloud { .. }
+    );
+    let generation =
+        match forge_state::plan_generation_resources(&instance, generation_id, needs_seed) {
+            Ok(plan) => plan,
+            Err(error) => {
+                eprintln!("cannot plan generation resources: {error}");
+                return ExitCode::from(1);
+            }
+        };
+    let plan = match forge_profiles::plan_create(instance_plan, generation) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("cannot assemble creation plan: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let disk_path = format!("/var/lib/libvirt/images/{}", plan.generation.overlay);
+    let domain = match forge_domain::profile_spec(
+        &profile,
+        &plan.instance.resources,
+        forge_domain::DomainMetadata {
+            name: instance.to_string(),
+            disk_path,
+        },
+    ) {
+        Ok(domain) => domain,
+        Err(error) => {
+            eprintln!("cannot build domain creation plan: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    print_create_plan(&plan, &domain);
+    ExitCode::SUCCESS
+}
+
+fn print_create_plan(plan: &forge_profiles::GenericCreatePlan, domain: &forge_domain::DomainSpec) {
+    println!("Mode: create dry-run (zero mutation)");
+    println!("Profile: {}", plan.instance.identity.profile_id);
+    println!("Instance identity: {}", plan.instance.identity.name);
+    println!(
+        "Generation identity plan: {}",
+        plan.generation.generation_id
+    );
+    println!(
+        "Image plan: source {:?}, verification {:?}, format {:?}, prepared base {}",
+        plan.prepared_base.source,
+        plan.prepared_base.verification,
+        plan.prepared_base.source_format,
+        plan.prepared_base.base_volume_name
+    );
+    println!(
+        "Storage plan: overlay {}, capacity {} GiB",
+        plan.generation.overlay,
+        plan.instance.resources.disk_bytes / 1024 / 1024 / 1024
+    );
+    println!(
+        "Seed plan: {}",
+        plan.generation.seed.as_deref().unwrap_or("none")
+    );
+    println!(
+        "Domain plan: persistent {} ({:?}, {:?})",
+        domain.name, domain.firmware, domain.machine
+    );
+    println!("Provisioning plan: {:?}", plan.instance.provisioning);
+    println!(
+        "First-boot success policy: {:?}",
+        plan.instance.first_boot_success
+    );
+    println!("Automatic first boot: {}", plan.auto_boot);
+    println!("Required observations: {:?}", plan.observations);
+    println!("Initial generation state: {}", plan.initial_state);
+    println!("Creation transaction:");
+    for step in &plan.steps {
+        println!("  - {step}");
+    }
+    println!(
+        "State path: ~/.local/share/forge/state/{}/",
+        plan.instance.identity.name
+    );
+    println!("Mutation: {}", plan.mutation);
+}
+
 fn print_plan(profile_name: &str, plan: VmResourcePlan) {
     const GIB: u64 = 1024 * 1024 * 1024;
     println!("Profile: {profile_name}");
@@ -2557,6 +2684,7 @@ fn print_usage() {
     eprintln!("  forge hypervisor info");
     eprintln!("  forge vm list");
     eprintln!("  forge vm status fedora-lab");
+    eprintln!("  forge vm create <profile> <instance> --dry-run");
     eprintln!("  forge vm cleanup fedora-lab --dry-run");
     eprintln!("  forge vm start fedora-lab [--dry-run]");
     eprintln!("  forge vm shutdown fedora-lab [--dry-run]");

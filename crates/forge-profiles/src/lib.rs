@@ -1,10 +1,11 @@
 //! Built-in VM profiles and pure resource planning.
 
 use forge_core::{
-    FirmwareMachinePolicy, GpuMode, GraphicsPolicy, GuestArchitecture, GuestFamily,
-    GuestProfileKind, HardwareInfo, ImageSourcePolicy, ImageVerificationPolicy, InstanceKind,
-    InstanceName, NetworkMode, NetworkPolicy, PersistencePolicy, ProfileId, ProvisioningPolicy,
-    ResourcePlanError, VmProfile, VmResourcePlan, VmResources,
+    FirmwareMachinePolicy, FirstBootSuccessPolicy, GenerationResourceNames, GpuMode,
+    GraphicsPolicy, GuestArchitecture, GuestFamily, GuestProfileKind, HardwareInfo,
+    ImageSourcePolicy, ImageVerificationPolicy, InstanceKind, InstanceName, NetworkMode,
+    NetworkPolicy, PersistencePolicy, ProfileId, ProvisioningPolicy, ResourcePlanError, VmProfile,
+    VmResourcePlan, VmResources,
 };
 use std::fmt;
 
@@ -66,6 +67,10 @@ pub fn fedora_lab() -> VmProfile {
             default_user: "forge".to_owned(),
             guest_agent: true,
         },
+        FirstBootSuccessPolicy::CloudInitManaged {
+            expected_user: "forge".to_owned(),
+            require_guest_agent: true,
+        },
     )
 }
 
@@ -96,6 +101,7 @@ pub fn luna_dev_fedora() -> VmProfile {
             verification: ImageVerificationPolicy::SignedSha256Checksums,
         },
         ProvisioningPolicy::None,
+        FirstBootSuccessPolicy::ManualGuest,
     )
 }
 
@@ -126,6 +132,7 @@ pub fn luna_lab_fedora() -> VmProfile {
             verification: ImageVerificationPolicy::SignedSha256Checksums,
         },
         ProvisioningPolicy::None,
+        FirstBootSuccessPolicy::ManualGuest,
     )
 }
 
@@ -148,6 +155,7 @@ fn profile(
     resources: VmResources,
     image: ImagePolicy,
     provisioning: ProvisioningPolicy,
+    first_boot_success: FirstBootSuccessPolicy,
 ) -> VmProfile {
     VmProfile {
         id: ProfileId::new(metadata.id).expect("built-in profile ID must be valid"),
@@ -161,6 +169,7 @@ fn profile(
         image_source: image.source,
         image_verification: image.verification,
         provisioning,
+        first_boot_success,
         network_policy: NetworkPolicy::DefaultNat,
         graphics_policy: GraphicsPolicy::Virtual,
         persistence: PersistencePolicy::Persistent,
@@ -200,14 +209,53 @@ pub struct InstancePlan {
     pub image: ImagePlan,
     pub storage: StoragePlan,
     pub provisioning: ProvisioningPolicy,
+    pub first_boot_success: FirstBootSuccessPolicy,
     pub network: NetworkPolicy,
     pub graphics: GraphicsPolicy,
     pub lifecycle: LifecyclePlan,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceImageFormat {
+    Qcow2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedBaseImagePlan {
+    pub source: ImageSourcePolicy,
+    pub verification: ImageVerificationPolicy,
+    pub source_format: SourceImageFormat,
+    pub base_volume_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstBootObservation {
+    DomainRunning,
+    DhcpAddress,
+    GuestAgentAvailable,
+    SshAuthenticated,
+    CloudInitDone,
+    ExpectedUserConfirmed,
+    HostnameMatchesInstance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericCreatePlan {
+    pub instance: InstancePlan,
+    pub generation: GenerationResourceNames,
+    pub prepared_base: PreparedBaseImagePlan,
+    pub observations: Vec<FirstBootObservation>,
+    pub auto_boot: bool,
+    pub initial_state: &'static str,
+    pub steps: Vec<&'static str>,
+    pub mutation: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FactoryPlanError {
     ProfileIdentityMismatch,
+    IncompatibleProvisioningPolicy,
+    GenerationResourceMismatch,
     Resource(ResourcePlanError),
 }
 
@@ -217,6 +265,11 @@ impl fmt::Display for FactoryPlanError {
             Self::ProfileIdentityMismatch => {
                 formatter.write_str("instance profile identity does not match selected profile")
             }
+            Self::IncompatibleProvisioningPolicy => formatter
+                .write_str("first-boot success policy is incompatible with provisioning policy"),
+            Self::GenerationResourceMismatch => formatter.write_str(
+                "generation resource roles do not match the selected provisioning policy",
+            ),
             Self::Resource(error) => error.fmt(formatter),
         }
     }
@@ -236,6 +289,22 @@ pub fn plan_instance(
 ) -> Result<InstancePlan, FactoryPlanError> {
     if identity.profile_id != profile.id {
         return Err(FactoryPlanError::ProfileIdentityMismatch);
+    }
+    if let FirstBootSuccessPolicy::CloudInitManaged {
+        expected_user,
+        require_guest_agent,
+    } = &profile.first_boot_success
+    {
+        let ProvisioningPolicy::NoCloud {
+            default_user,
+            guest_agent,
+        } = &profile.provisioning
+        else {
+            return Err(FactoryPlanError::IncompatibleProvisioningPolicy);
+        };
+        if expected_user != default_user || (*require_guest_agent && !guest_agent) {
+            return Err(FactoryPlanError::IncompatibleProvisioningPolicy);
+        }
     }
     let resources = plan(hardware, profile).map_err(FactoryPlanError::Resource)?;
     let instance = identity.name.to_string();
@@ -264,9 +333,84 @@ pub fn plan_instance(
             capacity_bytes: resources.disk_bytes,
         },
         provisioning: profile.provisioning.clone(),
+        first_boot_success: profile.first_boot_success.clone(),
         network: profile.network_policy,
         graphics: profile.graphics_policy,
         lifecycle,
+    })
+}
+
+/// Extends an instance plan with generation-scoped creation and success policy.
+/// The caller supplies names validated by the durable generation subsystem.
+///
+/// # Errors
+///
+/// Refuses a seed role that disagrees with the selected provisioning policy.
+pub fn plan_create(
+    instance: InstancePlan,
+    generation: GenerationResourceNames,
+) -> Result<GenericCreatePlan, FactoryPlanError> {
+    let seed_required = matches!(instance.provisioning, ProvisioningPolicy::NoCloud { .. });
+    if seed_required != generation.seed.is_some() {
+        return Err(FactoryPlanError::GenerationResourceMismatch);
+    }
+    let (auto_boot, observations) = match &instance.first_boot_success {
+        FirstBootSuccessPolicy::CloudInitManaged {
+            require_guest_agent,
+            ..
+        } => {
+            let mut required = vec![
+                FirstBootObservation::DomainRunning,
+                FirstBootObservation::DhcpAddress,
+            ];
+            if *require_guest_agent {
+                required.push(FirstBootObservation::GuestAgentAvailable);
+            }
+            required.extend([
+                FirstBootObservation::SshAuthenticated,
+                FirstBootObservation::CloudInitDone,
+                FirstBootObservation::ExpectedUserConfirmed,
+                FirstBootObservation::HostnameMatchesInstance,
+            ]);
+            (true, required)
+        }
+        FirstBootSuccessPolicy::BootOnly => (true, vec![FirstBootObservation::DomainRunning]),
+        FirstBootSuccessPolicy::ManualGuest => (false, Vec::new()),
+    };
+    let mut steps = vec![
+        "acquire source according to image policy",
+        "verify source according to supply-chain policy",
+        "prepare or prove the shared base",
+        "create the generation overlay",
+    ];
+    if seed_required {
+        steps.push("create the generation provisioning seed");
+    }
+    steps.extend([
+        "persist exact Preparing ownership",
+        "define the persistent domain",
+    ]);
+    if auto_boot {
+        steps.extend([
+            "boot according to profile policy",
+            "collect only profile-required success evidence",
+        ]);
+    }
+    steps.push("atomically activate the proven generation");
+    Ok(GenericCreatePlan {
+        prepared_base: PreparedBaseImagePlan {
+            source: instance.image.source.clone(),
+            verification: instance.image.verification,
+            source_format: SourceImageFormat::Qcow2,
+            base_volume_name: instance.image.base_volume_name.clone(),
+        },
+        instance,
+        generation,
+        observations,
+        auto_boot,
+        initial_state: "Preparing",
+        steps,
+        mutation: false,
     })
 }
 
@@ -464,6 +608,7 @@ mod tests {
         };
         profile.image_verification = ImageVerificationPolicy::Sha256Digest;
         profile.provisioning = ProvisioningPolicy::None;
+        profile.first_boot_success = FirstBootSuccessPolicy::ManualGuest;
         let plan = plan_instance(
             &hardware(16, 32),
             &profile,
@@ -527,5 +672,107 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, FactoryPlanError::ProfileIdentityMismatch);
+    }
+
+    fn generation(instance: &str, with_seed: bool) -> GenerationResourceNames {
+        GenerationResourceNames {
+            generation_id: "gen-123e4567-e89b-42d3-a456-426614174000".to_owned(),
+            overlay: format!("{instance}-123e4567-e89b-42d3-a456-426614174000.qcow2"),
+            seed: with_seed
+                .then(|| format!("{instance}-123e4567-e89b-42d3-a456-426614174000-seed.iso")),
+        }
+    }
+
+    #[test]
+    fn fedora_create_plan_keeps_full_verified_nocloud_policy() {
+        let profile = fedora_lab();
+        let instance = plan_instance(
+            &hardware(16, 32),
+            &profile,
+            InstanceIdentity {
+                name: InstanceName::new("fedora-factory-test").unwrap(),
+                profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap();
+        let plan = plan_create(instance, generation("fedora-factory-test", true)).unwrap();
+        assert_eq!(
+            plan.prepared_base.verification,
+            ImageVerificationPolicy::SignedSha256Checksums
+        );
+        assert!(matches!(
+            plan.instance.provisioning,
+            ProvisioningPolicy::NoCloud { .. }
+        ));
+        assert!(plan.auto_boot);
+        assert_eq!(plan.observations.len(), 7);
+        assert!(
+            plan.observations
+                .contains(&FirstBootObservation::GuestAgentAvailable)
+        );
+    }
+
+    #[test]
+    fn manual_guest_has_no_seed_boot_or_guest_observations() {
+        let mut profile = fedora_lab();
+        profile.id = ProfileId::new("mock-manual").unwrap();
+        profile.guest_family = GuestFamily::Debian;
+        profile.provisioning = ProvisioningPolicy::None;
+        profile.first_boot_success = FirstBootSuccessPolicy::ManualGuest;
+        let instance = plan_instance(
+            &hardware(16, 32),
+            &profile,
+            InstanceIdentity {
+                name: InstanceName::new("manual-one").unwrap(),
+                profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap();
+        assert!(instance.storage.seed_volume_name.is_none());
+        let plan = plan_create(instance, generation("manual-one", false)).unwrap();
+        assert!(plan.generation.seed.is_none());
+        assert!(!plan.auto_boot);
+        assert!(plan.observations.is_empty());
+    }
+
+    #[test]
+    fn generation_resources_are_isolated_between_instances() {
+        let first = generation("factory-one", true);
+        let second = generation("factory-two", true);
+        assert_ne!(first.overlay, second.overlay);
+        assert_ne!(first.seed, second.seed);
+    }
+
+    #[test]
+    fn create_refuses_seed_role_mismatch_and_incoherent_cloud_policy() {
+        let profile = fedora_lab();
+        let instance = plan_instance(
+            &hardware(16, 32),
+            &profile,
+            InstanceIdentity {
+                name: InstanceName::new("fedora-factory-test").unwrap(),
+                profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plan_create(instance, generation("fedora-factory-test", false)).unwrap_err(),
+            FactoryPlanError::GenerationResourceMismatch
+        );
+
+        let mut invalid = profile;
+        invalid.provisioning = ProvisioningPolicy::None;
+        assert_eq!(
+            plan_instance(
+                &hardware(16, 32),
+                &invalid,
+                InstanceIdentity {
+                    name: InstanceName::new("invalid-cloud").unwrap(),
+                    profile_id: invalid.id.clone(),
+                },
+            )
+            .unwrap_err(),
+            FactoryPlanError::IncompatibleProvisioningPolicy
+        );
     }
 }

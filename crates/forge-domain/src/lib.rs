@@ -483,6 +483,10 @@ mod tests {
                 default_user: "forge".to_owned(),
                 guest_agent: true,
             },
+            first_boot_success: forge_core::FirstBootSuccessPolicy::CloudInitManaged {
+                expected_user: "forge".to_owned(),
+                require_guest_agent: true,
+            },
             network_policy: NetworkPolicy::DefaultNat,
             graphics_policy: GraphicsPolicy::Virtual,
             persistence: PersistencePolicy::Persistent,
