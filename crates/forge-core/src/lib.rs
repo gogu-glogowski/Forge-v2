@@ -94,3 +94,112 @@ pub struct DoctorReport {
     pub host: HostInfo,
     pub notes: Vec<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkMode {
+    Nat,
+    Isolated,
+    NoNetwork,
+    WhonixInternal,
+}
+
+impl fmt::Display for NetworkMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Nat => "nat",
+            Self::Isolated => "isolated",
+            Self::NoNetwork => "none",
+            Self::WhonixInternal => "whonix-internal",
+        };
+        formatter.write_str(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuMode {
+    Virtual,
+}
+
+impl fmt::Display for GpuMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("virtual")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestProfileKind {
+    LunaDevFedora,
+    LunaLabFedora,
+    FedoraLab,
+    DebianClean,
+    KaliLab,
+    TsurugiLab,
+    WhonixGateway,
+    WhonixWorkstation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmResources {
+    pub cpu_ratio_per_mille: u16,
+    pub min_vcpus: usize,
+    pub max_vcpus: usize,
+    pub memory_start_ratio_per_mille: u16,
+    pub memory_max_ratio_per_mille: u16,
+    pub min_memory_bytes: u64,
+    pub host_memory_reserve_bytes: u64,
+    pub disk_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmProfile {
+    pub name: String,
+    pub kind: GuestProfileKind,
+    pub resources: VmResources,
+    pub network: NetworkMode,
+    pub gpu: GpuMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmResourcePlan {
+    pub vcpus: usize,
+    pub memory_start_bytes: u64,
+    pub memory_max_bytes: u64,
+    pub disk_bytes: u64,
+    pub network: NetworkMode,
+    pub gpu: GpuMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourcePlanError {
+    InsufficientCpu {
+        available: usize,
+        required: usize,
+    },
+    InsufficientMemory {
+        available_bytes: u64,
+        required_bytes: u64,
+    },
+}
+
+impl fmt::Display for ResourcePlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InsufficientCpu {
+                available,
+                required,
+            } => write!(
+                formatter,
+                "host has {available} logical CPUs, profile requires at least {required}"
+            ),
+            Self::InsufficientMemory {
+                available_bytes,
+                required_bytes,
+            } => write!(
+                formatter,
+                "host has {available_bytes} bytes available after reserve, profile requires at least {required_bytes}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResourcePlanError {}

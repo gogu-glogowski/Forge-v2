@@ -1,10 +1,16 @@
-use forge_core::{DoctorReport, HostState};
+use forge_core::{DoctorReport, HostState, VmResourcePlan};
 use std::env;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    if let Some("doctor") = env::args().nth(1).as_deref() {
-        match forge_doctor::run() {
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    match arguments
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["doctor"] => match forge_doctor::run() {
             Ok(report) => {
                 print_report(&report);
                 if matches!(report.state, HostState::Ready | HostState::Degraded) {
@@ -17,11 +23,61 @@ fn main() -> ExitCode {
                 eprintln!("forge doctor failed: {error}");
                 ExitCode::from(2)
             }
+        },
+        ["profile", "list"] => {
+            for profile in forge_profiles::built_in_profiles() {
+                println!("{}", profile.name);
+            }
+            ExitCode::SUCCESS
         }
-    } else {
-        eprintln!("Usage: forge doctor");
-        ExitCode::from(2)
+        ["profile", "plan", profile_name] => plan_profile(profile_name),
+        _ => {
+            print_usage();
+            ExitCode::from(2)
+        }
     }
+}
+
+fn plan_profile(profile_name: &str) -> ExitCode {
+    let Some(profile) = forge_profiles::find(profile_name) else {
+        eprintln!("unknown VM profile: {profile_name}");
+        return ExitCode::from(2);
+    };
+    let hardware = match forge_hardware::collect() {
+        Ok(hardware) => hardware,
+        Err(error) => {
+            eprintln!("hardware detection failed: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    match forge_profiles::plan(&hardware, &profile) {
+        Ok(plan) => {
+            print_plan(profile_name, plan);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("cannot plan profile {profile_name}: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn print_plan(profile_name: &str, plan: VmResourcePlan) {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    println!("Profile: {profile_name}");
+    println!("vCPU: {}", plan.vcpus);
+    println!("RAM start: {} GiB", plan.memory_start_bytes / GIB);
+    println!("RAM max: {} GiB", plan.memory_max_bytes / GIB);
+    println!("Disk: {} GiB", plan.disk_bytes / GIB);
+    println!("Network: {}", plan.network);
+    println!("GPU: {}", plan.gpu);
+}
+
+fn print_usage() {
+    eprintln!("Usage:");
+    eprintln!("  forge doctor");
+    eprintln!("  forge profile list");
+    eprintln!("  forge profile plan <profile>");
 }
 
 fn print_report(report: &DoctorReport) {

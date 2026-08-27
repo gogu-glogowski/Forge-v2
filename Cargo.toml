@@ -4,6 +4,7 @@ members = [
     "crates/forge-hardware",
     "crates/forge-host",
     "crates/forge-doctor",
+    "crates/forge-profiles",
     "crates/forge-cli",
 ]
 resolver = "2"
