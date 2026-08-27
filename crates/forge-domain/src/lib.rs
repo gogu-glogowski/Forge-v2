@@ -1,6 +1,9 @@
 //! Pure VM domain specification, validation, and deterministic libvirt XML.
 
-use forge_core::{GpuMode, GuestProfileKind, NetworkMode, VmProfile, VmResourcePlan};
+use forge_core::{
+    GpuMode, GraphicsPolicy, GuestProfileKind, NetworkMode, NetworkPolicy, ProvisioningPolicy,
+    VmProfile, VmResourcePlan,
+};
 use std::fmt;
 
 const MIB: u64 = 1024 * 1024;
@@ -92,7 +95,9 @@ pub struct DomainSpec {
     pub memory_max_bytes: u64,
     pub disks: Vec<DiskSpec>,
     pub network_interfaces: Vec<NetworkInterfaceSpec>,
+    pub network_policy: NetworkPolicy,
     pub channels: Vec<ChannelSpec>,
+    pub guest_agent_required: bool,
     pub graphics: GraphicsMode,
     pub host_filesystems: Vec<String>,
     pub host_devices: Vec<String>,
@@ -120,7 +125,7 @@ pub enum DomainSpecError {
 impl fmt::Display for DomainSpecError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
-            Self::UnsupportedProfile(_) => "only the fedora-lab domain profile is supported",
+            Self::UnsupportedProfile(_) => "domain profile policy is unsupported",
             Self::InvalidName => "domain name must not be empty",
             Self::InvalidUuid => "domain UUID is invalid",
             Self::InvalidDiskPath => "disk path must be an absolute file path",
@@ -128,14 +133,14 @@ impl fmt::Display for DomainSpecError {
             Self::ZeroMemory => "domain memory must be greater than zero",
             Self::StartMemoryExceedsMaximum => "initial memory exceeds maximum memory",
             Self::UnalignedMemory => "domain memory must be aligned to 256 MiB",
-            Self::GpuPolicyMismatch => "fedora-lab requires virtual graphics",
-            Self::NetworkPolicyMismatch => "fedora-lab requires one NAT network interface",
+            Self::GpuPolicyMismatch => "domain graphics do not match profile policy",
+            Self::NetworkPolicyMismatch => "domain network topology does not match profile policy",
             Self::HostFilesystemPassthrough => "host filesystem passthrough is forbidden",
             Self::HostDevicePassthrough => "host device passthrough is forbidden",
-            Self::InvalidDisk => "fedora-lab requires one qcow2 file disk on virtio",
+            Self::InvalidDisk => "domain requires one qcow2 file disk on virtio",
             Self::InvalidNetworkInterface => "network interface source is invalid",
             Self::GuestAgentChannelPolicy => {
-                "fedora-lab requires exactly one virtio QEMU guest-agent channel"
+                "domain guest-agent channel does not match provisioning policy"
             }
         };
         formatter.write_str(message)
@@ -158,10 +163,31 @@ pub fn fedora_lab_spec(
     if profile.kind != GuestProfileKind::FedoraLab {
         return Err(DomainSpecError::UnsupportedProfile(profile.kind));
     }
-    if profile.gpu != GpuMode::Virtual || plan.gpu != profile.gpu {
+    profile_spec(profile, plan, metadata)
+}
+
+/// Builds a domain specification from typed profile and instance policy.
+///
+/// # Errors
+///
+/// Returns a typed validation error when the resource plan or topology differs
+/// from the selected profile.
+pub fn profile_spec(
+    profile: &VmProfile,
+    plan: &VmResourcePlan,
+    metadata: DomainMetadata,
+) -> Result<DomainSpec, DomainSpecError> {
+    let expected_gpu = match profile.graphics_policy {
+        GraphicsPolicy::Virtual => GpuMode::Virtual,
+    };
+    if plan.gpu != expected_gpu {
         return Err(DomainSpecError::GpuPolicyMismatch);
     }
-    if profile.network != NetworkMode::Nat || plan.network != profile.network {
+    let expected_network = match profile.network_policy {
+        NetworkPolicy::DefaultNat => NetworkMode::Nat,
+        NetworkPolicy::Isolated => NetworkMode::Isolated,
+    };
+    if plan.network != expected_network {
         return Err(DomainSpecError::NetworkPolicyMismatch);
     }
     if metadata.name.trim().is_empty() {
@@ -171,6 +197,29 @@ pub fn fedora_lab_spec(
         return Err(DomainSpecError::InvalidDiskPath);
     }
 
+    let network_interfaces = match profile.network_policy {
+        NetworkPolicy::DefaultNat => vec![NetworkInterfaceSpec {
+            mode: NetworkMode::Nat,
+            source_network: "default".to_owned(),
+        }],
+        NetworkPolicy::Isolated => vec![],
+    };
+    let guest_agent_required = matches!(
+        profile.provisioning,
+        ProvisioningPolicy::NoCloud {
+            guest_agent: true,
+            ..
+        }
+    );
+    let channels = if guest_agent_required {
+        vec![ChannelSpec {
+            transport: ChannelTransport::Unix,
+            target: ChannelTarget::Virtio,
+            name: "org.qemu.guest_agent.0".to_owned(),
+        }]
+    } else {
+        vec![]
+    };
     let spec = DomainSpec {
         name: metadata.name,
         uuid: None,
@@ -187,15 +236,10 @@ pub fn fedora_lab_spec(
             bus: DiskBus::Virtio,
             capacity_bytes: plan.disk_bytes,
         }],
-        network_interfaces: vec![NetworkInterfaceSpec {
-            mode: NetworkMode::Nat,
-            source_network: "default".to_owned(),
-        }],
-        channels: vec![ChannelSpec {
-            transport: ChannelTransport::Unix,
-            target: ChannelTarget::Virtio,
-            name: "org.qemu.guest_agent.0".to_owned(),
-        }],
+        network_interfaces,
+        network_policy: profile.network_policy,
+        channels,
+        guest_agent_required,
         graphics: GraphicsMode::Virtual,
         host_filesystems: vec![],
         host_devices: vec![],
@@ -252,17 +296,26 @@ pub fn validate(spec: &DomainSpec) -> Result<(), DomainSpecError> {
     {
         return Err(DomainSpecError::InvalidDisk);
     }
-    if spec.network_interfaces.len() != 1
-        || spec.network_interfaces[0].mode != NetworkMode::Nat
-        || spec.network_interfaces[0].source_network != "default"
-    {
+    let network_valid = match spec.network_policy {
+        NetworkPolicy::DefaultNat => {
+            spec.network_interfaces.len() == 1
+                && spec.network_interfaces[0].mode == NetworkMode::Nat
+                && spec.network_interfaces[0].source_network == "default"
+        }
+        NetworkPolicy::Isolated => spec.network_interfaces.is_empty(),
+    };
+    if !network_valid {
         return Err(DomainSpecError::NetworkPolicyMismatch);
     }
-    if spec.channels.len() != 1
-        || spec.channels[0].transport != ChannelTransport::Unix
-        || spec.channels[0].target != ChannelTarget::Virtio
-        || spec.channels[0].name != "org.qemu.guest_agent.0"
-    {
+    let guest_agent_valid = if spec.guest_agent_required {
+        spec.channels.len() == 1
+            && spec.channels[0].transport == ChannelTransport::Unix
+            && spec.channels[0].target == ChannelTarget::Virtio
+            && spec.channels[0].name == "org.qemu.guest_agent.0"
+    } else {
+        spec.channels.is_empty()
+    };
+    if !guest_agent_valid {
         return Err(DomainSpecError::GuestAgentChannelPolicy);
     }
     Ok(())
@@ -277,7 +330,6 @@ pub fn validate(spec: &DomainSpec) -> Result<(), DomainSpecError> {
 pub fn render_xml(spec: &DomainSpec) -> Result<String, DomainSpecError> {
     validate(spec)?;
     let disk = &spec.disks[0];
-    let network = &spec.network_interfaces[0];
     let mut xml = XmlWriter::default();
     xml.line(0, "<domain type='kvm'>");
     xml.text_element(1, "name", &spec.name);
@@ -320,13 +372,20 @@ pub fn render_xml(spec: &DomainSpec) -> Result<String, DomainSpecError> {
     xml.empty_element_with_attr(3, "source", "file", &disk.source_file);
     xml.line(3, "<target dev='vda' bus='virtio'/>");
     xml.line(2, "</disk>");
-    xml.line(2, "<interface type='network'>");
-    xml.empty_element_with_attr(3, "source", "network", &network.source_network);
-    xml.line(3, "<model type='virtio'/>");
-    xml.line(2, "</interface>");
-    xml.line(2, "<channel type='unix'>");
-    xml.line(3, "<target type='virtio' name='org.qemu.guest_agent.0'/>");
-    xml.line(2, "</channel>");
+    for network in &spec.network_interfaces {
+        xml.line(2, "<interface type='network'>");
+        xml.empty_element_with_attr(3, "source", "network", &network.source_network);
+        xml.line(3, "<model type='virtio'/>");
+        xml.line(2, "</interface>");
+    }
+    for channel in &spec.channels {
+        xml.line(2, "<channel type='unix'>");
+        xml.line(
+            3,
+            &format!("<target type='virtio' name='{}'/>", channel.name),
+        );
+        xml.line(2, "</channel>");
+    }
     xml.line(2, "<graphics type='spice' autoport='yes'/>");
     xml.line(2, "<video>");
     xml.line(3, "<model type='virtio' heads='1' primary='yes'/>");
@@ -389,14 +448,23 @@ const fn round_memory_down(bytes: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_core::VmResources;
+    use forge_core::{
+        FirmwareMachinePolicy, GraphicsPolicy, GuestArchitecture, GuestFamily, ImageSourcePolicy,
+        ImageVerificationPolicy, NetworkPolicy, PersistencePolicy, ProfileId, ProvisioningPolicy,
+        VmResources,
+    };
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
     fn profile() -> VmProfile {
         VmProfile {
-            name: "fedora-lab".to_owned(),
+            id: ProfileId::new("fedora-lab").unwrap(),
+            display_name: "Fedora Lab".to_owned(),
             kind: GuestProfileKind::FedoraLab,
+            instance_kind: forge_core::InstanceKind::Lab,
+            guest_family: GuestFamily::Fedora,
+            architecture: GuestArchitecture::X86_64,
+            firmware_machine: FirmwareMachinePolicy::UefiQ35,
             resources: VmResources {
                 cpu_ratio_per_mille: 250,
                 min_vcpus: 1,
@@ -407,8 +475,17 @@ mod tests {
                 host_memory_reserve_bytes: 2 * GIB,
                 disk_bytes: 64 * GIB,
             },
-            network: NetworkMode::Nat,
-            gpu: GpuMode::Virtual,
+            image_source: ImageSourcePolicy::FedoraCloudBase {
+                release: "44".to_owned(),
+            },
+            image_verification: ImageVerificationPolicy::SignedSha256Checksums,
+            provisioning: ProvisioningPolicy::NoCloud {
+                default_user: "forge".to_owned(),
+                guest_agent: true,
+            },
+            network_policy: NetworkPolicy::DefaultNat,
+            graphics_policy: GraphicsPolicy::Virtual,
+            persistence: PersistencePolicy::Persistent,
         }
     }
 
@@ -580,6 +657,42 @@ mod tests {
         assert_eq!(
             validate(&invalid_spec),
             Err(DomainSpecError::HostFilesystemPassthrough)
+        );
+    }
+
+    #[test]
+    fn generic_non_fedora_profile_builds_without_nocloud_assumptions() {
+        let mut profile = profile();
+        profile.id = ProfileId::new("mock-debian").unwrap();
+        profile.kind = GuestProfileKind::DebianClean;
+        profile.guest_family = GuestFamily::Debian;
+        profile.provisioning = ProvisioningPolicy::None;
+        profile.network_policy = NetworkPolicy::Isolated;
+        let mut resources = plan();
+        resources.network = NetworkMode::Isolated;
+        let spec = profile_spec(
+            &profile,
+            &resources,
+            DomainMetadata {
+                name: "debian-test".to_owned(),
+                disk_path: "/pool/debian-test.qcow2".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(spec.network_interfaces.is_empty());
+        assert!(spec.channels.is_empty());
+        let xml = render_xml(&spec).unwrap();
+        assert!(!xml.contains("<interface"));
+        assert!(!xml.contains("<channel"));
+    }
+
+    #[test]
+    fn manual_topology_change_is_typed_drift_not_absorbed() {
+        let mut changed = spec();
+        changed.network_interfaces[0].source_network = "manually-edited".to_owned();
+        assert_eq!(
+            validate(&changed),
+            Err(DomainSpecError::NetworkPolicyMismatch)
         );
     }
 

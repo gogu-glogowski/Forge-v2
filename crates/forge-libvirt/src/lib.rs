@@ -698,14 +698,31 @@ fn matches_legacy_fedora_lab_xml(xml: &str) -> bool {
 
 pub struct LibvirtBootBackend {
     connection: Connect,
+    instance: forge_core::InstanceName,
 }
 
 impl LibvirtBootBackend {
     /// # Errors
     /// Returns an error when system libvirt is unavailable.
     pub fn connect_local() -> Result<Self, LibvirtError> {
+        let instance =
+            forge_core::InstanceName::new("fedora-lab").map_err(|error| LibvirtError::Mapping {
+                field: "compatibility instance".to_owned(),
+                message: error.to_string(),
+            })?;
+        Self::connect_instance(instance)
+    }
+
+    /// Connects the operational adapter to one typed instance identity.
+    ///
+    /// # Errors
+    /// Returns an error when system libvirt is unavailable.
+    pub fn connect_instance(instance: forge_core::InstanceName) -> Result<Self, LibvirtError> {
         Connect::open(Some(LOCAL_QEMU_URI))
-            .map(|connection| Self { connection })
+            .map(|connection| Self {
+                connection,
+                instance,
+            })
             .map_err(|error| LibvirtError::Connection {
                 uri: LOCAL_QEMU_URI.to_owned(),
                 message: error.to_string(),
@@ -713,7 +730,8 @@ impl LibvirtBootBackend {
     }
 
     fn domain(&self) -> Result<Domain, forge_provisioning::ProvisioningError> {
-        Domain::lookup_by_name(&self.connection, "fedora-lab").map_err(provisioning_backend_error)
+        Domain::lookup_by_name(&self.connection, self.instance.as_str())
+            .map_err(provisioning_backend_error)
     }
 
     fn pool(&self) -> Result<StoragePool, forge_provisioning::ProvisioningError> {
@@ -781,12 +799,49 @@ impl LibvirtBootBackend {
         &self,
     ) -> Result<forge_provisioning::FedoraLabLifecycleStatus, forge_provisioning::ProvisioningError>
     {
+        self.inspect_lifecycle_with_manifest(None)
+    }
+
+    /// Reads operational status using the exact active generation manifest.
+    ///
+    /// # Errors
+    /// Refuses instance/domain identity mismatches and unavailable libvirt data.
+    pub fn inspect_managed_lifecycle(
+        &self,
+        active: &forge_state::GenerationManifest,
+    ) -> Result<forge_provisioning::InstanceLifecycleStatus, forge_provisioning::ProvisioningError>
+    {
+        if active.domain_name != self.instance.as_str() {
+            return Err(forge_provisioning::ProvisioningError::Backend(
+                "active manifest belongs to a different instance".to_owned(),
+            ));
+        }
+        let status = self.inspect_lifecycle_with_manifest(Some(active))?;
+        if status.domain_uuid != active.domain_uuid {
+            return Err(forge_provisioning::ProvisioningError::Backend(
+                "domain UUID differs from active generation manifest".to_owned(),
+            ));
+        }
+        Ok(status)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn inspect_lifecycle_with_manifest(
+        &self,
+        active: Option<&forge_state::GenerationManifest>,
+    ) -> Result<forge_provisioning::FedoraLabLifecycleStatus, forge_provisioning::ProvisioningError>
+    {
         let domain = self.domain()?;
         let (raw_state, _) = domain.get_state().map_err(provisioning_backend_error)?;
         let domain_state = map_domain_state(raw_state)
             .map_err(|error| forge_provisioning::ProvisioningError::Backend(error.to_string()))?;
         let domain_xml = domain.get_xml_desc(0).map_err(provisioning_backend_error)?;
-        let pool = self.pool()?;
+        let pool = if let Some(manifest) = active {
+            StoragePool::lookup_by_name(&self.connection, &manifest.storage_pool_name)
+                .map_err(provisioning_backend_error)?
+        } else {
+            self.pool()?
+        };
         let pool_xml = pool.get_xml_desc(0).map_err(provisioning_backend_error)?;
         let pool_path = xml_element(&pool_xml, "path").ok_or_else(|| {
             forge_provisioning::ProvisioningError::Backend(
@@ -847,6 +902,31 @@ impl LibvirtBootBackend {
         let default_network_active = Network::lookup_by_name(&self.connection, "default")
             .and_then(|network| network.is_active())
             .map_err(provisioning_backend_error)?;
+        let managed_name = |role: forge_state::ResourceRole, fallback: &str| {
+            active
+                .and_then(|manifest| {
+                    manifest
+                        .resources
+                        .iter()
+                        .find(|resource| resource.role == role)
+                })
+                .map_or_else(
+                    || fallback.to_owned(),
+                    |resource| resource.volume_name.clone(),
+                )
+        };
+        let base_name = managed_name(
+            forge_state::ResourceRole::SharedBase,
+            forge_provisioning::BASE_VOLUME,
+        );
+        let overlay_name = managed_name(
+            forge_state::ResourceRole::WritableOverlay,
+            forge_provisioning::REBUILD_OVERLAY_VOLUME,
+        );
+        let seed_name = managed_name(
+            forge_state::ResourceRole::NoCloudSeed,
+            forge_provisioning::REBUILD_SEED_VOLUME,
+        );
         Ok(forge_provisioning::FedoraLabLifecycleStatus {
             domain_state,
             domain_uuid: domain
@@ -861,7 +941,7 @@ impl LibvirtBootBackend {
             },
             active_overlay_path: domain_disk_path(&domain_xml).ok_or_else(|| {
                 forge_provisioning::ProvisioningError::Backend(
-                    "Fedora-Lab domain has no file-backed vda".to_owned(),
+                    "instance domain has no file-backed vda".to_owned(),
                 )
             })?,
             active_backing_path: active_volume_backing(&domain_xml, &volume_backings),
@@ -869,9 +949,9 @@ impl LibvirtBootBackend {
             guest_agent_channel,
             guest_agent_status,
             ip_addresses,
-            base: volume_status(forge_provisioning::BASE_VOLUME)?,
-            current_overlay: volume_status(forge_provisioning::REBUILD_OVERLAY_VOLUME)?,
-            current_seed: volume_status(forge_provisioning::REBUILD_SEED_VOLUME)?,
+            base: volume_status(&base_name)?,
+            current_overlay: volume_status(&overlay_name)?,
+            current_seed: volume_status(&seed_name)?,
             legacy_overlay: volume_status(forge_provisioning::OVERLAY_VOLUME)?,
             legacy_seed: volume_status(forge_provisioning::SEED_VOLUME)?,
         })
@@ -916,8 +996,23 @@ impl LibvirtBootBackend {
         overlay_path: &str,
         seed_path: &str,
     ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
-        let lifecycle = self.inspect_lifecycle()?;
-        let pool = self.pool()?;
+        self.inspect_generation_paths_in_pool(forge_storage::DEFAULT_POOL, overlay_path, seed_path)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn inspect_generation_paths_in_pool(
+        &self,
+        pool_name: &str,
+        overlay_path: &str,
+        seed_path: &str,
+    ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
+        let domain = self.domain()?;
+        let domain_uuid = domain
+            .get_uuid_string()
+            .map_err(provisioning_backend_error)?;
+        let domain_persistent = domain.is_persistent().map_err(provisioning_backend_error)?;
+        let pool = StoragePool::lookup_by_name(&self.connection, pool_name)
+            .map_err(provisioning_backend_error)?;
         let pool_xml = pool.get_xml_desc(0).map_err(provisioning_backend_error)?;
         let pool_path = xml_element(&pool_xml, "path").ok_or_else(|| {
             forge_provisioning::ProvisioningError::Backend(
@@ -963,18 +1058,28 @@ impl LibvirtBootBackend {
                     ))
                 })
         };
+        let overlay_status = generation_volume_status(
+            &pool,
+            &pool_path,
+            &name(overlay_path)?,
+            &domain_references,
+            &volume_backings,
+        )?;
+        let base_path = overlay_status.backing_path.as_deref().ok_or_else(|| {
+            forge_provisioning::ProvisioningError::Backend(
+                "generation overlay has no backing volume".to_owned(),
+            )
+        })?;
+        let base_status = generation_volume_status(
+            &pool,
+            &pool_path,
+            &name(base_path)?,
+            &domain_references,
+            &volume_backings,
+        )?;
         let statuses = [
-            (forge_state::ResourceRole::SharedBase, lifecycle.base),
-            (
-                forge_state::ResourceRole::WritableOverlay,
-                generation_volume_status(
-                    &pool,
-                    &pool_path,
-                    &name(overlay_path)?,
-                    &domain_references,
-                    &volume_backings,
-                )?,
-            ),
+            (forge_state::ResourceRole::SharedBase, base_status),
+            (forge_state::ResourceRole::WritableOverlay, overlay_status),
             (
                 forge_state::ResourceRole::NoCloudSeed,
                 generation_volume_status(
@@ -1017,18 +1122,50 @@ impl LibvirtBootBackend {
             });
         }
         Ok(forge_state::ObservedGeneration {
-            domain_name: "fedora-lab".to_owned(),
-            domain_uuid: lifecycle.domain_uuid,
-            domain_persistent: lifecycle.persistent,
+            domain_name: self.instance.to_string(),
+            domain_uuid,
+            domain_persistent,
             libvirt_uri: self
                 .connection
                 .get_uri()
                 .map_err(provisioning_backend_error)?,
-            storage_pool_name: forge_storage::DEFAULT_POOL.to_owned(),
+            storage_pool_name: pool_name.to_owned(),
             storage_pool_uuid: pool.get_uuid_string().map_err(provisioning_backend_error)?,
             resources,
             unmanaged_resources: Vec::new(),
         })
+    }
+
+    /// Reads the active instance generation using durable manifest identities.
+    ///
+    /// # Errors
+    /// Refuses incomplete manifests and unavailable exact libvirt identities.
+    pub fn inspect_managed_state(
+        &self,
+        active: &forge_state::GenerationManifest,
+    ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
+        if active.domain_name != self.instance.as_str() {
+            return Err(forge_provisioning::ProvisioningError::Backend(
+                "active manifest belongs to a different instance".to_owned(),
+            ));
+        }
+        let resource_path = |role| {
+            active
+                .resources
+                .iter()
+                .find(|resource| resource.role == role)
+                .map(|resource| resource.path.as_str())
+                .ok_or_else(|| {
+                    forge_provisioning::ProvisioningError::Backend(format!(
+                        "active manifest lacks {role:?}"
+                    ))
+                })
+        };
+        self.inspect_generation_paths_in_pool(
+            &active.storage_pool_name,
+            resource_path(forge_state::ResourceRole::WritableOverlay)?,
+            resource_path(forge_state::ResourceRole::NoCloudSeed)?,
+        )
     }
 
     /// Deletes one exact, previously reconciled volume identity.

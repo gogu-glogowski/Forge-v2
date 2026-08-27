@@ -247,7 +247,7 @@ pub fn plan_image_prepare<B: ImagePrepareBackend>(
     source_size_bytes: u64,
     source_capacity_bytes: u64,
 ) -> Result<ImagePreparePlan, ImagePrepareError> {
-    if profile.kind != GuestProfileKind::FedoraLab || profile.name != "fedora-lab" {
+    if profile.kind != GuestProfileKind::FedoraLab || profile.id.as_str() != "fedora-lab" {
         return Err(ImagePrepareError::UnsupportedProfile);
     }
     let expected = source.expected_checksum.as_deref();
@@ -370,7 +370,7 @@ fn build_image_plan(
         profile,
         resources,
         DomainMetadata {
-            name: profile.name.clone(),
+            name: profile.id.to_string(),
             disk_path: overlay_path,
         },
     )
@@ -794,8 +794,13 @@ mod tests {
 
     fn profile() -> VmProfile {
         VmProfile {
-            name: "fedora-lab".to_owned(),
+            id: forge_core::ProfileId::new("fedora-lab").unwrap(),
+            display_name: "Fedora Lab".to_owned(),
             kind: GuestProfileKind::FedoraLab,
+            instance_kind: forge_core::InstanceKind::Lab,
+            guest_family: forge_core::GuestFamily::Fedora,
+            architecture: forge_core::GuestArchitecture::X86_64,
+            firmware_machine: forge_core::FirmwareMachinePolicy::UefiQ35,
             resources: VmResources {
                 cpu_ratio_per_mille: 250,
                 min_vcpus: 1,
@@ -806,8 +811,17 @@ mod tests {
                 host_memory_reserve_bytes: 2 * GIB,
                 disk_bytes: 64 * GIB,
             },
-            network: NetworkMode::Nat,
-            gpu: GpuMode::Virtual,
+            image_source: forge_core::ImageSourcePolicy::FedoraCloudBase {
+                release: "44".to_owned(),
+            },
+            image_verification: forge_core::ImageVerificationPolicy::SignedSha256Checksums,
+            provisioning: forge_core::ProvisioningPolicy::NoCloud {
+                default_user: "forge".to_owned(),
+                guest_agent: true,
+            },
+            network_policy: forge_core::NetworkPolicy::DefaultNat,
+            graphics_policy: forge_core::GraphicsPolicy::Virtual,
+            persistence: forge_core::PersistencePolicy::Persistent,
         }
     }
 

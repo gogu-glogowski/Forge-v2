@@ -1,9 +1,12 @@
 //! Built-in VM profiles and pure resource planning.
 
 use forge_core::{
-    GpuMode, GuestProfileKind, HardwareInfo, NetworkMode, ResourcePlanError, VmProfile,
-    VmResourcePlan, VmResources,
+    FirmwareMachinePolicy, GpuMode, GraphicsPolicy, GuestArchitecture, GuestFamily,
+    GuestProfileKind, HardwareInfo, ImageSourcePolicy, ImageVerificationPolicy, InstanceKind,
+    InstanceName, NetworkMode, NetworkPolicy, PersistencePolicy, ProfileId, ProvisioningPolicy,
+    ResourcePlanError, VmProfile, VmResourcePlan, VmResources,
 };
+use std::fmt;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const RATIO_SCALE: u64 = 1000;
@@ -18,14 +21,31 @@ pub fn built_in_profiles() -> Vec<VmProfile> {
 pub fn find(name: &str) -> Option<VmProfile> {
     built_in_profiles()
         .into_iter()
-        .find(|profile| profile.name == name)
+        .find(|profile| profile.id.as_str() == name)
+}
+
+#[must_use]
+pub fn base_volume_name(profile: &VmProfile) -> String {
+    match &profile.image_source {
+        ImageSourcePolicy::FedoraCloudBase { release } => {
+            format!("forge-base-fedora-{release}.qcow2")
+        }
+        ImageSourcePolicy::VerifiedQcow2 { source_id } => {
+            format!("forge-base-{source_id}.qcow2")
+        }
+    }
 }
 
 #[must_use]
 pub fn fedora_lab() -> VmProfile {
     profile(
-        "fedora-lab",
-        GuestProfileKind::FedoraLab,
+        ProfileMetadata {
+            id: "fedora-lab",
+            display_name: "Fedora Lab",
+            kind: GuestProfileKind::FedoraLab,
+            instance_kind: InstanceKind::Lab,
+            guest_family: GuestFamily::Fedora,
+        },
         VmResources {
             cpu_ratio_per_mille: 250,
             min_vcpus: 1,
@@ -36,14 +56,29 @@ pub fn fedora_lab() -> VmProfile {
             host_memory_reserve_bytes: 2 * GIB,
             disk_bytes: 64 * GIB,
         },
+        ImagePolicy {
+            source: ImageSourcePolicy::FedoraCloudBase {
+                release: "44".to_owned(),
+            },
+            verification: ImageVerificationPolicy::SignedSha256Checksums,
+        },
+        ProvisioningPolicy::NoCloud {
+            default_user: "forge".to_owned(),
+            guest_agent: true,
+        },
     )
 }
 
 #[must_use]
 pub fn luna_dev_fedora() -> VmProfile {
     profile(
-        "luna-dev-fedora",
-        GuestProfileKind::LunaDevFedora,
+        ProfileMetadata {
+            id: "luna-dev-fedora",
+            display_name: "Luna Dev Fedora",
+            kind: GuestProfileKind::LunaDevFedora,
+            instance_kind: InstanceKind::Development,
+            guest_family: GuestFamily::Fedora,
+        },
         VmResources {
             cpu_ratio_per_mille: 500,
             min_vcpus: 2,
@@ -54,14 +89,26 @@ pub fn luna_dev_fedora() -> VmProfile {
             host_memory_reserve_bytes: 2 * GIB,
             disk_bytes: 160 * GIB,
         },
+        ImagePolicy {
+            source: ImageSourcePolicy::FedoraCloudBase {
+                release: "44".to_owned(),
+            },
+            verification: ImageVerificationPolicy::SignedSha256Checksums,
+        },
+        ProvisioningPolicy::None,
     )
 }
 
 #[must_use]
 pub fn luna_lab_fedora() -> VmProfile {
     profile(
-        "luna-lab-fedora",
-        GuestProfileKind::LunaLabFedora,
+        ProfileMetadata {
+            id: "luna-lab-fedora",
+            display_name: "Luna Lab Fedora",
+            kind: GuestProfileKind::LunaLabFedora,
+            instance_kind: InstanceKind::Lab,
+            guest_family: GuestFamily::Fedora,
+        },
         VmResources {
             cpu_ratio_per_mille: 250,
             min_vcpus: 2,
@@ -72,17 +119,155 @@ pub fn luna_lab_fedora() -> VmProfile {
             host_memory_reserve_bytes: 2 * GIB,
             disk_bytes: 96 * GIB,
         },
+        ImagePolicy {
+            source: ImageSourcePolicy::FedoraCloudBase {
+                release: "44".to_owned(),
+            },
+            verification: ImageVerificationPolicy::SignedSha256Checksums,
+        },
+        ProvisioningPolicy::None,
     )
 }
 
-fn profile(name: &str, kind: GuestProfileKind, resources: VmResources) -> VmProfile {
+#[derive(Clone, Copy)]
+struct ProfileMetadata {
+    id: &'static str,
+    display_name: &'static str,
+    kind: GuestProfileKind,
+    instance_kind: InstanceKind,
+    guest_family: GuestFamily,
+}
+
+struct ImagePolicy {
+    source: ImageSourcePolicy,
+    verification: ImageVerificationPolicy,
+}
+
+fn profile(
+    metadata: ProfileMetadata,
+    resources: VmResources,
+    image: ImagePolicy,
+    provisioning: ProvisioningPolicy,
+) -> VmProfile {
     VmProfile {
-        name: name.to_owned(),
-        kind,
+        id: ProfileId::new(metadata.id).expect("built-in profile ID must be valid"),
+        display_name: metadata.display_name.to_owned(),
+        kind: metadata.kind,
+        instance_kind: metadata.instance_kind,
+        guest_family: metadata.guest_family,
+        architecture: GuestArchitecture::X86_64,
+        firmware_machine: FirmwareMachinePolicy::UefiQ35,
         resources,
-        network: NetworkMode::Nat,
-        gpu: GpuMode::Virtual,
+        image_source: image.source,
+        image_verification: image.verification,
+        provisioning,
+        network_policy: NetworkPolicy::DefaultNat,
+        graphics_policy: GraphicsPolicy::Virtual,
+        persistence: PersistencePolicy::Persistent,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceIdentity {
+    pub name: InstanceName,
+    pub profile_id: ProfileId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagePlan {
+    pub source: ImageSourcePolicy,
+    pub verification: ImageVerificationPolicy,
+    pub base_volume_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoragePlan {
+    pub overlay_volume_name: String,
+    pub seed_volume_name: Option<String>,
+    pub capacity_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecyclePlan {
+    PersistentManaged { state_directory_name: String },
+    DisposableUnimplemented,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstancePlan {
+    pub identity: InstanceIdentity,
+    pub resources: VmResourcePlan,
+    pub image: ImagePlan,
+    pub storage: StoragePlan,
+    pub provisioning: ProvisioningPolicy,
+    pub network: NetworkPolicy,
+    pub graphics: GraphicsPolicy,
+    pub lifecycle: LifecyclePlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FactoryPlanError {
+    ProfileIdentityMismatch,
+    Resource(ResourcePlanError),
+}
+
+impl fmt::Display for FactoryPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProfileIdentityMismatch => {
+                formatter.write_str("instance profile identity does not match selected profile")
+            }
+            Self::Resource(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for FactoryPlanError {}
+
+/// Builds the complete mutation-free profile-to-instance factory plan.
+///
+/// # Errors
+///
+/// Refuses mismatched profile identity and unsatisfied resource policy.
+pub fn plan_instance(
+    hardware: &HardwareInfo,
+    profile: &VmProfile,
+    identity: InstanceIdentity,
+) -> Result<InstancePlan, FactoryPlanError> {
+    if identity.profile_id != profile.id {
+        return Err(FactoryPlanError::ProfileIdentityMismatch);
+    }
+    let resources = plan(hardware, profile).map_err(FactoryPlanError::Resource)?;
+    let instance = identity.name.to_string();
+    let seed_volume_name = match profile.provisioning {
+        ProvisioningPolicy::NoCloud { .. } => Some(format!("{instance}-seed.iso")),
+        ProvisioningPolicy::None => None,
+    };
+    let base_volume_name = base_volume_name(profile);
+    let lifecycle = match profile.persistence {
+        PersistencePolicy::Persistent => LifecyclePlan::PersistentManaged {
+            state_directory_name: instance.clone(),
+        },
+        PersistencePolicy::Disposable => LifecyclePlan::DisposableUnimplemented,
+    };
+    Ok(InstancePlan {
+        identity,
+        resources,
+        image: ImagePlan {
+            source: profile.image_source.clone(),
+            verification: profile.image_verification,
+            base_volume_name,
+        },
+        storage: StoragePlan {
+            overlay_volume_name: format!("{instance}.qcow2"),
+            seed_volume_name,
+            capacity_bytes: resources.disk_bytes,
+        },
+        provisioning: profile.provisioning.clone(),
+        network: profile.network_policy,
+        graphics: profile.graphics_policy,
+        lifecycle,
+    })
 }
 
 /// Produces a resource proposal without modifying the host.
@@ -131,8 +316,13 @@ pub fn plan(
         memory_start_bytes: memory_start,
         memory_max_bytes: memory_max,
         disk_bytes: policy.disk_bytes,
-        network: profile.network,
-        gpu: profile.gpu,
+        network: match profile.network_policy {
+            NetworkPolicy::DefaultNat => NetworkMode::Nat,
+            NetworkPolicy::Isolated => NetworkMode::Isolated,
+        },
+        gpu: match profile.graphics_policy {
+            GraphicsPolicy::Virtual => GpuMode::Virtual,
+        },
     })
 }
 
@@ -228,8 +418,114 @@ mod tests {
     fn built_in_profile_list_is_stable() {
         let names = built_in_profiles()
             .into_iter()
-            .map(|profile| profile.name)
+            .map(|profile| profile.id.to_string())
             .collect::<Vec<_>>();
         assert_eq!(names, ["fedora-lab", "luna-dev-fedora", "luna-lab-fedora"]);
+    }
+
+    #[test]
+    fn one_profile_plans_isolated_instance_identities_and_state_paths() {
+        let profile = fedora_lab();
+        let first = plan_instance(
+            &hardware(16, 32),
+            &profile,
+            InstanceIdentity {
+                name: InstanceName::new("fedora-lab-01").unwrap(),
+                profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap();
+        let second = plan_instance(
+            &hardware(16, 32),
+            &profile,
+            InstanceIdentity {
+                name: InstanceName::new("fedora-lab-test").unwrap(),
+                profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap();
+        assert_ne!(first.identity.name, second.identity.name);
+        assert_ne!(
+            first.storage.overlay_volume_name,
+            second.storage.overlay_volume_name
+        );
+        assert_ne!(first.lifecycle, second.lifecycle);
+    }
+
+    #[test]
+    fn non_fedora_profile_uses_generic_planning_without_guest_provisioning() {
+        let mut profile = fedora_lab();
+        profile.id = ProfileId::new("mock-debian").unwrap();
+        profile.display_name = "Mock Debian".to_owned();
+        profile.guest_family = GuestFamily::Debian;
+        profile.kind = GuestProfileKind::DebianClean;
+        profile.image_source = ImageSourcePolicy::VerifiedQcow2 {
+            source_id: "mock-debian-12".to_owned(),
+        };
+        profile.image_verification = ImageVerificationPolicy::Sha256Digest;
+        profile.provisioning = ProvisioningPolicy::None;
+        let plan = plan_instance(
+            &hardware(16, 32),
+            &profile,
+            InstanceIdentity {
+                name: InstanceName::new("debian-test").unwrap(),
+                profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.storage.seed_volume_name, None);
+        assert_eq!(plan.provisioning, ProvisioningPolicy::None);
+        assert_eq!(plan.identity.name.as_str(), "debian-test");
+    }
+
+    #[test]
+    fn disposable_policy_never_receives_persistent_lifecycle() {
+        let mut profile = fedora_lab();
+        profile.persistence = PersistencePolicy::Disposable;
+        let plan = plan_instance(
+            &hardware(16, 32),
+            &profile,
+            InstanceIdentity {
+                name: InstanceName::new("throwaway-test").unwrap(),
+                profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.lifecycle, LifecyclePlan::DisposableUnimplemented);
+    }
+
+    #[test]
+    fn default_nat_and_isolated_are_typed_network_policies() {
+        let profile = fedora_lab();
+        assert_eq!(profile.network_policy, NetworkPolicy::DefaultNat);
+
+        let mut isolated = profile;
+        isolated.network_policy = NetworkPolicy::Isolated;
+        let plan = plan_instance(
+            &hardware(16, 32),
+            &isolated,
+            InstanceIdentity {
+                name: InstanceName::new("offline-test").unwrap(),
+                profile_id: isolated.id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.network, NetworkPolicy::Isolated);
+        assert_eq!(plan.resources.network, NetworkMode::Isolated);
+    }
+
+    #[test]
+    fn profile_instance_mismatch_is_typed_conflict() {
+        let profile = fedora_lab();
+        let error = plan_instance(
+            &hardware(16, 32),
+            &profile,
+            InstanceIdentity {
+                name: InstanceName::new("fedora-lab").unwrap(),
+                profile_id: ProfileId::new("different-profile").unwrap(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, FactoryPlanError::ProfileIdentityMismatch);
     }
 }

@@ -1,4 +1,6 @@
-use forge_core::{DoctorReport, DomainSummary, HostState, LibvirtInfo, VmResourcePlan};
+use forge_core::{
+    DoctorReport, DomainSummary, HostState, InstanceName, LibvirtInfo, ProfileId, VmResourcePlan,
+};
 use forge_provisioning::{BootBackend, RebuildBackend};
 use std::env;
 use std::io;
@@ -29,22 +31,24 @@ fn main() -> ExitCode {
         },
         ["profile", "list"] => {
             for profile in forge_profiles::built_in_profiles() {
-                println!("{}", profile.name);
+                println!("{}\t{}", profile.id, profile.display_name);
             }
             ExitCode::SUCCESS
         }
+        ["profile", "show", profile_name] => show_profile(profile_name),
         ["profile", "plan", profile_name] => plan_profile(profile_name),
+        ["vm", "plan", profile_name, instance_name] => plan_instance(profile_name, instance_name),
         ["hypervisor", "info"] => hypervisor_info(),
         ["vm", "list"] => vm_list(),
-        ["vm", "status", "fedora-lab"] => lifecycle_status(),
+        ["vm", "status", instance] => lifecycle_status(instance),
         ["vm", "cleanup", "fedora-lab", "--dry-run"] => cleanup_vm_dry_run(),
         ["vm", "cleanup", "fedora-lab"] => managed_cleanup(false),
-        ["vm", "start", "fedora-lab", "--dry-run"] => lifecycle_action(true, true),
-        ["vm", "start", "fedora-lab"] => lifecycle_action(true, false),
-        ["vm", "shutdown", "fedora-lab", "--dry-run"] => lifecycle_action(false, true),
-        ["vm", "shutdown", "fedora-lab"] => lifecycle_action(false, false),
+        ["vm", "start", instance, "--dry-run"] => lifecycle_action(instance, true, true),
+        ["vm", "start", instance] => lifecycle_action(instance, true, false),
+        ["vm", "shutdown", instance, "--dry-run"] => lifecycle_action(instance, false, true),
+        ["vm", "shutdown", instance] => lifecycle_action(instance, false, false),
         ["state", "show", "fedora-lab"] => state_show(),
-        ["state", "reconcile", "fedora-lab"] => state_reconcile(),
+        ["state", "reconcile", instance] => state_reconcile(instance),
         ["state", "recover", "fedora-lab", "--dry-run"] => state_recover(true),
         ["state", "recover", "fedora-lab"] => state_recover(false),
         ["state", "adopt", "fedora-lab", "--dry-run"] => state_adopt(true),
@@ -118,8 +122,16 @@ fn discover_state() -> Result<forge_state::ObservedGeneration, String> {
         .map_err(|error| format!("Forge state discovery failed: {error}"))
 }
 
-fn state_reconcile() -> ExitCode {
-    let layout = match managed_state_layout() {
+#[allow(clippy::too_many_lines)]
+fn state_reconcile(instance_name: &str) -> ExitCode {
+    let instance = match InstanceName::new(instance_name) {
+        Ok(instance) => instance,
+        Err(error) => {
+            eprintln!("invalid instance name: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let layout = match managed_state_layout_for(&instance) {
         Ok(layout) => layout,
         Err(error) => {
             eprintln!("Forge state path failed: {error}");
@@ -130,13 +142,6 @@ fn state_reconcile() -> ExitCode {
         Ok(state) => state,
         Err(error) => {
             println!("ReconciliationStatus: CorruptState");
-            eprintln!("{error}");
-            return ExitCode::from(1);
-        }
-    };
-    let observed = match discover_state() {
-        Ok(observed) => observed,
-        Err(error) => {
             eprintln!("{error}");
             return ExitCode::from(1);
         }
@@ -154,6 +159,34 @@ fn state_reconcile() -> ExitCode {
                 Err(error) => {
                     println!("ManagedReconciliationStatus: Conflict");
                     eprintln!("{error}");
+                    return ExitCode::from(1);
+                }
+            };
+            let active = match active_manifest(&index, &manifests) {
+                Ok(active) => active,
+                Err(error) => {
+                    println!("ManagedReconciliationStatus: Conflict");
+                    eprintln!("{error}");
+                    return ExitCode::from(1);
+                }
+            };
+            if let Err(error) = validate_profile_binding(instance_name, &index, active) {
+                println!("ManagedReconciliationStatus: Conflict");
+                eprintln!("{error}");
+                return ExitCode::from(1);
+            }
+            let backend =
+                match forge_libvirt::LibvirtBootBackend::connect_instance(instance.clone()) {
+                    Ok(backend) => backend,
+                    Err(error) => {
+                        eprintln!("libvirt connection failed: {error}");
+                        return ExitCode::from(1);
+                    }
+                };
+            let observed = match backend.inspect_managed_state(active) {
+                Ok(observed) => observed,
+                Err(error) => {
+                    eprintln!("instance state discovery failed: {error}");
                     return ExitCode::from(1);
                 }
             };
@@ -182,6 +215,13 @@ fn state_reconcile() -> ExitCode {
         forge_state::ManagedState::Conflict(reason) => {
             println!("ManagedReconciliationStatus: Conflict");
             eprintln!("{reason}");
+            return ExitCode::from(1);
+        }
+    };
+    let observed = match discover_state() {
+        Ok(observed) => observed,
+        Err(error) => {
+            eprintln!("{error}");
             return ExitCode::from(1);
         }
     };
@@ -535,18 +575,39 @@ fn print_adoption_plan(
     println!("Mutation: {}", plan.mutation);
 }
 
-fn discover_lifecycle_status() -> Result<forge_provisioning::FedoraLabLifecycleStatus, String> {
-    let backend = forge_libvirt::LibvirtBootBackend::connect_local()
+fn discover_lifecycle_status(
+    operational: &OperationalInstance,
+) -> Result<forge_provisioning::InstanceLifecycleStatus, String> {
+    let backend = forge_libvirt::LibvirtBootBackend::connect_instance(operational.instance.clone())
         .map_err(|error| format!("libvirt connection failed: {error}"))?;
-    backend
-        .inspect_lifecycle()
-        .map_err(|error| format!("Fedora-Lab lifecycle discovery failed: {error}"))
+    let status = backend
+        .inspect_managed_lifecycle(&operational.active)
+        .map_err(|error| format!("instance lifecycle discovery failed: {error}"))?;
+    let observed = backend
+        .inspect_managed_state(&operational.active)
+        .map_err(|error| format!("instance reconciliation discovery failed: {error}"))?;
+    let reconciliation =
+        forge_state::reconcile_managed(&operational.index, &operational.manifests, &observed);
+    if reconciliation.status != forge_state::ManagedReconciliationStatus::Consistent {
+        return Err(format!(
+            "instance lifecycle denied by {:?}: {}",
+            reconciliation.status, reconciliation.detail
+        ));
+    }
+    Ok(status)
 }
 
-fn lifecycle_status() -> ExitCode {
-    match discover_lifecycle_status() {
+fn lifecycle_status(instance_name: &str) -> ExitCode {
+    let operational = match operational_instance(instance_name) {
+        Ok(operational) => operational,
+        Err(error) => {
+            eprintln!("instance resolution failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match discover_lifecycle_status(&operational) {
         Ok(status) => {
-            print_lifecycle_status(&status);
+            print_lifecycle_status(instance_name, &status);
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -561,11 +622,104 @@ fn cleanup_vm_dry_run() -> ExitCode {
 }
 
 fn managed_state_layout() -> Result<forge_state::StateLayout, String> {
+    let instance = InstanceName::new("fedora-lab").expect("compatibility instance name is valid");
+    managed_state_layout_for(&instance)
+}
+
+fn managed_state_layout_for(instance: &InstanceName) -> Result<forge_state::StateLayout, String> {
     let home = env::var_os("HOME").ok_or_else(|| "HOME is unavailable".to_owned())?;
-    Ok(forge_state::StateLayout::new(
+    Ok(forge_state::StateLayout::for_instance(
         &forge_state::state_directory(std::path::Path::new(&home)),
-        "fedora-lab",
+        instance,
     ))
+}
+
+fn active_manifest<'a>(
+    index: &forge_state::GenerationIndex,
+    manifests: &'a [forge_state::GenerationManifest],
+) -> Result<&'a forge_state::GenerationManifest, String> {
+    let active_entries = index
+        .generations
+        .iter()
+        .filter(|entry| entry.status == forge_state::GenerationStatus::Active)
+        .collect::<Vec<_>>();
+    if active_entries.len() != 1 || active_entries[0].generation_id != index.active_generation_id {
+        return Err("durable state does not contain exactly one selected Active generation".into());
+    }
+    manifests
+        .iter()
+        .find(|manifest| manifest.generation_id == index.active_generation_id)
+        .ok_or_else(|| "active generation manifest is missing".to_owned())
+}
+
+fn validate_profile_binding(
+    instance_name: &str,
+    index: &forge_state::GenerationIndex,
+    active: &forge_state::GenerationManifest,
+) -> Result<forge_core::VmProfile, String> {
+    let profile = forge_profiles::find(instance_name)
+        .ok_or_else(|| format!("no profile binding exists for instance {instance_name}"))?;
+    if profile.persistence != forge_core::PersistencePolicy::Persistent {
+        return Err("operational lifecycle requires Persistent profile policy".to_owned());
+    }
+    if index.domain_name != instance_name || active.domain_name != instance_name {
+        return Err("profile, instance, and durable domain identity differ".to_owned());
+    }
+    let resource = |role| {
+        active
+            .resources
+            .iter()
+            .find(|resource| resource.role == role)
+            .ok_or_else(|| format!("active generation lacks {role:?}"))
+    };
+    let base = resource(forge_state::ResourceRole::SharedBase)?;
+    let overlay = resource(forge_state::ResourceRole::WritableOverlay)?;
+    let seed = resource(forge_state::ResourceRole::NoCloudSeed)?;
+    if base.volume_name != forge_profiles::base_volume_name(&profile)
+        || overlay.capacity_bytes != profile.resources.disk_bytes
+        || !matches!(
+            profile.provisioning,
+            forge_core::ProvisioningPolicy::NoCloud { .. }
+        )
+        || seed.capacity_bytes == 0
+    {
+        return Err("active generation topology differs from profile policy".to_owned());
+    }
+    Ok(profile)
+}
+
+struct OperationalInstance {
+    instance: InstanceName,
+    profile: forge_core::VmProfile,
+    index: forge_state::GenerationIndex,
+    manifests: Vec<forge_state::GenerationManifest>,
+    active: forge_state::GenerationManifest,
+}
+
+fn operational_instance(instance_name: &str) -> Result<OperationalInstance, String> {
+    let instance = InstanceName::new(instance_name)
+        .map_err(|error| format!("invalid instance name: {error}"))?;
+    let layout = managed_state_layout_for(&instance)?;
+    let index = match forge_state::inspect_layout(&layout).map_err(|error| error.to_string())? {
+        forge_state::ManagedState::Current(index) => index,
+        forge_state::ManagedState::Missing => {
+            return Err("managed instance state is missing".into());
+        }
+        forge_state::ManagedState::Legacy(_) => {
+            return Err("legacy state requires explicit migration before managed lifecycle".into());
+        }
+        forge_state::ManagedState::Conflict(reason) => return Err(reason),
+    };
+    let manifests = load_index_manifests(&layout, &index)?;
+    let active = active_manifest(&index, &manifests)?.clone();
+    let profile = validate_profile_binding(instance_name, &index, &active)?;
+    Ok(OperationalInstance {
+        instance,
+        profile,
+        index,
+        manifests,
+        active,
+    })
 }
 
 fn load_generation(path: &std::path::Path) -> Result<forge_state::GenerationManifest, String> {
@@ -964,8 +1118,16 @@ fn managed_cleanup(dry_run: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn lifecycle_action(start: bool, dry_run: bool) -> ExitCode {
-    let status = match discover_lifecycle_status() {
+#[allow(clippy::too_many_lines)]
+fn lifecycle_action(instance_name: &str, start: bool, dry_run: bool) -> ExitCode {
+    let operational = match operational_instance(instance_name) {
+        Ok(operational) => operational,
+        Err(error) => {
+            eprintln!("instance resolution failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let status = match discover_lifecycle_status(&operational) {
         Ok(status) => status,
         Err(error) => {
             eprintln!("{error}");
@@ -977,10 +1139,15 @@ fn lifecycle_action(start: bool, dry_run: bool) -> ExitCode {
     } else {
         forge_provisioning::LifecycleAction::Shutdown
     };
-    let plan = match forge_provisioning::plan_lifecycle_action(&status, action) {
+    let plan = match forge_provisioning::plan_instance_lifecycle(
+        &status,
+        &operational.profile,
+        true,
+        action,
+    ) {
         Ok(plan) => plan,
         Err(error) => {
-            eprintln!("Fedora-Lab lifecycle action denied: {error}");
+            eprintln!("instance lifecycle action denied: {error}");
             return ExitCode::from(1);
         }
     };
@@ -1012,8 +1179,9 @@ fn lifecycle_action(start: bool, dry_run: bool) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     eprint!(
-        "{} Fedora-Lab now? [y/N] ",
-        if start { "Start" } else { "Shutdown" }
+        "{} instance {} now? [y/N] ",
+        if start { "Start" } else { "Shutdown" },
+        instance_name,
     );
     let mut answer = String::new();
     if io::stdin().read_line(&mut answer).is_err()
@@ -1022,14 +1190,31 @@ fn lifecycle_action(start: bool, dry_run: bool) -> ExitCode {
         eprintln!("Lifecycle action cancelled.");
         return ExitCode::SUCCESS;
     }
-    let mut backend = match forge_libvirt::LibvirtBootBackend::connect_local() {
+    let fresh_operational = match operational_instance(instance_name) {
+        Ok(fresh) => fresh,
+        Err(error) => {
+            eprintln!("pre-mutation instance revalidation failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if fresh_operational.profile != operational.profile
+        || fresh_operational.index != operational.index
+        || fresh_operational.manifests != operational.manifests
+        || fresh_operational.active != operational.active
+    {
+        eprintln!("profile or durable state changed before lifecycle action; action denied");
+        return ExitCode::from(1);
+    }
+    let mut backend = match forge_libvirt::LibvirtBootBackend::connect_instance(
+        fresh_operational.instance.clone(),
+    ) {
         Ok(backend) => backend,
         Err(error) => {
             eprintln!("libvirt connection failed: {error}");
             return ExitCode::from(1);
         }
     };
-    let fresh = match backend.inspect_lifecycle() {
+    let fresh = match backend.inspect_managed_lifecycle(&fresh_operational.active) {
         Ok(fresh) => fresh,
         Err(error) => {
             eprintln!("pre-mutation lifecycle revalidation failed: {error}");
@@ -1041,7 +1226,13 @@ fn lifecycle_action(start: bool, dry_run: bool) -> ExitCode {
         || fresh.active_overlay_path != status.active_overlay_path
         || fresh.active_backing_path != status.active_backing_path
         || fresh.active_seed_path != status.active_seed_path
-        || forge_provisioning::plan_lifecycle_action(&fresh, action).is_err()
+        || forge_provisioning::plan_instance_lifecycle(
+            &fresh,
+            &fresh_operational.profile,
+            true,
+            action,
+        )
+        .is_err()
     {
         eprintln!("pre-mutation lifecycle state changed; action denied");
         return ExitCode::from(1);
@@ -1095,8 +1286,11 @@ fn execute_lifecycle_start(
     Ok(())
 }
 
-fn print_lifecycle_status(status: &forge_provisioning::FedoraLabLifecycleStatus) {
-    println!("Domain: fedora-lab");
+fn print_lifecycle_status(
+    instance_name: &str,
+    status: &forge_provisioning::InstanceLifecycleStatus,
+) {
+    println!("Domain: {instance_name}");
     println!("State: {}", status.domain_state);
     println!("UUID: {}", status.domain_uuid);
     println!("Persistent: {}", status.persistent);
@@ -2241,6 +2435,107 @@ fn plan_profile(profile_name: &str) -> ExitCode {
     }
 }
 
+fn show_profile(profile_name: &str) -> ExitCode {
+    let Some(profile) = forge_profiles::find(profile_name) else {
+        eprintln!("unknown VM profile: {profile_name}");
+        return ExitCode::from(2);
+    };
+    println!("Profile ID: {}", profile.id);
+    println!("Display name: {}", profile.display_name);
+    println!("Guest family: {}", profile.guest_family);
+    println!("Instance kind: {:?}", profile.instance_kind);
+    println!("Architecture: {:?}", profile.architecture);
+    println!("Firmware/machine: {:?}", profile.firmware_machine);
+    println!(
+        "Disk capacity: {} GiB",
+        profile.resources.disk_bytes / 1024 / 1024 / 1024
+    );
+    println!("Image source: {:?}", profile.image_source);
+    println!("Image verification: {:?}", profile.image_verification);
+    println!("Provisioning: {:?}", profile.provisioning);
+    println!("Network: {:?}", profile.network_policy);
+    println!("Graphics: {:?}", profile.graphics_policy);
+    println!("Persistence: {:?}", profile.persistence);
+    ExitCode::SUCCESS
+}
+
+fn plan_instance(profile_name: &str, instance_name: &str) -> ExitCode {
+    let Some(profile) = forge_profiles::find(profile_name) else {
+        eprintln!("unknown VM profile: {profile_name}");
+        return ExitCode::from(2);
+    };
+    let instance = match InstanceName::new(instance_name) {
+        Ok(instance) => instance,
+        Err(error) => {
+            eprintln!("invalid instance name: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let hardware = match forge_hardware::collect() {
+        Ok(hardware) => hardware,
+        Err(error) => {
+            eprintln!("hardware detection failed: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let identity = forge_profiles::InstanceIdentity {
+        name: instance,
+        profile_id: ProfileId::new(profile_name).expect("registry profile ID is valid"),
+    };
+    let plan = match forge_profiles::plan_instance(&hardware, &profile, identity) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("cannot plan instance: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let disk_path = format!(
+        "/var/lib/libvirt/images/{}",
+        plan.storage.overlay_volume_name
+    );
+    let domain = match forge_domain::profile_spec(
+        &profile,
+        &plan.resources,
+        forge_domain::DomainMetadata {
+            name: plan.identity.name.to_string(),
+            disk_path,
+        },
+    ) {
+        Ok(domain) => domain,
+        Err(error) => {
+            eprintln!("cannot build domain plan: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    println!("Mode: plan (zero mutation)");
+    println!("Profile: {}", plan.identity.profile_id);
+    println!("Instance: {}", plan.identity.name);
+    println!(
+        "Resource plan: {} vCPU, {} MiB start / {} MiB max, {} GiB disk",
+        plan.resources.vcpus,
+        plan.resources.memory_start_bytes / 1024 / 1024,
+        plan.resources.memory_max_bytes / 1024 / 1024,
+        plan.resources.disk_bytes / 1024 / 1024 / 1024,
+    );
+    println!(
+        "Image plan: {:?}, verification {:?}, base {}",
+        plan.image.source, plan.image.verification, plan.image.base_volume_name
+    );
+    println!(
+        "Domain plan: {} ({:?}, {:?})",
+        domain.name, domain.firmware, domain.machine
+    );
+    println!(
+        "Storage plan: overlay {}, seed {}",
+        plan.storage.overlay_volume_name,
+        plan.storage.seed_volume_name.as_deref().unwrap_or("none")
+    );
+    println!("Provisioning plan: {:?}", plan.provisioning);
+    println!("Network plan: {:?}", plan.network);
+    println!("Lifecycle/state plan: {:?}", plan.lifecycle);
+    ExitCode::SUCCESS
+}
+
 fn print_plan(profile_name: &str, plan: VmResourcePlan) {
     const GIB: u64 = 1024 * 1024 * 1024;
     println!("Profile: {profile_name}");
@@ -2256,7 +2551,9 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  forge doctor");
     eprintln!("  forge profile list");
+    eprintln!("  forge profile show <profile>");
     eprintln!("  forge profile plan <profile>");
+    eprintln!("  forge vm plan <profile> <instance>");
     eprintln!("  forge hypervisor info");
     eprintln!("  forge vm list");
     eprintln!("  forge vm status fedora-lab");

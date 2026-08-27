@@ -3,6 +3,7 @@ use super::{
     ReconciliationStatus, ResourceRole, STATE_DIRECTORY_MODE, STATE_FILE_MODE, StateError,
     read_manifest, reconcile, write_manifest_atomic,
 };
+use forge_core::InstanceName;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
@@ -29,6 +30,11 @@ impl StateLayout {
             generations: domain_directory.join("generations"),
             domain_directory,
         }
+    }
+
+    #[must_use]
+    pub fn for_instance(state_directory: &Path, instance: &InstanceName) -> Self {
+        Self::new(state_directory, instance.as_str())
     }
 
     #[must_use]
@@ -1229,6 +1235,19 @@ fn reconcile_without_domain_references(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn typed_instances_have_isolated_backward_compatible_state_layouts() {
+        let root = PathBuf::from("/state");
+        let fedora = InstanceName::new("fedora-lab").unwrap();
+        let test = InstanceName::new("fedora-lab-test").unwrap();
+        let fedora_layout = StateLayout::for_instance(&root, &fedora);
+        let test_layout = StateLayout::for_instance(&root, &test);
+        assert_eq!(fedora_layout.domain_directory, root.join("fedora-lab"));
+        assert_eq!(fedora_layout.index, root.join("fedora-lab/index.json"));
+        assert_ne!(fedora_layout.domain_directory, test_layout.domain_directory);
+        assert_ne!(fedora_layout.index, test_layout.index);
+    }
 
     fn manifest(id: &str, status: GenerationStatus) -> GenerationManifest {
         GenerationManifest {

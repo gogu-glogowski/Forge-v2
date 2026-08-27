@@ -1,6 +1,6 @@
 //! Minimal, secret-free Fedora-Lab cloud-init and first-boot planning.
 
-use forge_core::VmState;
+use forge_core::{NetworkPolicy, PersistencePolicy, ProvisioningPolicy, VmProfile, VmState};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::time::Duration;
@@ -26,7 +26,7 @@ pub struct GenerationVolumeStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FedoraLabLifecycleStatus {
+pub struct InstanceLifecycleStatus {
     pub domain_state: VmState,
     pub domain_uuid: String,
     pub persistent: bool,
@@ -44,6 +44,8 @@ pub struct FedoraLabLifecycleStatus {
     pub legacy_overlay: GenerationVolumeStatus,
     pub legacy_seed: GenerationVolumeStatus,
 }
+
+pub type FedoraLabLifecycleStatus = InstanceLifecycleStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefaultNetworkStatus {
@@ -203,10 +205,80 @@ pub fn plan_lifecycle_action(
     status: &FedoraLabLifecycleStatus,
     action: LifecycleAction,
 ) -> Result<LifecycleActionPlan, ProvisioningError> {
-    if !status.persistent
+    plan_lifecycle_with_policy(
+        status,
+        action,
+        &LifecyclePolicyEvidence {
+            persistence: PersistencePolicy::Persistent,
+            disk_bytes: 64 * 1024 * 1024 * 1024,
+            provisioning: ProvisioningPolicy::NoCloud {
+                default_user: "forge".to_owned(),
+                guest_agent: true,
+            },
+            network: NetworkPolicy::DefaultNat,
+            expected_base_capacity: Some(5 * 1024 * 1024 * 1024),
+            reconciliation: ReconciliationEvidence::Consistent,
+        },
+    )
+}
+
+/// Plans a lifecycle action from generic profile policy and reconciled instance evidence.
+///
+/// # Errors
+/// Refuses non-persistent profiles, incomplete reconciliation, and topology drift.
+pub fn plan_instance_lifecycle(
+    status: &InstanceLifecycleStatus,
+    profile: &VmProfile,
+    reconciled: bool,
+    action: LifecycleAction,
+) -> Result<LifecycleActionPlan, ProvisioningError> {
+    plan_lifecycle_with_policy(
+        status,
+        action,
+        &LifecyclePolicyEvidence {
+            persistence: profile.persistence,
+            disk_bytes: profile.resources.disk_bytes,
+            provisioning: profile.provisioning.clone(),
+            network: profile.network_policy,
+            expected_base_capacity: None,
+            reconciliation: if reconciled {
+                ReconciliationEvidence::Consistent
+            } else {
+                ReconciliationEvidence::Incomplete
+            },
+        },
+    )
+}
+
+#[derive(Debug, Clone)]
+struct LifecyclePolicyEvidence {
+    persistence: PersistencePolicy,
+    disk_bytes: u64,
+    provisioning: ProvisioningPolicy,
+    network: NetworkPolicy,
+    expected_base_capacity: Option<u64>,
+    reconciliation: ReconciliationEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconciliationEvidence {
+    Consistent,
+    Incomplete,
+}
+
+fn plan_lifecycle_with_policy(
+    status: &FedoraLabLifecycleStatus,
+    action: LifecycleAction,
+    policy: &LifecyclePolicyEvidence,
+) -> Result<LifecycleActionPlan, ProvisioningError> {
+    if policy.reconciliation != ReconciliationEvidence::Consistent
+        || policy.persistence != PersistencePolicy::Persistent
+        || !status.persistent
         || !status.base.exists
         || status.base.format.as_deref() != Some("qcow2")
-        || status.base.capacity_bytes != Some(5 * 1024 * 1024 * 1024)
+        || policy
+            .expected_base_capacity
+            .is_some_and(|capacity| status.base.capacity_bytes != Some(capacity))
         || status.base.backing_path.is_some()
         || !status.current_overlay.exists
         || !status.current_seed.exists
@@ -214,15 +286,22 @@ pub fn plan_lifecycle_action(
         || status.active_backing_path.as_deref() != Some(status.base.path.as_str())
         || status.active_seed_path.as_deref() != Some(status.current_seed.path.as_str())
         || status.current_overlay.format.as_deref() != Some("qcow2")
-        || status.current_overlay.capacity_bytes != Some(64 * 1024 * 1024 * 1024)
+        || status.current_overlay.capacity_bytes != Some(policy.disk_bytes)
         || status.current_overlay.backing_path.as_deref() != Some(status.base.path.as_str())
         || !matches!(status.current_seed.format.as_deref(), Some("raw" | "iso"))
-        || !status.guest_agent_channel
-        || (action == LifecycleAction::Start
+        || (matches!(
+            policy.provisioning,
+            ProvisioningPolicy::NoCloud {
+                guest_agent: true,
+                ..
+            }
+        ) && !status.guest_agent_channel)
+        || (policy.network == NetworkPolicy::DefaultNat
+            && action == LifecycleAction::Start
             && status.default_network != DefaultNetworkStatus::Active)
     {
         return Err(ProvisioningError::LifecycleUnsafe(
-            "persistent Fedora-Lab identity and active base/overlay/seed topology could not be proven"
+            "persistent instance profile and active base/overlay/seed topology could not be proven"
                 .to_owned(),
         ));
     }
@@ -1295,6 +1374,66 @@ mod tests {
                 .steps
                 .iter()
                 .any(|step| step.contains("never fall back"))
+        );
+    }
+
+    #[test]
+    fn shared_lifecycle_uses_instance_profile_policy_without_fedora_literal() {
+        let mut status = lifecycle_status();
+        status.current_overlay.capacity_bytes = Some(32 * 1024 * 1024 * 1024);
+        let mut profile = VmProfile {
+            id: forge_core::ProfileId::new("mock-debian").unwrap(),
+            display_name: "Mock Debian".to_owned(),
+            kind: forge_core::GuestProfileKind::DebianClean,
+            instance_kind: forge_core::InstanceKind::Lab,
+            guest_family: forge_core::GuestFamily::Debian,
+            architecture: forge_core::GuestArchitecture::X86_64,
+            firmware_machine: forge_core::FirmwareMachinePolicy::UefiQ35,
+            resources: forge_core::VmResources {
+                cpu_ratio_per_mille: 250,
+                min_vcpus: 1,
+                max_vcpus: 4,
+                memory_start_ratio_per_mille: 200,
+                memory_max_ratio_per_mille: 250,
+                min_memory_bytes: 2 * 1024 * 1024 * 1024,
+                host_memory_reserve_bytes: 2 * 1024 * 1024 * 1024,
+                disk_bytes: 32 * 1024 * 1024 * 1024,
+            },
+            image_source: forge_core::ImageSourcePolicy::VerifiedQcow2 {
+                source_id: "debian-12".to_owned(),
+            },
+            image_verification: forge_core::ImageVerificationPolicy::Sha256Digest,
+            provisioning: ProvisioningPolicy::None,
+            network_policy: NetworkPolicy::Isolated,
+            graphics_policy: forge_core::GraphicsPolicy::Virtual,
+            persistence: PersistencePolicy::Persistent,
+        };
+        assert!(
+            plan_instance_lifecycle(&status, &profile, true, LifecycleAction::Shutdown).is_ok()
+        );
+        assert!(matches!(
+            plan_instance_lifecycle(&status, &profile, false, LifecycleAction::Shutdown),
+            Err(ProvisioningError::LifecycleUnsafe(_))
+        ));
+
+        status.current_overlay.capacity_bytes = Some(64 * 1024 * 1024 * 1024);
+        profile.id = forge_core::ProfileId::new("fedora-lab").unwrap();
+        profile.display_name = "Fedora Lab".to_owned();
+        profile.kind = forge_core::GuestProfileKind::FedoraLab;
+        profile.guest_family = forge_core::GuestFamily::Fedora;
+        profile.resources.disk_bytes = 64 * 1024 * 1024 * 1024;
+        profile.image_source = forge_core::ImageSourcePolicy::FedoraCloudBase {
+            release: "44".to_owned(),
+        };
+        profile.image_verification = forge_core::ImageVerificationPolicy::SignedSha256Checksums;
+        profile.provisioning = ProvisioningPolicy::NoCloud {
+            default_user: "forge".to_owned(),
+            guest_agent: true,
+        };
+        profile.network_policy = NetworkPolicy::DefaultNat;
+        assert_eq!(
+            plan_instance_lifecycle(&status, &profile, true, LifecycleAction::Shutdown).unwrap(),
+            plan_lifecycle_action(&status, LifecycleAction::Shutdown).unwrap()
         );
     }
 

@@ -3,6 +3,76 @@
 
 use std::fmt;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProfileId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InstanceName(String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityError {
+    Empty,
+    InvalidCharacter,
+}
+
+fn validate_identity(value: &str) -> Result<(), IdentityError> {
+    if value.is_empty() {
+        return Err(IdentityError::Empty);
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || !value.as_bytes()[0].is_ascii_lowercase()
+    {
+        return Err(IdentityError::InvalidCharacter);
+    }
+    Ok(())
+}
+
+macro_rules! identity_type {
+    ($type:ident) => {
+        impl $type {
+            /// Creates a validated Forge identity.
+            ///
+            /// # Errors
+            ///
+            /// Rejects empty values and values outside lower-case DNS-label syntax.
+            pub fn new(value: impl Into<String>) -> Result<Self, IdentityError> {
+                let value = value.into();
+                validate_identity(&value)?;
+                Ok(Self(value))
+            }
+
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+    };
+}
+
+identity_type!(ProfileId);
+identity_type!(InstanceName);
+
+impl fmt::Display for IdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("identity must not be empty"),
+            Self::InvalidCharacter => formatter.write_str(
+                "identity must start with a lower-case letter and contain only lower-case ASCII letters, digits, or hyphens",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IdentityError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostState {
     Unsupported,
@@ -139,6 +209,81 @@ pub enum GuestProfileKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceKind {
+    Lab,
+    Development,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestFamily {
+    Fedora,
+    Debian,
+    Other,
+}
+
+impl fmt::Display for GuestFamily {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}",
+            match self {
+                Self::Fedora => "fedora",
+                Self::Debian => "debian",
+                Self::Other => "other",
+            }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestArchitecture {
+    X86_64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirmwareMachinePolicy {
+    UefiQ35,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageSourcePolicy {
+    FedoraCloudBase { release: String },
+    VerifiedQcow2 { source_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageVerificationPolicy {
+    SignedSha256Checksums,
+    Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisioningPolicy {
+    NoCloud {
+        default_user: String,
+        guest_agent: bool,
+    },
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkPolicy {
+    DefaultNat,
+    Isolated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphicsPolicy {
+    Virtual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistencePolicy {
+    Persistent,
+    Disposable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmResources {
     pub cpu_ratio_per_mille: u16,
     pub min_vcpus: usize,
@@ -152,11 +297,20 @@ pub struct VmResources {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmProfile {
-    pub name: String,
+    pub id: ProfileId,
+    pub display_name: String,
     pub kind: GuestProfileKind,
+    pub instance_kind: InstanceKind,
+    pub guest_family: GuestFamily,
+    pub architecture: GuestArchitecture,
+    pub firmware_machine: FirmwareMachinePolicy,
     pub resources: VmResources,
-    pub network: NetworkMode,
-    pub gpu: GpuMode,
+    pub image_source: ImageSourcePolicy,
+    pub image_verification: ImageVerificationPolicy,
+    pub provisioning: ProvisioningPolicy,
+    pub network_policy: NetworkPolicy,
+    pub graphics_policy: GraphicsPolicy,
+    pub persistence: PersistencePolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +357,23 @@ impl fmt::Display for ResourcePlanError {
 }
 
 impl std::error::Error for ResourcePlanError {}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn profile_and_instance_are_distinct_validated_identities() {
+        let profile = ProfileId::new("fedora-lab").unwrap();
+        let instance = InstanceName::new("fedora-lab-01").unwrap();
+        assert_eq!(profile.as_str(), "fedora-lab");
+        assert_eq!(instance.as_str(), "fedora-lab-01");
+        assert_eq!(
+            InstanceName::new("Fedora Lab"),
+            Err(IdentityError::InvalidCharacter)
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VmState {
