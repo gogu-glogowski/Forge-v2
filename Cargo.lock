@@ -24,6 +24,7 @@ dependencies = [
  "forge-hardware",
  "forge-libvirt",
  "forge-profiles",
+ "forge-storage",
 ]
 
 [[package]]
@@ -65,6 +66,7 @@ name = "forge-libvirt"
 version = "0.1.0"
 dependencies = [
  "forge-core",
+ "forge-storage",
  "virt",
 ]
 
@@ -73,6 +75,14 @@ name = "forge-profiles"
 version = "0.1.0"
 dependencies = [
  "forge-core",
+]
+
+[[package]]
+name = "forge-storage"
+version = "0.1.0"
+dependencies = [
+ "forge-core",
+ "forge-domain",
 ]
 
 [[package]]

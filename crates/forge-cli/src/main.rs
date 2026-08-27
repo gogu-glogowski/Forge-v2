@@ -1,5 +1,6 @@
 use forge_core::{DoctorReport, DomainSummary, HostState, LibvirtInfo, VmResourcePlan};
 use std::env;
+use std::io;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -33,12 +34,92 @@ fn main() -> ExitCode {
         ["profile", "plan", profile_name] => plan_profile(profile_name),
         ["hypervisor", "info"] => hypervisor_info(),
         ["vm", "list"] => vm_list(),
+        ["vm", "define", "fedora-lab"] => define_vm(false),
+        ["vm", "define", "fedora-lab", "--dry-run"] => define_vm(true),
         ["domain", "render", profile_name] => render_domain(profile_name),
         _ => {
             print_usage();
             ExitCode::from(2)
         }
     }
+}
+
+fn define_vm(dry_run: bool) -> ExitCode {
+    let Some(profile) = forge_profiles::find("fedora-lab") else {
+        eprintln!("fedora-lab profile is unavailable");
+        return ExitCode::from(2);
+    };
+    let hardware = match forge_hardware::collect() {
+        Ok(hardware) => hardware,
+        Err(error) => {
+            eprintln!("hardware detection failed: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let resource_plan = match forge_profiles::plan(&hardware, &profile) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("cannot plan fedora-lab: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut backend = match forge_libvirt::LibvirtDefineBackend::connect_local() {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("libvirt connection failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let plan = match forge_storage::prepare(&mut backend, &profile, &resource_plan) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("cannot prepare Fedora-Lab definition: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    print_define_plan(&plan);
+    if dry_run {
+        println!("\n{}", plan.xml);
+        return ExitCode::SUCCESS;
+    }
+    eprint!("Define Fedora-Lab domain? [y/N] ");
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err()
+        || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    {
+        eprintln!("Definition cancelled.");
+        return ExitCode::SUCCESS;
+    }
+    match forge_storage::execute(&mut backend, &plan) {
+        Ok(result) => {
+            println!("Domain UUID: {}", result.domain.uuid);
+            println!("Domain state: {}", result.domain.state);
+            println!("Volume path: {}", result.volume.path);
+            println!(
+                "Capacity: {} GiB",
+                result.volume.capacity_bytes / 1024 / 1024 / 1024
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Fedora-Lab definition failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn print_define_plan(plan: &forge_storage::DefinePlan) {
+    println!("Domain: {}", plan.domain_name);
+    println!("vCPU: {}", plan.spec.vcpus);
+    println!(
+        "RAM: {} MiB start / {} MiB max",
+        plan.spec.memory_start_bytes / 1024 / 1024,
+        plan.spec.memory_max_bytes / 1024 / 1024
+    );
+    println!("Disk: {} GiB", plan.capacity_bytes / 1024 / 1024 / 1024);
+    println!("Storage pool: {}", plan.pool.name);
+    println!("Network: {}", plan.spec.network_interfaces[0].mode);
+    println!("GPU: virtual");
 }
 
 fn render_domain(profile_name: &str) -> ExitCode {
@@ -187,6 +268,7 @@ fn print_usage() {
     eprintln!("  forge profile plan <profile>");
     eprintln!("  forge hypervisor info");
     eprintln!("  forge vm list");
+    eprintln!("  forge vm define fedora-lab [--dry-run]");
     eprintln!("  forge domain render fedora-lab");
 }
 

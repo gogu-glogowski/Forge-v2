@@ -6,6 +6,7 @@ members = [
     "crates/forge-doctor",
     "crates/forge-profiles",
     "crates/forge-domain",
+    "crates/forge-storage",
     "crates/forge-libvirt",
     "crates/forge-cli",
 ]

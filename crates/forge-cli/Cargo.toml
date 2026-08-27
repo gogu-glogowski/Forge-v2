@@ -15,6 +15,7 @@ forge-domain = { path = "../forge-domain" }
 forge-hardware = { path = "../forge-hardware" }
 forge-libvirt = { path = "../forge-libvirt" }
 forge-profiles = { path = "../forge-profiles" }
+forge-storage = { path = "../forge-storage" }
 
 [lints]
 workspace = true

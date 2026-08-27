@@ -4,7 +4,9 @@ use forge_core::{DomainSummary, HostCapabilities, LibvirtInfo, VmState};
 use std::fmt;
 use virt::connect::Connect;
 use virt::domain::Domain;
-use virt::error::Error as VirtError;
+use virt::error::{Error as VirtError, ErrorNumber};
+use virt::storage_pool::StoragePool;
+use virt::storage_vol::StorageVol;
 use virt::sys;
 
 pub const LOCAL_QEMU_URI: &str = "qemu:///system";
@@ -152,6 +154,148 @@ pub fn format_version(version: u32) -> String {
     let minor = version / 1_000 % 1_000;
     let release = version % 1_000;
     format!("{major}.{minor}.{release}")
+}
+
+pub struct LibvirtDefineBackend {
+    connection: Connect,
+}
+
+impl LibvirtDefineBackend {
+    /// Opens the local system libvirt connection used by an explicitly
+    /// confirmed define operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a connection error when system libvirt is unavailable.
+    pub fn connect_local() -> Result<Self, LibvirtError> {
+        Connect::open(Some(LOCAL_QEMU_URI))
+            .map(|connection| Self { connection })
+            .map_err(|error| LibvirtError::Connection {
+                uri: LOCAL_QEMU_URI.to_owned(),
+                message: error.to_string(),
+            })
+    }
+
+    fn pool(&self, name: &str) -> Result<StoragePool, forge_storage::StorageError> {
+        StoragePool::lookup_by_name(&self.connection, name).map_err(storage_backend_error)
+    }
+}
+
+impl forge_storage::DefineBackend for LibvirtDefineBackend {
+    fn inspect_pool(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<forge_storage::StoragePoolInfo>, forge_storage::StorageError> {
+        let pool = match StoragePool::lookup_by_name(&self.connection, name) {
+            Ok(pool) => pool,
+            Err(error) if error.code() == ErrorNumber::NoStoragePool => return Ok(None),
+            Err(error) => return Err(storage_backend_error(error)),
+        };
+        let active = pool.is_active().map_err(storage_backend_error)?;
+        let info = pool.get_info().map_err(storage_backend_error)?;
+        let xml = pool.get_xml_desc(0).map_err(storage_backend_error)?;
+        let target_path = xml_element(&xml, "path").ok_or_else(|| {
+            forge_storage::StorageError::PoolUnusable(
+                "libvirt pool XML has no target path".to_owned(),
+            )
+        })?;
+        Ok(Some(forge_storage::StoragePoolInfo {
+            name: name.to_owned(),
+            active,
+            target_path,
+            available_bytes: info.available,
+        }))
+    }
+
+    fn domain_exists(&mut self, name: &str) -> Result<bool, forge_storage::StorageError> {
+        match Domain::lookup_by_name(&self.connection, name) {
+            Ok(_) => Ok(true),
+            Err(error) if error.code() == ErrorNumber::NoDomain => Ok(false),
+            Err(error) => Err(storage_backend_error(error)),
+        }
+    }
+
+    fn volume_exists(
+        &mut self,
+        pool: &str,
+        name: &str,
+    ) -> Result<bool, forge_storage::StorageError> {
+        let pool = self.pool(pool)?;
+        match StorageVol::lookup_by_name(&pool, name) {
+            Ok(_) => Ok(true),
+            Err(error) if error.code() == ErrorNumber::NoStorageVolume => Ok(false),
+            Err(error) => Err(storage_backend_error(error)),
+        }
+    }
+
+    fn create_volume(
+        &mut self,
+        pool: &str,
+        name: &str,
+        capacity_bytes: u64,
+    ) -> Result<forge_storage::VolumeInfo, forge_storage::StorageError> {
+        let pool = self.pool(pool)?;
+        let xml = format!(
+            "<volume><name>{name}</name><capacity unit='bytes'>{capacity_bytes}</capacity><allocation unit='bytes'>0</allocation><target><format type='qcow2'/></target></volume>"
+        );
+        let volume = StorageVol::create_xml(&pool, &xml, 0).map_err(storage_backend_error)?;
+        let info = volume.get_info().map_err(storage_backend_error)?;
+        let path = volume.get_path().map_err(storage_backend_error)?;
+        Ok(forge_storage::VolumeInfo {
+            name: name.to_owned(),
+            path,
+            capacity_bytes: info.capacity,
+            allocation_bytes: info.allocation,
+        })
+    }
+
+    fn define_domain(
+        &mut self,
+        xml: &str,
+    ) -> Result<forge_storage::DefinedDomain, forge_storage::DomainDefineError> {
+        let domain = Domain::define_xml(&self.connection, xml).map_err(|error| {
+            forge_storage::DomainDefineError {
+                error: storage_backend_error(error),
+                domain_defined: false,
+            }
+        })?;
+        let inspect_error = |error: forge_storage::StorageError| forge_storage::DomainDefineError {
+            error,
+            domain_defined: true,
+        };
+        let uuid = domain
+            .get_uuid_string()
+            .map_err(storage_backend_error)
+            .map_err(inspect_error)?;
+        let (state, _) = domain
+            .get_state()
+            .map_err(storage_backend_error)
+            .map_err(inspect_error)?;
+        let state = map_domain_state(state)
+            .map_err(|error| forge_storage::StorageError::Backend(error.to_string()))
+            .map_err(inspect_error)?;
+        Ok(forge_storage::DefinedDomain { uuid, state })
+    }
+
+    fn delete_volume(&mut self, pool: &str, name: &str) -> Result<(), forge_storage::StorageError> {
+        let pool = self.pool(pool)?;
+        let volume = StorageVol::lookup_by_name(&pool, name).map_err(storage_backend_error)?;
+        volume.delete(0).map_err(storage_backend_error)
+    }
+}
+
+fn storage_backend_error(error: VirtError) -> forge_storage::StorageError {
+    let message = error.to_string();
+    drop(error);
+    forge_storage::StorageError::Backend(format!("libvirt storage operation failed: {message}"))
+}
+
+fn xml_element(xml: &str, name: &str) -> Option<String> {
+    let opening = format!("<{name}>");
+    let closing = format!("</{name}>");
+    let start = xml.find(&opening)? + opening.len();
+    let end = xml[start..].find(&closing)? + start;
+    Some(xml[start..end].trim().to_owned())
 }
 
 #[cfg(test)]
