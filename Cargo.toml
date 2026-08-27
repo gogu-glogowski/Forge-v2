@@ -8,6 +8,7 @@ members = [
     "crates/forge-domain",
     "crates/forge-storage",
     "crates/forge-images",
+    "crates/forge-provisioning",
     "crates/forge-libvirt",
     "crates/forge-cli",
 ]

@@ -56,6 +56,23 @@ pub struct NetworkInterfaceSpec {
     pub source_network: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelTransport {
+    Unix,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelTarget {
+    Virtio,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelSpec {
+    pub transport: ChannelTransport,
+    pub target: ChannelTarget,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainMetadata {
     pub name: String,
@@ -75,6 +92,7 @@ pub struct DomainSpec {
     pub memory_max_bytes: u64,
     pub disks: Vec<DiskSpec>,
     pub network_interfaces: Vec<NetworkInterfaceSpec>,
+    pub channels: Vec<ChannelSpec>,
     pub graphics: GraphicsMode,
     pub host_filesystems: Vec<String>,
     pub host_devices: Vec<String>,
@@ -96,6 +114,7 @@ pub enum DomainSpecError {
     HostDevicePassthrough,
     InvalidDisk,
     InvalidNetworkInterface,
+    GuestAgentChannelPolicy,
 }
 
 impl fmt::Display for DomainSpecError {
@@ -115,6 +134,9 @@ impl fmt::Display for DomainSpecError {
             Self::HostDevicePassthrough => "host device passthrough is forbidden",
             Self::InvalidDisk => "fedora-lab requires one qcow2 file disk on virtio",
             Self::InvalidNetworkInterface => "network interface source is invalid",
+            Self::GuestAgentChannelPolicy => {
+                "fedora-lab requires exactly one virtio QEMU guest-agent channel"
+            }
         };
         formatter.write_str(message)
     }
@@ -168,6 +190,11 @@ pub fn fedora_lab_spec(
         network_interfaces: vec![NetworkInterfaceSpec {
             mode: NetworkMode::Nat,
             source_network: "default".to_owned(),
+        }],
+        channels: vec![ChannelSpec {
+            transport: ChannelTransport::Unix,
+            target: ChannelTarget::Virtio,
+            name: "org.qemu.guest_agent.0".to_owned(),
         }],
         graphics: GraphicsMode::Virtual,
         host_filesystems: vec![],
@@ -231,6 +258,13 @@ pub fn validate(spec: &DomainSpec) -> Result<(), DomainSpecError> {
     {
         return Err(DomainSpecError::NetworkPolicyMismatch);
     }
+    if spec.channels.len() != 1
+        || spec.channels[0].transport != ChannelTransport::Unix
+        || spec.channels[0].target != ChannelTarget::Virtio
+        || spec.channels[0].name != "org.qemu.guest_agent.0"
+    {
+        return Err(DomainSpecError::GuestAgentChannelPolicy);
+    }
     Ok(())
 }
 
@@ -290,6 +324,9 @@ pub fn render_xml(spec: &DomainSpec) -> Result<String, DomainSpecError> {
     xml.empty_element_with_attr(3, "source", "network", &network.source_network);
     xml.line(3, "<model type='virtio'/>");
     xml.line(2, "</interface>");
+    xml.line(2, "<channel type='unix'>");
+    xml.line(3, "<target type='virtio' name='org.qemu.guest_agent.0'/>");
+    xml.line(2, "</channel>");
     xml.line(2, "<graphics type='spice' autoport='yes'/>");
     xml.line(2, "<video>");
     xml.line(3, "<model type='virtio' heads='1' primary='yes'/>");
@@ -400,7 +437,7 @@ mod tests {
 
     #[test]
     fn fedora_lab_xml_is_deterministic() {
-        let expected = "<domain type='kvm'>\n  <name>fedora-lab</name>\n  <memory unit='MiB'>8192</memory>\n  <currentMemory unit='MiB'>6144</currentMemory>\n  <vcpu placement='static'>4</vcpu>\n  <os firmware='efi'>\n    <type arch='x86_64' machine='q35'>hvm</type>\n    <firmware>\n      <feature enabled='no' name='secure-boot'/>\n      <feature enabled='no' name='enrolled-keys'/>\n    </firmware>\n  </os>\n  <features>\n    <acpi/>\n    <apic/>\n  </features>\n  <cpu mode='host-passthrough'/>\n  <devices>\n    <disk type='file' device='disk'>\n      <driver name='qemu' type='qcow2'/>\n      <source file='/var/lib/libvirt/images/fedora-lab.qcow2'/>\n      <target dev='vda' bus='virtio'/>\n    </disk>\n    <interface type='network'>\n      <source network='default'/>\n      <model type='virtio'/>\n    </interface>\n    <graphics type='spice' autoport='yes'/>\n    <video>\n      <model type='virtio' heads='1' primary='yes'/>\n    </video>\n  </devices>\n</domain>\n";
+        let expected = "<domain type='kvm'>\n  <name>fedora-lab</name>\n  <memory unit='MiB'>8192</memory>\n  <currentMemory unit='MiB'>6144</currentMemory>\n  <vcpu placement='static'>4</vcpu>\n  <os firmware='efi'>\n    <type arch='x86_64' machine='q35'>hvm</type>\n    <firmware>\n      <feature enabled='no' name='secure-boot'/>\n      <feature enabled='no' name='enrolled-keys'/>\n    </firmware>\n  </os>\n  <features>\n    <acpi/>\n    <apic/>\n  </features>\n  <cpu mode='host-passthrough'/>\n  <devices>\n    <disk type='file' device='disk'>\n      <driver name='qemu' type='qcow2'/>\n      <source file='/var/lib/libvirt/images/fedora-lab.qcow2'/>\n      <target dev='vda' bus='virtio'/>\n    </disk>\n    <interface type='network'>\n      <source network='default'/>\n      <model type='virtio'/>\n    </interface>\n    <channel type='unix'>\n      <target type='virtio' name='org.qemu.guest_agent.0'/>\n    </channel>\n    <graphics type='spice' autoport='yes'/>\n    <video>\n      <model type='virtio' heads='1' primary='yes'/>\n    </video>\n  </devices>\n</domain>\n";
         assert_eq!(render_xml(&spec()).unwrap(), expected);
         assert_eq!(render_xml(&spec()).unwrap(), expected);
     }
@@ -458,6 +495,34 @@ mod tests {
         assert!(!xml.contains("<filesystem"));
         assert!(!xml.contains("<hostdev"));
         assert!(!xml.contains("type='block'"));
+    }
+
+    #[test]
+    fn xml_has_exactly_one_virtio_guest_agent_channel() {
+        let valid_spec = spec();
+        let xml = render_xml(&valid_spec).unwrap();
+        assert_eq!(xml.matches("<channel type='unix'>").count(), 1);
+        assert_eq!(
+            xml.matches("<target type='virtio' name='org.qemu.guest_agent.0'/>")
+                .count(),
+            1
+        );
+        assert!(!xml.contains("<filesystem"));
+        assert!(!xml.contains("<hostdev"));
+
+        let mut missing = valid_spec.clone();
+        missing.channels.clear();
+        assert_eq!(
+            validate(&missing),
+            Err(DomainSpecError::GuestAgentChannelPolicy)
+        );
+
+        let mut duplicate = valid_spec;
+        duplicate.channels.push(duplicate.channels[0].clone());
+        assert_eq!(
+            validate(&duplicate),
+            Err(DomainSpecError::GuestAgentChannelPolicy)
+        );
     }
 
     #[test]

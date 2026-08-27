@@ -9,6 +9,7 @@ use std::process::Command;
 use virt::connect::Connect;
 use virt::domain::Domain;
 use virt::error::{Error as VirtError, ErrorNumber};
+use virt::network::Network;
 use virt::storage_pool::StoragePool;
 use virt::storage_vol::StorageVol;
 use virt::stream::Stream;
@@ -600,6 +601,564 @@ fn matches_legacy_fedora_lab_xml(xml: &str) -> bool {
         && !xml.contains("<hostdev")
 }
 
+pub struct LibvirtBootBackend {
+    connection: Connect,
+}
+
+impl LibvirtBootBackend {
+    /// # Errors
+    /// Returns an error when system libvirt is unavailable.
+    pub fn connect_local() -> Result<Self, LibvirtError> {
+        Connect::open(Some(LOCAL_QEMU_URI))
+            .map(|connection| Self { connection })
+            .map_err(|error| LibvirtError::Connection {
+                uri: LOCAL_QEMU_URI.to_owned(),
+                message: error.to_string(),
+            })
+    }
+
+    fn domain(&self) -> Result<Domain, forge_provisioning::ProvisioningError> {
+        Domain::lookup_by_name(&self.connection, "fedora-lab").map_err(provisioning_backend_error)
+    }
+
+    fn pool(&self) -> Result<StoragePool, forge_provisioning::ProvisioningError> {
+        StoragePool::lookup_by_name(&self.connection, forge_storage::DEFAULT_POOL)
+            .map_err(provisioning_backend_error)
+    }
+
+    /// Reads the current Fedora-Lab resources needed for a mutation-free rebuild plan.
+    ///
+    /// # Errors
+    /// Returns an error when domain, pool, or volume metadata cannot be inspected.
+    pub fn inspect_rebuild(
+        &self,
+    ) -> Result<forge_provisioning::RebuildEnvironment, forge_provisioning::ProvisioningError> {
+        let domain = self.domain()?;
+        let (raw_state, _) = domain.get_state().map_err(provisioning_backend_error)?;
+        let domain_state = map_domain_state(raw_state)
+            .map_err(|error| forge_provisioning::ProvisioningError::Backend(error.to_string()))?;
+        let domain_xml = domain.get_xml_desc(0).map_err(provisioning_backend_error)?;
+        let current_overlay_path = domain_disk_path(&domain_xml).ok_or_else(|| {
+            forge_provisioning::ProvisioningError::Backend(
+                "Fedora-Lab domain has no file-backed vda".to_owned(),
+            )
+        })?;
+        let pool = self.pool()?;
+        let pool_xml = pool.get_xml_desc(0).map_err(provisioning_backend_error)?;
+        let pool_path = xml_element(&pool_xml, "path").ok_or_else(|| {
+            forge_provisioning::ProvisioningError::Backend(
+                "default pool has no target path".to_owned(),
+            )
+        })?;
+        let volume = |name: &str| match StorageVol::lookup_by_name(&pool, name) {
+            Ok(volume) => Ok(Some(volume)),
+            Err(error) if error.code() == ErrorNumber::NoStorageVolume => Ok(None),
+            Err(error) => Err(provisioning_backend_error(error)),
+        };
+        let current_overlay = StorageVol::lookup_by_path(&self.connection, &current_overlay_path)
+            .map_err(provisioning_backend_error)?;
+        let current_overlay_xml = current_overlay
+            .get_xml_desc(0)
+            .map_err(provisioning_backend_error)?;
+        let base = volume(forge_provisioning::BASE_VOLUME)?;
+        let seed = volume(forge_provisioning::SEED_VOLUME)?;
+        Ok(forge_provisioning::RebuildEnvironment {
+            domain_state,
+            domain_uuid: domain
+                .get_uuid_string()
+                .map_err(provisioning_backend_error)?,
+            domain_persistent: domain.is_persistent().map_err(provisioning_backend_error)?,
+            current_overlay_path,
+            current_backing_path: backing_store_path(&current_overlay_xml),
+            base_path: format!("{pool_path}/{}", forge_provisioning::BASE_VOLUME),
+            base_exists: base.is_some(),
+            seed_path: format!("{pool_path}/{}", forge_provisioning::SEED_VOLUME),
+            seed_exists: seed.is_some(),
+            pool_path,
+        })
+    }
+}
+
+impl forge_provisioning::BootBackend for LibvirtBootBackend {
+    fn inspect(
+        &mut self,
+    ) -> Result<forge_provisioning::BootEnvironment, forge_provisioning::ProvisioningError> {
+        let domain = self.domain()?;
+        let (state, _) = domain.get_state().map_err(provisioning_backend_error)?;
+        let state = map_domain_state(state)
+            .map_err(|error| forge_provisioning::ProvisioningError::Backend(error.to_string()))?;
+        let domain_xml = domain.get_xml_desc(0).map_err(provisioning_backend_error)?;
+        let pool = self.pool()?;
+        let pool_xml = pool.get_xml_desc(0).map_err(provisioning_backend_error)?;
+        let pool_path = xml_element(&pool_xml, "path").ok_or_else(|| {
+            forge_provisioning::ProvisioningError::Backend(
+                "default pool has no target path".to_owned(),
+            )
+        })?;
+        let volume = |name: &str| match StorageVol::lookup_by_name(&pool, name) {
+            Ok(volume) => Ok(Some(volume)),
+            Err(error) if error.code() == ErrorNumber::NoStorageVolume => Ok(None),
+            Err(error) => Err(provisioning_backend_error(error)),
+        };
+        let overlay = volume(forge_provisioning::OVERLAY_VOLUME)?;
+        let overlay_backing_path = overlay
+            .as_ref()
+            .and_then(|volume| volume.get_xml_desc(0).ok())
+            .and_then(|xml| backing_store_path(&xml));
+        let base_exists = volume(forge_provisioning::BASE_VOLUME)?.is_some();
+        let seed = volume(forge_provisioning::SEED_VOLUME)?;
+        let seed_checksum = seed
+            .as_ref()
+            .and_then(|volume| volume.get_xml_desc(0).ok())
+            .and_then(|xml| xml_element(&xml, "description"))
+            .and_then(|value| {
+                value
+                    .strip_prefix("forge-cloud-init-sha256:")
+                    .map(str::to_owned)
+            });
+        let network = Network::lookup_by_name(&self.connection, "default")
+            .map_err(provisioning_backend_error)?;
+        Ok(forge_provisioning::BootEnvironment {
+            domain_state: state,
+            domain_xml,
+            overlay_exists: overlay.is_some(),
+            overlay_backing_path,
+            base_exists,
+            network_active: network.is_active().map_err(provisioning_backend_error)?,
+            seed_path: format!("{pool_path}/{}", forge_provisioning::SEED_VOLUME),
+            seed_checksum,
+        })
+    }
+
+    fn create_seed(
+        &mut self,
+        seed: &forge_provisioning::SeedPlan,
+    ) -> Result<(), forge_provisioning::ProvisioningError> {
+        let temporary =
+            std::env::temp_dir().join(format!("forge-cloud-init-{}", std::process::id()));
+        std::fs::create_dir(&temporary)
+            .map_err(|error| forge_provisioning::ProvisioningError::Backend(error.to_string()))?;
+        let result = (|| {
+            std::fs::write(temporary.join("user-data"), &seed.data.user_data).map_err(|error| {
+                forge_provisioning::ProvisioningError::Backend(error.to_string())
+            })?;
+            std::fs::write(temporary.join("meta-data"), &seed.data.meta_data).map_err(|error| {
+                forge_provisioning::ProvisioningError::Backend(error.to_string())
+            })?;
+            let iso = temporary.join("seed.iso");
+            let output = Command::new("genisoimage")
+                .current_dir(&temporary)
+                .args(["-quiet", "-output"])
+                .arg(&iso)
+                .args([
+                    "-volid",
+                    "cidata",
+                    "-joliet",
+                    "-rock",
+                    "user-data",
+                    "meta-data",
+                ])
+                .output()
+                .map_err(|error| {
+                    forge_provisioning::ProvisioningError::Backend(error.to_string())
+                })?;
+            if !output.status.success() {
+                return Err(forge_provisioning::ProvisioningError::Backend(
+                    String::from_utf8_lossy(&output.stderr).to_string(),
+                ));
+            }
+            let length = std::fs::metadata(&iso)
+                .map_err(|error| forge_provisioning::ProvisioningError::Backend(error.to_string()))?
+                .len();
+            let pool = self.pool()?;
+            let xml = seed_volume_xml(&seed.volume_name, length);
+            let volume = StorageVol::create_xml(&pool, &xml, sys::VIR_STORAGE_VOL_CREATE_VALIDATE)
+                .map_err(provisioning_backend_error)?;
+            let upload = upload_file(
+                &self.connection,
+                &volume,
+                iso.to_string_lossy().as_ref(),
+                length,
+            );
+            if let Err(error) = upload {
+                let _ = volume.delete(0);
+                return Err(forge_provisioning::ProvisioningError::Backend(
+                    error.to_string(),
+                ));
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(&temporary);
+        result
+    }
+
+    fn redefine(&mut self, xml: &str) -> Result<(), forge_provisioning::ProvisioningError> {
+        Domain::define_xml(&self.connection, xml)
+            .map(|_| ())
+            .map_err(provisioning_backend_error)
+    }
+
+    fn start(&mut self) -> Result<(), forge_provisioning::ProvisioningError> {
+        self.domain()?
+            .create()
+            .map(|_| ())
+            .map_err(provisioning_backend_error)
+    }
+
+    fn wait_running(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<(), forge_provisioning::ProvisioningError> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let (state, _) = self
+                .domain()?
+                .get_state()
+                .map_err(provisioning_backend_error)?;
+            if map_domain_state(state).ok() == Some(VmState::Running) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        Err(forge_provisioning::ProvisioningError::Timeout {
+            stage: forge_provisioning::WaitStage::DomainRunning,
+            after_seconds: timeout.as_secs(),
+        })
+    }
+
+    fn discover_ip(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<String>, forge_provisioning::ProvisioningError> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let domain = self.domain()?;
+            for source in [
+                sys::VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT,
+                sys::VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE,
+            ] {
+                if let Ok(interfaces) = domain.interface_addresses(source, 0)
+                    && let Some(address) = interfaces
+                        .into_iter()
+                        .flat_map(|interface| interface.addrs)
+                        .map(|address| address.addr)
+                        .find(|address| !address.starts_with("127.") && address != "::1")
+                {
+                    return Ok(Some(address));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        Ok(None)
+    }
+
+    fn wait_guest_agent(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<forge_provisioning::GuestAgentStatus, forge_provisioning::ProvisioningError> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            match self
+                .domain()?
+                .qemu_agent_command("{\"execute\":\"guest-ping\"}", 5, 0)
+            {
+                Ok(_) => return Ok(forge_provisioning::GuestAgentStatus::Available),
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        ErrorNumber::OperationUnsupported | ErrorNumber::ConfigUnsupported
+                    ) =>
+                {
+                    return Ok(forge_provisioning::GuestAgentStatus::Unavailable);
+                }
+                Err(_) => {}
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        Ok(forge_provisioning::GuestAgentStatus::TimedOut {
+            after_seconds: timeout.as_secs(),
+        })
+    }
+
+    fn observe_ssh(
+        &mut self,
+        ip_address: &str,
+        private_key_path: &str,
+        timeout: std::time::Duration,
+    ) -> Result<forge_provisioning::SshObservation, forge_provisioning::ProvisioningError> {
+        let remote =
+            "cloud-init status --long; echo __FORGE_ID__; id; echo __FORGE_HOSTNAME__; hostname";
+        let mut child = Command::new("ssh")
+            .args(["-i", private_key_path, "-o", "BatchMode=yes"])
+            .arg("-o")
+            .arg(format!("ConnectTimeout={}", timeout.as_secs()))
+            .args([
+                "-o",
+                "ConnectionAttempts=1",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "UserKnownHostsFile=/tmp/forge-fedora-lab-known-hosts",
+            ])
+            .arg(format!("forge@{ip_address}"))
+            .arg(remote)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| forge_provisioning::ProvisioningError::Backend(error.to_string()))?;
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if child
+                .try_wait()
+                .map_err(|error| forge_provisioning::ProvisioningError::Backend(error.to_string()))?
+                .is_some()
+            {
+                let output = child.wait_with_output().map_err(|error| {
+                    forge_provisioning::ProvisioningError::Backend(error.to_string())
+                })?;
+                return Ok(parse_ssh_observation(&output));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        child
+            .kill()
+            .map_err(|error| forge_provisioning::ProvisioningError::Backend(error.to_string()))?;
+        let _ = child.wait();
+        Ok(forge_provisioning::SshObservation {
+            status: forge_provisioning::SshStatus::TimedOut {
+                after_seconds: timeout.as_secs(),
+            },
+            cloud_init: forge_provisioning::CloudInitStatus::Unknown,
+            forge_user_confirmed: false,
+            hostname: None,
+        })
+    }
+}
+
+impl forge_provisioning::RebuildBackend for LibvirtBootBackend {
+    fn create_rebuild_overlay(
+        &mut self,
+        plan: &forge_provisioning::RebuildPlan,
+    ) -> Result<(), forge_provisioning::ProvisioningError> {
+        let pool = self.pool()?;
+        for name in [
+            forge_provisioning::REBUILD_OVERLAY_VOLUME,
+            forge_provisioning::REBUILD_SEED_VOLUME,
+        ] {
+            match StorageVol::lookup_by_name(&pool, name) {
+                Ok(_) => {
+                    return Err(forge_provisioning::ProvisioningError::Backend(format!(
+                        "rebuild resource already exists: {name}"
+                    )));
+                }
+                Err(error) if error.code() == ErrorNumber::NoStorageVolume => {}
+                Err(error) => return Err(provisioning_backend_error(error)),
+            }
+        }
+        let xml = format!(
+            "<volume><name>{}</name><capacity unit='bytes'>{}</capacity><allocation unit='bytes'>0</allocation><target><format type='qcow2'/></target><backingStore><path>{}</path><format type='qcow2'/></backingStore></volume>",
+            forge_provisioning::REBUILD_OVERLAY_VOLUME,
+            plan.new_overlay_capacity_bytes,
+            plan.environment.base_path
+        );
+        StorageVol::create_xml(&pool, &xml, sys::VIR_STORAGE_VOL_CREATE_VALIDATE)
+            .map_err(provisioning_backend_error)?;
+        let volume = StorageVol::lookup_by_name(&pool, forge_provisioning::REBUILD_OVERLAY_VOLUME)
+            .map_err(provisioning_backend_error)?;
+        let info = volume.get_info().map_err(provisioning_backend_error)?;
+        let path = volume.get_path().map_err(provisioning_backend_error)?;
+        let xml = volume.get_xml_desc(0).map_err(provisioning_backend_error)?;
+        if path != plan.new_overlay_path
+            || info.capacity != plan.new_overlay_capacity_bytes
+            || xml_attribute(&xml, "format", "type").as_deref() != Some("qcow2")
+            || backing_store_path(&xml).as_deref() != Some(plan.environment.base_path.as_str())
+        {
+            return Err(forge_provisioning::ProvisioningError::Backend(
+                "new rebuild overlay failed libvirt validation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_rebuild_seed(
+        &mut self,
+        plan: &forge_provisioning::RebuildPlan,
+    ) -> Result<(), forge_provisioning::ProvisioningError> {
+        let pool = self.pool()?;
+        let volume = StorageVol::lookup_by_name(&pool, forge_provisioning::REBUILD_SEED_VOLUME)
+            .map_err(provisioning_backend_error)?;
+        let info = volume.get_info().map_err(provisioning_backend_error)?;
+        let path = volume.get_path().map_err(provisioning_backend_error)?;
+        let xml = volume.get_xml_desc(0).map_err(provisioning_backend_error)?;
+        let format = xml_attribute(&xml, "format", "type");
+        if path != plan.new_seed_path
+            || info.capacity == 0
+            || !matches!(format.as_deref(), Some("raw" | "iso"))
+        {
+            return Err(forge_provisioning::ProvisioningError::Backend(
+                "new rebuild seed failed libvirt validation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn shutdown_and_wait(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<(), forge_provisioning::ProvisioningError> {
+        self.domain()?
+            .shutdown()
+            .map_err(provisioning_backend_error)?;
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let (state, _) = self
+                .domain()?
+                .get_state()
+                .map_err(provisioning_backend_error)?;
+            if map_domain_state(state).ok() == Some(VmState::Shutoff) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        Err(forge_provisioning::ProvisioningError::Timeout {
+            stage: forge_provisioning::WaitStage::DomainShutoff,
+            after_seconds: timeout.as_secs(),
+        })
+    }
+
+    fn verify_pre_switch(
+        &mut self,
+        expected: &forge_provisioning::RebuildEnvironment,
+    ) -> Result<(), forge_provisioning::ProvisioningError> {
+        let actual = self.inspect_rebuild()?;
+        if actual.domain_state != VmState::Shutoff
+            || actual.domain_uuid != expected.domain_uuid
+            || actual.current_overlay_path != expected.current_overlay_path
+            || actual.current_backing_path != expected.current_backing_path
+            || actual.base_path != expected.base_path
+            || !actual.base_exists
+            || actual.seed_path != expected.seed_path
+            || !actual.seed_exists
+        {
+            return Err(forge_provisioning::ProvisioningError::Backend(
+                "durable Fedora-Lab resources changed before domain switch".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn switch_and_verify(
+        &mut self,
+        plan: &forge_provisioning::RebuildPlan,
+    ) -> Result<(), forge_provisioning::ProvisioningError> {
+        Domain::define_xml(&self.connection, &plan.domain_xml)
+            .map_err(provisioning_backend_error)?;
+        let domain = self.domain()?;
+        let xml = domain.get_xml_desc(0).map_err(provisioning_backend_error)?;
+        if !domain.is_persistent().map_err(provisioning_backend_error)?
+            || domain_disk_path(&xml).as_deref() != Some(plan.new_overlay_path.as_str())
+            || !xml.contains(&plan.new_seed_path)
+            || xml.matches("org.qemu.guest_agent.0").count() != 1
+            || !xml.contains("<readonly")
+        {
+            return Err(forge_provisioning::ProvisioningError::Backend(
+                "persistent domain XML verification failed after switch".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn rollback_new_resources(
+        &mut self,
+        context: &forge_provisioning::RebuildContext,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        let Ok(pool) = self.pool() else {
+            return vec!["cannot open default pool for rebuild rollback".to_owned()];
+        };
+        for (created, name) in [
+            (
+                context.seed_created,
+                forge_provisioning::REBUILD_SEED_VOLUME,
+            ),
+            (
+                context.overlay_created,
+                forge_provisioning::REBUILD_OVERLAY_VOLUME,
+            ),
+        ] {
+            if created
+                && let Ok(volume) = StorageVol::lookup_by_name(&pool, name)
+                && let Err(error) = volume.delete(0)
+            {
+                failures.push(format!("cannot delete {name}: {error}"));
+            }
+        }
+        failures
+    }
+}
+
+fn provisioning_backend_error(error: VirtError) -> forge_provisioning::ProvisioningError {
+    let message = error.to_string();
+    drop(error);
+    forge_provisioning::ProvisioningError::Backend(format!(
+        "libvirt provisioning operation failed: {message}"
+    ))
+}
+
+fn parse_ssh_observation(output: &std::process::Output) -> forge_provisioning::SshObservation {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let Some((cloud_output, identity_and_hostname)) = stdout.split_once("__FORGE_ID__") else {
+        return forge_provisioning::SshObservation {
+            status: if stderr.to_ascii_lowercase().contains("permission denied") {
+                forge_provisioning::SshStatus::AuthenticationFailed
+            } else {
+                forge_provisioning::SshStatus::Reachable
+            },
+            cloud_init: forge_provisioning::CloudInitStatus::Unknown,
+            forge_user_confirmed: false,
+            hostname: None,
+        };
+    };
+    let (identity, hostname) = identity_and_hostname
+        .split_once("__FORGE_HOSTNAME__")
+        .unwrap_or((identity_and_hostname, ""));
+    let cloud_init = if cloud_output
+        .lines()
+        .any(|line| line.trim() == "status: done")
+    {
+        forge_provisioning::CloudInitStatus::Done
+    } else if cloud_output
+        .lines()
+        .any(|line| line.trim() == "status: running")
+    {
+        forge_provisioning::CloudInitStatus::Running
+    } else if cloud_output
+        .lines()
+        .any(|line| line.trim() == "status: error")
+    {
+        forge_provisioning::CloudInitStatus::Error(cloud_output.trim().to_owned())
+    } else {
+        forge_provisioning::CloudInitStatus::Unknown
+    };
+    forge_provisioning::SshObservation {
+        status: forge_provisioning::SshStatus::Authenticated,
+        cloud_init,
+        forge_user_confirmed: identity.contains("forge"),
+        hostname: hostname
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_owned),
+    }
+}
+
+fn seed_volume_xml(name: &str, capacity_bytes: u64) -> String {
+    format!(
+        "<volume type='file'><name>{name}</name><capacity unit='bytes'>{capacity_bytes}</capacity><allocation unit='bytes'>0</allocation><target><format type='raw'/></target></volume>"
+    )
+}
+
 fn storage_backend_error(error: VirtError) -> forge_storage::StorageError {
     let message = error.to_string();
     drop(error);
@@ -617,6 +1176,7 @@ fn xml_element(xml: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
 
     fn domain(name: &str, uuid: &str) -> DomainSummary {
         DomainSummary {
@@ -685,5 +1245,52 @@ mod tests {
     #[test]
     fn formats_encoded_libvirt_version() {
         assert_eq!(format_version(12_003_004), "12.3.4");
+    }
+
+    #[test]
+    fn renders_seed_storage_volume_xml() {
+        assert_eq!(
+            seed_volume_xml("fedora-lab-seed.iso", 374_784),
+            "<volume type='file'><name>fedora-lab-seed.iso</name><capacity unit='bytes'>374784</capacity><allocation unit='bytes'>0</allocation><target><format type='raw'/></target></volume>"
+        );
+    }
+
+    #[test]
+    fn ssh_output_confirms_authentication_user_hostname_and_cloud_init() {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"status: done\n__FORGE_ID__\nuid=1000(forge) gid=1000(forge)\n__FORGE_HOSTNAME__\nfedora-lab\n".to_vec(),
+            stderr: vec![],
+        };
+        let observation = parse_ssh_observation(&output);
+        assert_eq!(
+            observation.status,
+            forge_provisioning::SshStatus::Authenticated
+        );
+        assert_eq!(
+            observation.cloud_init,
+            forge_provisioning::CloudInitStatus::Done
+        );
+        assert!(observation.forge_user_confirmed);
+        assert_eq!(observation.hostname.as_deref(), Some("fedora-lab"));
+    }
+
+    #[test]
+    fn ssh_permission_denied_is_not_authentication_success() {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(255 << 8),
+            stdout: vec![],
+            stderr: b"forge@host: Permission denied (publickey).".to_vec(),
+        };
+        let observation = parse_ssh_observation(&output);
+        assert_eq!(
+            observation.status,
+            forge_provisioning::SshStatus::AuthenticationFailed
+        );
+        assert_eq!(
+            observation.cloud_init,
+            forge_provisioning::CloudInitStatus::Unknown
+        );
+        assert!(!observation.forge_user_confirmed);
     }
 }
