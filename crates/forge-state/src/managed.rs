@@ -53,6 +53,24 @@ pub struct GenerationIndex {
     pub domain_uuid: String,
     pub active_generation_id: String,
     pub generations: Vec<GenerationEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cleanup_progress: Vec<CleanupProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupPhase {
+    SeedDeletePending,
+    OverlayDeletePending,
+    IncompleteAfterSeed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupProgress {
+    pub generation_id: String,
+    pub phase: CleanupPhase,
+    pub deleted_roles: Vec<ResourceRole>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,14 +165,15 @@ pub struct ManagedRecoveryPlan {
 pub struct ResourceEvidence {
     pub resource: ManagedResource,
     pub exists: bool,
+    pub observed_resource: Option<ManagedResource>,
     pub referenced_by_domains: Vec<String>,
     pub backing_for_volumes: Vec<String>,
-    pub identity_matches: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetainedEvidence {
     pub manifest: GenerationManifest,
+    pub observed_pool_uuid: String,
     pub resources: Vec<ResourceEvidence>,
 }
 
@@ -173,6 +192,10 @@ pub struct ManagedCleanupPlan {
     pub shared_protected: Vec<String>,
     pub candidates: Vec<ManagedCleanupCandidate>,
     pub refused: Vec<String>,
+    pub already_cleaned_generation_ids: Vec<String>,
+    pub source_index: GenerationIndex,
+    pub source_evidence: Vec<RetainedEvidence>,
+    pub source_reconciliation: ManagedReconciliationStatus,
     pub mutation: bool,
 }
 
@@ -180,11 +203,28 @@ pub trait CleanupBackend {
     /// Revalidates the complete candidate immediately before mutation.
     /// # Errors
     /// Returns a fail-closed reason when identity or references changed.
-    fn revalidate(&mut self, candidate: &ManagedCleanupCandidate) -> Result<(), String>;
+    fn revalidate(
+        &mut self,
+        plan: &ManagedCleanupPlan,
+        candidate: &ManagedCleanupCandidate,
+    ) -> Result<(), String>;
+    /// Atomically persists one crash-recovery checkpoint after comparing the current index
+    /// with `expected`.
+    /// # Errors
+    /// Returns a fail-closed state-change or durable-write error.
+    fn persist_index(
+        &mut self,
+        expected: &GenerationIndex,
+        next: &GenerationIndex,
+    ) -> Result<(), String>;
     /// Deletes the exact already-revalidated resource.
     /// # Errors
     /// Returns the backend deletion failure and stops the cleanup sequence.
     fn delete_exact(&mut self, resource: &ManagedResource) -> Result<(), String>;
+    /// Proves through the storage API that the exact volume identity no longer exists.
+    /// # Errors
+    /// Returns an error if the volume still exists or absence cannot be established.
+    fn verify_absent(&mut self, resource: &ManagedResource) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,20 +239,51 @@ pub struct CleanupExecution {
 /// Returns the first revalidation, deletion, or state-transition failure.
 pub fn execute_cleanup_candidate<B: CleanupBackend>(
     backend: &mut B,
-    index: &GenerationIndex,
+    plan: &ManagedCleanupPlan,
     candidate: &ManagedCleanupCandidate,
 ) -> Result<CleanupExecution, String> {
-    backend.revalidate(candidate)?;
-    let mut deleted = Vec::new();
-    for resource in &candidate.resources {
-        if resource.role == ResourceRole::SharedBase {
-            return Err("shared base deletion is forbidden".to_owned());
-        }
-        backend.delete_exact(resource)?;
-        deleted.push(resource.path.clone());
+    backend.revalidate(plan, candidate)?;
+    let seed = candidate
+        .resources
+        .iter()
+        .find(|resource| resource.role == ResourceRole::NoCloudSeed)
+        .ok_or_else(|| "cleanup candidate has no exact seed".to_owned())?;
+    let overlay = candidate
+        .resources
+        .iter()
+        .find(|resource| resource.role == ResourceRole::WritableOverlay)
+        .ok_or_else(|| "cleanup candidate has no exact overlay".to_owned())?;
+    if candidate.resources.len() != 2 {
+        return Err("cleanup candidate must contain exactly seed and overlay".to_owned());
     }
+    let mut current = begin_cleanup(&plan.source_index, &candidate.generation_id)
+        .map_err(|error| error.to_string())?;
+    backend.persist_index(&plan.source_index, &current)?;
+    let mut deleted = Vec::new();
+    if let Err(error) = backend.delete_exact(seed) {
+        return Err(format!(
+            "seed delete failed before any successful delete: {error}"
+        ));
+    }
+    backend.verify_absent(seed)?;
+    deleted.push(seed.path.clone());
+    let seed_deleted = record_seed_deleted(&current, &candidate.generation_id)
+        .map_err(|error| error.to_string())?;
+    backend.persist_index(&current, &seed_deleted)?;
+    current = seed_deleted;
+    if let Err(error) = backend.delete_exact(overlay) {
+        let incomplete = record_cleanup_incomplete(&current, &candidate.generation_id)
+            .map_err(|state_error| state_error.to_string())?;
+        backend.persist_index(&current, &incomplete)?;
+        return Err(format!(
+            "overlay delete failed after seed deletion; cleanup is incomplete: {error}"
+        ));
+    }
+    backend.verify_absent(overlay)?;
+    deleted.push(overlay.path.clone());
     let next_index =
-        remove_generation(index, &candidate.generation_id).map_err(|error| error.to_string())?;
+        complete_cleanup(&current, &candidate.generation_id).map_err(|error| error.to_string())?;
+    backend.persist_index(&current, &next_index)?;
     Ok(CleanupExecution {
         next_index,
         deleted,
@@ -516,6 +587,7 @@ pub fn plan_migration(
             status: GenerationStatus::Active,
             manifest_file: format!("generations/{}.json", manifest.generation_id),
         }],
+        cleanup_progress: Vec::new(),
     };
     validate_index(&index)?;
     Ok(MigrationPlan {
@@ -755,7 +827,171 @@ pub fn validate_index(index: &GenerationIndex) -> Result<(), StateError> {
             "duplicate generation ID".to_owned(),
         ));
     }
+    let progress_ids = index
+        .cleanup_progress
+        .iter()
+        .map(|progress| &progress.generation_id)
+        .collect::<BTreeSet<_>>();
+    if progress_ids.len() != index.cleanup_progress.len() {
+        return Err(StateError::InvalidObservedState(
+            "duplicate cleanup progress identity".to_owned(),
+        ));
+    }
+    for progress in &index.cleanup_progress {
+        let Some(entry) = index
+            .generations
+            .iter()
+            .find(|entry| entry.generation_id == progress.generation_id)
+        else {
+            return Err(StateError::InvalidObservedState(
+                "cleanup progress generation is absent".to_owned(),
+            ));
+        };
+        if entry.status != GenerationStatus::Retained {
+            return Err(StateError::InvalidObservedState(
+                "cleanup progress is allowed only for Retained generation".to_owned(),
+            ));
+        }
+        let expected_deleted = match progress.phase {
+            CleanupPhase::SeedDeletePending => &[][..],
+            CleanupPhase::OverlayDeletePending | CleanupPhase::IncompleteAfterSeed => {
+                &[ResourceRole::NoCloudSeed][..]
+            }
+        };
+        if progress.deleted_roles != expected_deleted {
+            return Err(StateError::InvalidObservedState(
+                "cleanup progress roles do not match its phase".to_owned(),
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Publishes durable intent before the first irreversible delete.
+/// # Errors
+/// Refuses non-Retained, active, missing, or already-progressing generations.
+pub fn begin_cleanup(
+    index: &GenerationIndex,
+    generation_id: &str,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    let entry = index
+        .generations
+        .iter()
+        .find(|entry| entry.generation_id == generation_id)
+        .ok_or_else(|| StateError::InvalidObservedState("cleanup generation is absent".into()))?;
+    if entry.status == GenerationStatus::Cleaned {
+        return Err(StateError::InvalidObservedState(
+            "generation is already Cleaned".into(),
+        ));
+    }
+    if entry.status != GenerationStatus::Retained {
+        return Err(StateError::InvalidObservedState(
+            "cleanup requires a Retained generation".into(),
+        ));
+    }
+    if index
+        .cleanup_progress
+        .iter()
+        .any(|progress| progress.generation_id == generation_id)
+    {
+        return Err(StateError::InvalidObservedState(
+            "generation already has durable cleanup progress".into(),
+        ));
+    }
+    let mut next = index.clone();
+    next.cleanup_progress.push(CleanupProgress {
+        generation_id: generation_id.to_owned(),
+        phase: CleanupPhase::SeedDeletePending,
+        deleted_roles: Vec::new(),
+    });
+    validate_index(&next)?;
+    Ok(next)
+}
+
+/// Records verified seed absence and authorizes only the overlay step.
+/// # Errors
+/// Refuses missing or unexpected cleanup progress.
+pub fn record_seed_deleted(
+    index: &GenerationIndex,
+    generation_id: &str,
+) -> Result<GenerationIndex, StateError> {
+    let mut next = index.clone();
+    let progress = next
+        .cleanup_progress
+        .iter_mut()
+        .find(|progress| progress.generation_id == generation_id)
+        .ok_or_else(|| StateError::InvalidObservedState("cleanup progress is absent".into()))?;
+    if progress.phase != CleanupPhase::SeedDeletePending {
+        return Err(StateError::InvalidObservedState(
+            "seed delete is not the pending cleanup step".into(),
+        ));
+    }
+    progress.phase = CleanupPhase::OverlayDeletePending;
+    progress.deleted_roles = vec![ResourceRole::NoCloudSeed];
+    validate_index(&next)?;
+    Ok(next)
+}
+
+/// Records an irreversible partial result without attempting rollback.
+/// # Errors
+/// Refuses a failure outside the overlay step.
+pub fn record_cleanup_incomplete(
+    index: &GenerationIndex,
+    generation_id: &str,
+) -> Result<GenerationIndex, StateError> {
+    let mut next = index.clone();
+    let progress = next
+        .cleanup_progress
+        .iter_mut()
+        .find(|progress| progress.generation_id == generation_id)
+        .ok_or_else(|| StateError::InvalidObservedState("cleanup progress is absent".into()))?;
+    if progress.phase != CleanupPhase::OverlayDeletePending {
+        return Err(StateError::InvalidObservedState(
+            "partial cleanup can be recorded only after seed deletion".into(),
+        ));
+    }
+    progress.phase = CleanupPhase::IncompleteAfterSeed;
+    validate_index(&next)?;
+    Ok(next)
+}
+
+/// Marks a generation Cleaned only after both exact disposable resources were verified absent.
+/// # Errors
+/// Refuses incomplete progress and every status other than Retained.
+pub fn complete_cleanup(
+    index: &GenerationIndex,
+    generation_id: &str,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    let progress = index
+        .cleanup_progress
+        .iter()
+        .find(|progress| progress.generation_id == generation_id)
+        .ok_or_else(|| StateError::InvalidObservedState("cleanup progress is absent".into()))?;
+    if progress.phase != CleanupPhase::OverlayDeletePending
+        || progress.deleted_roles != [ResourceRole::NoCloudSeed]
+    {
+        return Err(StateError::InvalidObservedState(
+            "cleanup is not ready for final completion".into(),
+        ));
+    }
+    let mut next = index.clone();
+    let entry = next
+        .generations
+        .iter_mut()
+        .find(|entry| entry.generation_id == generation_id)
+        .ok_or_else(|| StateError::InvalidObservedState("cleanup generation is absent".into()))?;
+    if entry.status != GenerationStatus::Retained {
+        return Err(StateError::InvalidObservedState(
+            "only Retained generation can become Cleaned".into(),
+        ));
+    }
+    entry.status = GenerationStatus::Cleaned;
+    next.cleanup_progress
+        .retain(|progress| progress.generation_id != generation_id);
+    validate_index(&next)?;
+    Ok(next)
 }
 
 /// Reads and validates an index; absence is not an error.
@@ -781,32 +1017,6 @@ pub fn write_index_atomic(path: &Path, index: &GenerationIndex) -> Result<(), St
     let bytes = serde_json::to_vec_pretty(index)
         .map_err(|error| StateError::CorruptManifest(error.to_string()))?;
     atomic_bytes(path, &bytes)
-}
-
-/// Marks only a Retained entry as Cleaned in a future index value.
-/// # Errors
-/// Rejects absent, Active, Preparing, or Failed generations.
-pub fn remove_generation(
-    index: &GenerationIndex,
-    generation_id: &str,
-) -> Result<GenerationIndex, StateError> {
-    validate_index(index)?;
-    let position = index
-        .generations
-        .iter()
-        .position(|entry| entry.generation_id == generation_id)
-        .ok_or_else(|| {
-            StateError::InvalidObservedState("cleanup generation is absent".to_owned())
-        })?;
-    if index.generations[position].status != GenerationStatus::Retained {
-        return Err(StateError::InvalidObservedState(
-            "only Retained generation state can be removed".to_owned(),
-        ));
-    }
-    let mut next = index.clone();
-    next.generations[position].status = GenerationStatus::Cleaned;
-    validate_index(&next)?;
-    Ok(next)
 }
 
 fn atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
@@ -848,12 +1058,24 @@ fn atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
 /// Produces a zero-mutation cleanup plan from manifests and libvirt evidence.
 /// # Errors
 /// Rejects an invalid or ambiguous generation index.
+#[allow(clippy::too_many_lines)]
 pub fn plan_managed_cleanup(
     index: &GenerationIndex,
     evidence: &[RetainedEvidence],
     unmanaged: Vec<String>,
+    reconciliation: ManagedReconciliationStatus,
 ) -> Result<ManagedCleanupPlan, StateError> {
     validate_index(index)?;
+    if reconciliation != ManagedReconciliationStatus::Consistent {
+        return Err(StateError::InvalidObservedState(
+            "cleanup requires Consistent managed reconciliation".to_owned(),
+        ));
+    }
+    if !index.cleanup_progress.is_empty() {
+        return Err(StateError::InvalidObservedState(
+            "cleanup progress requires explicit resume/recovery".to_owned(),
+        ));
+    }
     if index
         .generations
         .iter()
@@ -871,6 +1093,12 @@ pub fn plan_managed_cleanup(
         .filter(|entry| entry.status == GenerationStatus::Retained)
         .map(|entry| entry.generation_id.clone())
         .collect::<Vec<_>>();
+    let already_cleaned_generation_ids = index
+        .generations
+        .iter()
+        .filter(|entry| entry.status == GenerationStatus::Cleaned)
+        .map(|entry| entry.generation_id.clone())
+        .collect::<Vec<_>>();
     let mut protected = BTreeSet::new();
     for generation in evidence {
         for resource in &generation.manifest.resources {
@@ -883,6 +1111,13 @@ pub fn plan_managed_cleanup(
         {
             continue;
         }
+        if generation.observed_pool_uuid != generation.manifest.storage_pool_uuid {
+            refused.push(format!(
+                "{}: storage pool UUID changed",
+                generation.manifest.generation_id
+            ));
+            continue;
+        }
         let disposable = generation
             .resources
             .iter()
@@ -891,17 +1126,23 @@ pub fn plan_managed_cleanup(
         let safe = disposable.len() == 2
             && disposable.iter().all(|item| {
                 item.exists
-                    && item.identity_matches
+                    && item.observed_resource.as_ref() == Some(&item.resource)
                     && item.referenced_by_domains.is_empty()
                     && item.backing_for_volumes.is_empty()
             });
         if safe {
+            let mut resources = disposable
+                .iter()
+                .map(|item| item.resource.clone())
+                .collect::<Vec<_>>();
+            resources.sort_by_key(|resource| match resource.role {
+                ResourceRole::NoCloudSeed => 0,
+                ResourceRole::WritableOverlay => 1,
+                ResourceRole::SharedBase => 2,
+            });
             candidates.push(ManagedCleanupCandidate {
                 generation_id: generation.manifest.generation_id.clone(),
-                resources: disposable
-                    .iter()
-                    .map(|item| item.resource.clone())
-                    .collect(),
+                resources,
                 proof: vec![
                     "durable Retained manifest and index agree".to_owned(),
                     "exact libvirt key/path/format/capacity/backing metadata agree".to_owned(),
@@ -930,6 +1171,10 @@ pub fn plan_managed_cleanup(
         shared_protected: protected.into_iter().collect(),
         candidates,
         refused,
+        already_cleaned_generation_ids,
+        source_index: index.clone(),
+        source_evidence: evidence.to_vec(),
+        source_reconciliation: reconciliation,
         mutation: false,
     })
 }
@@ -1038,6 +1283,7 @@ mod tests {
                 status: GenerationStatus::Active,
                 manifest_file: "generations/old.json".into(),
             }],
+            cleanup_progress: Vec::new(),
         }
     }
     fn observed(id: &str) -> ObservedGeneration {
@@ -1090,6 +1336,7 @@ mod tests {
                     manifest_file: "generations/c.json".into(),
                 },
             ],
+            cleanup_progress: Vec::new(),
         }
     }
     fn recovery_manifests() -> Vec<GenerationManifest> {
@@ -1395,6 +1642,7 @@ mod tests {
                 &recovery_index,
                 &[evidence(GenerationStatus::Retained, false)],
                 vec![],
+                ManagedReconciliationStatus::Consistent,
             )
             .is_err()
         );
@@ -1413,15 +1661,16 @@ mod tests {
             .iter()
             .cloned()
             .map(|resource| ResourceEvidence {
+                observed_resource: Some(resource.clone()),
                 resource,
                 exists: true,
                 referenced_by_domains: if refs { vec!["other".into()] } else { vec![] },
                 backing_for_volumes: vec![],
-                identity_matches: true,
             })
             .collect();
         RetainedEvidence {
             manifest: m,
+            observed_pool_uuid: "pu".into(),
             resources,
         }
     }
@@ -1443,6 +1692,7 @@ mod tests {
                     manifest_file: "new".into(),
                 },
             ],
+            cleanup_progress: Vec::new(),
         }
     }
     #[test]
@@ -1451,6 +1701,7 @@ mod tests {
             &retained_index(),
             &[evidence(GenerationStatus::Retained, false)],
             vec![],
+            ManagedReconciliationStatus::Consistent,
         )
         .unwrap();
         assert_eq!(plan.candidates.len(), 1);
@@ -1467,13 +1718,20 @@ mod tests {
             &index(),
             &[evidence(GenerationStatus::Active, false)],
             vec![],
+            ManagedReconciliationStatus::Consistent,
         )
         .unwrap();
         assert!(plan.candidates.is_empty());
     }
     #[test]
     fn unmanaged_legacy_is_never_candidate() {
-        let plan = plan_managed_cleanup(&index(), &[], vec!["legacy".into()]).unwrap();
+        let plan = plan_managed_cleanup(
+            &index(),
+            &[],
+            vec!["legacy".into()],
+            ManagedReconciliationStatus::Consistent,
+        )
+        .unwrap();
         assert_eq!(plan.unmanaged_legacy, ["legacy"]);
         assert!(plan.candidates.is_empty());
     }
@@ -1483,6 +1741,7 @@ mod tests {
             &retained_index(),
             &[evidence(GenerationStatus::Retained, true)],
             vec![],
+            ManagedReconciliationStatus::Consistent,
         )
         .unwrap();
         assert!(plan.candidates.is_empty());
@@ -1494,9 +1753,132 @@ mod tests {
             &retained_index(),
             &[evidence(GenerationStatus::Retained, false)],
             vec![],
+            ManagedReconciliationStatus::Consistent,
         )
         .unwrap();
         assert!(!plan.mutation);
+    }
+    #[test]
+    fn cleanup_refuses_non_retained_and_reports_unmanaged_without_candidates() {
+        let active = plan_managed_cleanup(
+            &index(),
+            &[evidence(GenerationStatus::Active, false)],
+            vec![],
+            ManagedReconciliationStatus::Consistent,
+        )
+        .unwrap();
+        assert!(active.candidates.is_empty());
+
+        let mut preparing = retained_index();
+        preparing.generations[0].status = GenerationStatus::Preparing;
+        assert!(
+            plan_managed_cleanup(
+                &preparing,
+                &[evidence(GenerationStatus::Preparing, false)],
+                vec![],
+                ManagedReconciliationStatus::RecoveryRequired,
+            )
+            .is_err()
+        );
+
+        let mut failed = retained_index();
+        failed.generations[0].status = GenerationStatus::Failed;
+        let failed_plan = plan_managed_cleanup(
+            &failed,
+            &[evidence(GenerationStatus::Failed, false)],
+            vec![],
+            ManagedReconciliationStatus::Consistent,
+        )
+        .unwrap();
+        assert!(failed_plan.candidates.is_empty());
+
+        let unmanaged = plan_managed_cleanup(
+            &index(),
+            &[],
+            vec!["/unmanaged".into()],
+            ManagedReconciliationStatus::Consistent,
+        )
+        .unwrap();
+        assert_eq!(unmanaged.unmanaged_legacy, ["/unmanaged"]);
+        assert!(unmanaged.candidates.is_empty());
+    }
+    #[test]
+    fn cleanup_refuses_wrong_pool_and_every_volume_identity_field() {
+        let mut wrong_pool = evidence(GenerationStatus::Retained, false);
+        wrong_pool.observed_pool_uuid = "wrong".into();
+        let pool_plan = plan_managed_cleanup(
+            &retained_index(),
+            &[wrong_pool],
+            vec![],
+            ManagedReconciliationStatus::Consistent,
+        )
+        .unwrap();
+        assert!(pool_plan.candidates.is_empty());
+
+        for mutate in [
+            |resource: &mut ManagedResource| resource.volume_key = "wrong".into(),
+            |resource: &mut ManagedResource| resource.path = "/wrong".into(),
+            |resource: &mut ManagedResource| resource.format = "wrong".into(),
+            |resource: &mut ManagedResource| resource.capacity_bytes += 1,
+            |resource: &mut ManagedResource| resource.backing_path = Some("/wrong".into()),
+        ] {
+            let mut wrong = evidence(GenerationStatus::Retained, false);
+            let observed = wrong.resources[1].observed_resource.as_mut().unwrap();
+            mutate(observed);
+            let plan = plan_managed_cleanup(
+                &retained_index(),
+                &[wrong],
+                vec![],
+                ManagedReconciliationStatus::Consistent,
+            )
+            .unwrap();
+            assert!(plan.candidates.is_empty());
+            assert!(!plan.refused.is_empty());
+        }
+    }
+    #[test]
+    fn cleanup_refuses_cross_domain_and_backing_references() {
+        let mut domain_reference = evidence(GenerationStatus::Retained, false);
+        domain_reference.resources[1].referenced_by_domains = vec!["other-domain".into()];
+        let mut backing_reference = evidence(GenerationStatus::Retained, false);
+        backing_reference.resources[1].backing_for_volumes = vec!["dependent.qcow2".into()];
+        for unsafe_evidence in [domain_reference, backing_reference] {
+            let plan = plan_managed_cleanup(
+                &retained_index(),
+                &[unsafe_evidence],
+                vec![],
+                ManagedReconciliationStatus::Consistent,
+            )
+            .unwrap();
+            assert!(plan.candidates.is_empty());
+        }
+    }
+    #[test]
+    fn cleanup_requires_consistent_reconciliation() {
+        assert!(
+            plan_managed_cleanup(
+                &retained_index(),
+                &[evidence(GenerationStatus::Retained, false)],
+                vec![],
+                ManagedReconciliationStatus::Conflict,
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn cleaned_generation_is_typed_idempotent_zero_mutation() {
+        let mut cleaned = retained_index();
+        cleaned.generations[0].status = GenerationStatus::Cleaned;
+        let plan = plan_managed_cleanup(
+            &cleaned,
+            &[],
+            vec![],
+            ManagedReconciliationStatus::Consistent,
+        )
+        .unwrap();
+        assert!(plan.candidates.is_empty());
+        assert_eq!(plan.already_cleaned_generation_ids, ["old"]);
+        assert!(begin_cleanup(&cleaned, "old").is_err());
     }
     #[test]
     fn index_atomic_write_has_private_permissions() {
@@ -1519,18 +1901,48 @@ mod tests {
     }
     struct CleanupMock {
         revalidated: bool,
-        deletes: usize,
+        durable: GenerationIndex,
+        deletes: Vec<ResourceRole>,
+        existing: Vec<ResourceRole>,
         fail_at: Option<usize>,
+        revalidation_fails: bool,
     }
     impl CleanupBackend for CleanupMock {
-        fn revalidate(&mut self, _: &ManagedCleanupCandidate) -> Result<(), String> {
+        fn revalidate(
+            &mut self,
+            _: &ManagedCleanupPlan,
+            _: &ManagedCleanupCandidate,
+        ) -> Result<(), String> {
             self.revalidated = true;
+            if self.revalidation_fails {
+                Err("snapshot changed".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn persist_index(
+            &mut self,
+            expected: &GenerationIndex,
+            next: &GenerationIndex,
+        ) -> Result<(), String> {
+            if &self.durable != expected {
+                return Err("durable index changed".into());
+            }
+            self.durable = next.clone();
             Ok(())
         }
-        fn delete_exact(&mut self, _: &ManagedResource) -> Result<(), String> {
-            self.deletes += 1;
-            if self.fail_at == Some(self.deletes) {
+        fn delete_exact(&mut self, resource: &ManagedResource) -> Result<(), String> {
+            self.deletes.push(resource.role);
+            if self.fail_at == Some(self.deletes.len()) {
                 Err("delete failed".into())
+            } else {
+                self.existing.retain(|role| role != &resource.role);
+                Ok(())
+            }
+        }
+        fn verify_absent(&mut self, resource: &ManagedResource) -> Result<(), String> {
+            if self.existing.contains(&resource.role) {
+                Err("resource still exists".into())
             } else {
                 Ok(())
             }
@@ -1542,18 +1954,28 @@ mod tests {
             &retained_index(),
             &[evidence(GenerationStatus::Retained, false)],
             vec![],
+            ManagedReconciliationStatus::Consistent,
         )
         .unwrap();
         let mut backend = CleanupMock {
             revalidated: false,
-            deletes: 0,
+            durable: retained_index(),
+            deletes: Vec::new(),
+            existing: vec![
+                ResourceRole::SharedBase,
+                ResourceRole::WritableOverlay,
+                ResourceRole::NoCloudSeed,
+            ],
             fail_at: None,
+            revalidation_fails: false,
         };
-        let result =
-            execute_cleanup_candidate(&mut backend, &retained_index(), &plan.candidates[0])
-                .unwrap();
+        let result = execute_cleanup_candidate(&mut backend, &plan, &plan.candidates[0]).unwrap();
         assert!(backend.revalidated);
-        assert_eq!(backend.deletes, 2);
+        assert_eq!(
+            backend.deletes,
+            [ResourceRole::NoCloudSeed, ResourceRole::WritableOverlay]
+        );
+        assert_eq!(backend.existing, [ResourceRole::SharedBase]);
         assert!(
             result
                 .next_index
@@ -1568,21 +1990,62 @@ mod tests {
             &retained_index(),
             &[evidence(GenerationStatus::Retained, false)],
             vec![],
+            ManagedReconciliationStatus::Consistent,
         )
         .unwrap();
-        let original = retained_index();
         let mut backend = CleanupMock {
             revalidated: false,
-            deletes: 0,
-            fail_at: Some(1),
+            durable: retained_index(),
+            deletes: Vec::new(),
+            existing: vec![
+                ResourceRole::SharedBase,
+                ResourceRole::WritableOverlay,
+                ResourceRole::NoCloudSeed,
+            ],
+            fail_at: Some(2),
+            revalidation_fails: false,
         };
-        assert!(execute_cleanup_candidate(&mut backend, &original, &plan.candidates[0]).is_err());
-        assert_eq!(backend.deletes, 1);
-        assert!(
-            original
-                .generations
-                .iter()
-                .any(|e| e.generation_id == "old")
+        assert!(execute_cleanup_candidate(&mut backend, &plan, &plan.candidates[0]).is_err());
+        assert_eq!(backend.deletes.len(), 2);
+        assert_eq!(
+            backend.durable.cleanup_progress[0].phase,
+            CleanupPhase::IncompleteAfterSeed
         );
+        assert_eq!(
+            backend.durable.cleanup_progress[0].deleted_roles,
+            [ResourceRole::NoCloudSeed]
+        );
+        assert_eq!(
+            backend.durable.generations[0].status,
+            GenerationStatus::Retained
+        );
+        assert!(!backend.existing.contains(&ResourceRole::NoCloudSeed));
+        assert!(backend.existing.contains(&ResourceRole::WritableOverlay));
+        assert!(backend.existing.contains(&ResourceRole::SharedBase));
+    }
+    #[test]
+    fn cleanup_toctou_refusal_happens_before_delete() {
+        let plan = plan_managed_cleanup(
+            &retained_index(),
+            &[evidence(GenerationStatus::Retained, false)],
+            vec![],
+            ManagedReconciliationStatus::Consistent,
+        )
+        .unwrap();
+        let mut backend = CleanupMock {
+            revalidated: false,
+            durable: retained_index(),
+            deletes: Vec::new(),
+            existing: vec![
+                ResourceRole::SharedBase,
+                ResourceRole::WritableOverlay,
+                ResourceRole::NoCloudSeed,
+            ],
+            fail_at: None,
+            revalidation_fails: true,
+        };
+        assert!(execute_cleanup_candidate(&mut backend, &plan, &plan.candidates[0]).is_err());
+        assert!(backend.deletes.is_empty());
+        assert!(backend.durable.cleanup_progress.is_empty());
     }
 }

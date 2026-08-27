@@ -585,6 +585,164 @@ fn load_index_manifests(
         .collect()
 }
 
+fn discover_cleanup_evidence(
+    backend: &forge_libvirt::LibvirtBootBackend,
+    index: &forge_state::GenerationIndex,
+    manifests: &[forge_state::GenerationManifest],
+    observed_active: &forge_state::ObservedGeneration,
+) -> Vec<forge_state::RetainedEvidence> {
+    manifests
+        .iter()
+        .map(|manifest| {
+            let overlay = manifest
+                .resources
+                .iter()
+                .find(|resource| resource.role == forge_state::ResourceRole::WritableOverlay)
+                .map_or("", |resource| resource.path.as_str());
+            let seed = manifest
+                .resources
+                .iter()
+                .find(|resource| resource.role == forge_state::ResourceRole::NoCloudSeed)
+                .map_or("", |resource| resource.path.as_str());
+            let actual = if manifest.generation_id == index.active_generation_id {
+                Ok(observed_active.clone())
+            } else {
+                backend.inspect_generation_paths(overlay, seed)
+            };
+            let observed_pool_uuid = actual
+                .as_ref()
+                .map(|value| value.storage_pool_uuid.clone())
+                .unwrap_or_default();
+            let resources = match actual {
+                Ok(actual) => manifest
+                    .resources
+                    .iter()
+                    .map(|expected| {
+                        let found = actual
+                            .resources
+                            .iter()
+                            .find(|resource| resource.role == expected.role);
+                        forge_state::ResourceEvidence {
+                            resource: expected.clone(),
+                            exists: found.is_some(),
+                            observed_resource: found.map(|item| forge_state::ManagedResource {
+                                role: item.role,
+                                volume_name: item.volume_name.clone(),
+                                volume_key: item.volume_key.clone(),
+                                path: item.path.clone(),
+                                format: item.format.clone(),
+                                capacity_bytes: item.capacity_bytes,
+                                backing_path: item.backing_path.clone(),
+                            }),
+                            referenced_by_domains: found
+                                .map(|item| item.referenced_by_domains.clone())
+                                .unwrap_or_default(),
+                            backing_for_volumes: found
+                                .map(|item| item.backing_for_volumes.clone())
+                                .unwrap_or_default(),
+                        }
+                    })
+                    .collect(),
+                Err(_) => manifest
+                    .resources
+                    .iter()
+                    .cloned()
+                    .map(|resource| forge_state::ResourceEvidence {
+                        resource,
+                        exists: false,
+                        observed_resource: None,
+                        referenced_by_domains: Vec::new(),
+                        backing_for_volumes: Vec::new(),
+                    })
+                    .collect(),
+            };
+            let mut authoritative = manifest.clone();
+            if let Some(entry) = index
+                .generations
+                .iter()
+                .find(|entry| entry.generation_id == manifest.generation_id)
+            {
+                authoritative.status = entry.status;
+            }
+            forge_state::RetainedEvidence {
+                manifest: authoritative,
+                observed_pool_uuid,
+                resources,
+            }
+        })
+        .collect()
+}
+
+struct CleanupExecutor<'a> {
+    backend: &'a forge_libvirt::LibvirtBootBackend,
+    layout: &'a forge_state::StateLayout,
+}
+
+impl forge_state::CleanupBackend for CleanupExecutor<'_> {
+    fn revalidate(
+        &mut self,
+        plan: &forge_state::ManagedCleanupPlan,
+        candidate: &forge_state::ManagedCleanupCandidate,
+    ) -> Result<(), String> {
+        let fresh_index = forge_state::read_index(&self.layout.index)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "generation index disappeared".to_owned())?;
+        if fresh_index != plan.source_index {
+            return Err("generation index changed since planning".to_owned());
+        }
+        let manifests = load_index_manifests(self.layout, &fresh_index)?;
+        let observed = self
+            .backend
+            .inspect_state()
+            .map_err(|error| error.to_string())?;
+        let reconciliation = forge_state::reconcile_managed(&fresh_index, &manifests, &observed);
+        let evidence = discover_cleanup_evidence(self.backend, &fresh_index, &manifests, &observed);
+        let fresh_plan = forge_state::plan_managed_cleanup(
+            &fresh_index,
+            &evidence,
+            observed.unmanaged_resources.clone(),
+            reconciliation.status,
+        )
+        .map_err(|error| error.to_string())?;
+        if fresh_plan.source_evidence != plan.source_evidence
+            || fresh_plan.source_reconciliation != plan.source_reconciliation
+            || fresh_plan.unmanaged_legacy != plan.unmanaged_legacy
+            || fresh_plan.shared_protected != plan.shared_protected
+            || fresh_plan.candidates != plan.candidates
+            || !fresh_plan.candidates.contains(candidate)
+        {
+            return Err("libvirt/storage cleanup snapshot changed since planning".to_owned());
+        }
+        Ok(())
+    }
+
+    fn persist_index(
+        &mut self,
+        expected: &forge_state::GenerationIndex,
+        next: &forge_state::GenerationIndex,
+    ) -> Result<(), String> {
+        let current = forge_state::read_index(&self.layout.index)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "generation index disappeared".to_owned())?;
+        if &current != expected {
+            return Err("generation index changed before durable cleanup transition".to_owned());
+        }
+        forge_state::write_index_atomic(&self.layout.index, next).map_err(|error| error.to_string())
+    }
+
+    fn delete_exact(&mut self, resource: &forge_state::ManagedResource) -> Result<(), String> {
+        self.backend
+            .delete_managed_volume_exact(resource)
+            .map_err(|error| error.to_string())
+    }
+
+    fn verify_absent(&mut self, resource: &forge_state::ManagedResource) -> Result<(), String> {
+        self.backend
+            .verify_managed_volume_absent(resource)
+            .map_err(|error| error.to_string())
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn managed_cleanup(dry_run: bool) -> ExitCode {
     let layout = match managed_state_layout() {
@@ -657,82 +815,12 @@ fn managed_cleanup(dry_run: bool) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let mut evidence = Vec::new();
-    for manifest in &manifests {
-        let overlay = manifest
-            .resources
-            .iter()
-            .find(|resource| resource.role == forge_state::ResourceRole::WritableOverlay)
-            .map_or("", |resource| resource.path.as_str());
-        let seed = manifest
-            .resources
-            .iter()
-            .find(|resource| resource.role == forge_state::ResourceRole::NoCloudSeed)
-            .map_or("", |resource| resource.path.as_str());
-        let actual = if manifest.generation_id == index.active_generation_id {
-            Ok(observed_active.clone())
-        } else {
-            backend.inspect_generation_paths(overlay, seed)
-        };
-        let resources = match actual {
-            Ok(actual) => manifest
-                .resources
-                .iter()
-                .map(|expected| {
-                    let found = actual
-                        .resources
-                        .iter()
-                        .find(|resource| resource.role == expected.role);
-                    forge_state::ResourceEvidence {
-                        resource: expected.clone(),
-                        exists: found.is_some(),
-                        referenced_by_domains: found
-                            .map(|item| item.referenced_by_domains.clone())
-                            .unwrap_or_default(),
-                        backing_for_volumes: found
-                            .map(|item| item.backing_for_volumes.clone())
-                            .unwrap_or_default(),
-                        identity_matches: found.is_some_and(|item| {
-                            item.volume_name == expected.volume_name
-                                && item.volume_key == expected.volume_key
-                                && item.path == expected.path
-                                && item.format == expected.format
-                                && item.capacity_bytes == expected.capacity_bytes
-                                && item.backing_path == expected.backing_path
-                        }),
-                    }
-                })
-                .collect(),
-            Err(_) => manifest
-                .resources
-                .iter()
-                .cloned()
-                .map(|resource| forge_state::ResourceEvidence {
-                    resource,
-                    exists: false,
-                    referenced_by_domains: Vec::new(),
-                    backing_for_volumes: Vec::new(),
-                    identity_matches: false,
-                })
-                .collect(),
-        };
-        let mut authoritative = manifest.clone();
-        if let Some(entry) = index
-            .generations
-            .iter()
-            .find(|entry| entry.generation_id == manifest.generation_id)
-        {
-            authoritative.status = entry.status;
-        }
-        evidence.push(forge_state::RetainedEvidence {
-            manifest: authoritative,
-            resources,
-        });
-    }
+    let evidence = discover_cleanup_evidence(&backend, &index, &manifests, &observed_active);
     let plan = match forge_state::plan_managed_cleanup(
         &index,
         &evidence,
         observed_active.unmanaged_resources.clone(),
+        managed_reconciliation.status,
     ) {
         Ok(value) => value,
         Err(error) => {
@@ -748,13 +836,26 @@ fn managed_cleanup(dry_run: bool) -> ExitCode {
             "real"
         }
     );
-    println!("ACTIVE OWNED GENERATION\n- {}", plan.active_generation_id);
-    println!("RETAINED OWNED GENERATIONS");
+    println!("ACTIVE OWNED\n- {}", plan.active_generation_id);
+    println!("RETAINED OWNED");
     if plan.retained_generation_ids.is_empty() {
         println!("- none");
     } else {
         for id in &plan.retained_generation_ids {
             println!("- {id}");
+        }
+    }
+    println!("FAILED");
+    let failed = index
+        .generations
+        .iter()
+        .filter(|entry| entry.status == forge_state::GenerationStatus::Failed)
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        println!("- none");
+    } else {
+        for entry in failed {
+            println!("- {}", entry.generation_id);
         }
     }
     println!("UNMANAGED LEGACY");
@@ -794,6 +895,15 @@ fn managed_cleanup(dry_run: bool) -> ExitCode {
             println!("- {item}");
         }
     }
+    println!("EXECUTE ORDER");
+    println!("- revalidate complete durable/libvirt snapshot");
+    println!("- atomically persist cleanup intent");
+    println!("- exact delete seed through libvirt storage API");
+    println!("- verify exact seed absence and persist progress");
+    println!("- exact delete overlay through libvirt storage API");
+    println!("- verify exact overlay absence");
+    println!("- atomically mark generation Cleaned");
+    println!("- final managed reconciliation");
     if dry_run {
         return ExitCode::SUCCESS;
     }
@@ -809,37 +919,44 @@ fn managed_cleanup(dry_run: bool) -> ExitCode {
         eprintln!("Cleanup cancelled.");
         return ExitCode::SUCCESS;
     }
-    // Re-run the complete read-only plan immediately before exact deletion.
-    let Ok(Some(fresh)) = forge_state::read_index(&layout.index) else {
-        eprintln!("cleanup revalidation failed: index changed");
-        return ExitCode::from(1);
-    };
-    if fresh != index {
-        eprintln!("cleanup revalidation failed: generation index changed");
+    if plan.candidates.len() != 1 {
+        eprintln!("cleanup refused: execute requires exactly one proven Retained candidate");
         return ExitCode::from(1);
     }
-    let mut next = index.clone();
-    for candidate in &plan.candidates {
-        for resource in &candidate.resources {
-            if let Err(error) = backend.delete_managed_volume_exact(resource) {
-                eprintln!(
-                    "partial cleanup stopped at {}: {error}; no further resource was deleted",
-                    resource.path
-                );
-                return ExitCode::from(1);
-            }
-        }
-        next = match forge_state::remove_generation(&next, &candidate.generation_id) {
+    let mut executor = CleanupExecutor {
+        backend: &backend,
+        layout: &layout,
+    };
+    let execution =
+        match forge_state::execute_cleanup_candidate(&mut executor, &plan, &plan.candidates[0]) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("resources deleted but state update requires recovery: {error}");
+                eprintln!("cleanup stopped fail-closed: {error}");
                 return ExitCode::from(1);
             }
         };
-        if let Err(error) = forge_state::write_index_atomic(&layout.index, &next) {
-            eprintln!("resources deleted but state update requires recovery: {error}");
+    let final_manifests = match load_index_manifests(&layout, &execution.next_index) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("cleanup completed but final reconciliation failed: {error}");
             return ExitCode::from(1);
         }
+    };
+    let final_observed = match discover_state() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("cleanup completed but final reconciliation failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let final_reconciliation =
+        forge_state::reconcile_managed(&execution.next_index, &final_manifests, &final_observed);
+    if final_reconciliation.status != forge_state::ManagedReconciliationStatus::Consistent {
+        eprintln!(
+            "cleanup completed but final reconciliation is {:?}: {}",
+            final_reconciliation.status, final_reconciliation.detail
+        );
+        return ExitCode::from(1);
     }
     println!(
         "Exact retained-owned cleanup completed; shared base and unmanaged legacy were untouched."

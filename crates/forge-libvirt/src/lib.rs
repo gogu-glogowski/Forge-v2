@@ -1090,6 +1090,26 @@ impl LibvirtBootBackend {
         volume.delete(0).map_err(provisioning_backend_error)
     }
 
+    /// Proves that no libvirt storage volume remains at an exact managed path.
+    /// # Errors
+    /// Returns an error when the volume still exists or discovery is inconclusive.
+    pub fn verify_managed_volume_absent(
+        &self,
+        expected: &forge_state::ManagedResource,
+    ) -> Result<(), forge_provisioning::ProvisioningError> {
+        match StorageVol::lookup_by_path(&self.connection, &expected.path) {
+            Err(error) if error.code() == ErrorNumber::NoStorageVolume => Ok(()),
+            Err(error) => Err(provisioning_backend_error(error)),
+            Ok(volume) => {
+                let key = volume.get_key().map_err(provisioning_backend_error)?;
+                Err(forge_provisioning::ProvisioningError::Backend(format!(
+                    "managed volume still exists after delete: path={} key={key}",
+                    expected.path
+                )))
+            }
+        }
+    }
+
     /// Performs recovery-only SSH observability with a caller-supplied, dedicated known-hosts
     /// file. Global host keys and TOFU are disabled.
     /// # Errors
