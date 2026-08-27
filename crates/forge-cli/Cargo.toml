@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 forge-core = { path = "../forge-core" }
 forge-doctor = { path = "../forge-doctor" }
+forge-domain = { path = "../forge-domain" }
 forge-hardware = { path = "../forge-hardware" }
 forge-libvirt = { path = "../forge-libvirt" }
 forge-profiles = { path = "../forge-profiles" }

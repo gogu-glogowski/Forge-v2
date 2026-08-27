@@ -33,9 +33,56 @@ fn main() -> ExitCode {
         ["profile", "plan", profile_name] => plan_profile(profile_name),
         ["hypervisor", "info"] => hypervisor_info(),
         ["vm", "list"] => vm_list(),
+        ["domain", "render", profile_name] => render_domain(profile_name),
         _ => {
             print_usage();
             ExitCode::from(2)
+        }
+    }
+}
+
+fn render_domain(profile_name: &str) -> ExitCode {
+    if profile_name != "fedora-lab" {
+        eprintln!("domain rendering is currently supported only for fedora-lab");
+        return ExitCode::from(2);
+    }
+    let Some(profile) = forge_profiles::find(profile_name) else {
+        eprintln!("unknown VM profile: {profile_name}");
+        return ExitCode::from(2);
+    };
+    let hardware = match forge_hardware::collect() {
+        Ok(hardware) => hardware,
+        Err(error) => {
+            eprintln!("hardware detection failed: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let plan = match forge_profiles::plan(&hardware, &profile) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("cannot plan profile {profile_name}: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let metadata = forge_domain::DomainMetadata {
+        name: profile_name.to_owned(),
+        disk_path: format!("/var/lib/libvirt/images/{profile_name}.qcow2"),
+    };
+    let spec = match forge_domain::fedora_lab_spec(&profile, &plan, metadata) {
+        Ok(spec) => spec,
+        Err(error) => {
+            eprintln!("invalid domain specification: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match forge_domain::render_xml(&spec) {
+        Ok(xml) => {
+            print!("{xml}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("domain XML validation failed: {error}");
+            ExitCode::from(1)
         }
     }
 }
@@ -140,6 +187,7 @@ fn print_usage() {
     eprintln!("  forge profile plan <profile>");
     eprintln!("  forge hypervisor info");
     eprintln!("  forge vm list");
+    eprintln!("  forge domain render fedora-lab");
 }
 
 fn print_report(report: &DoctorReport) {

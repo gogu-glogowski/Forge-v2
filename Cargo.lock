@@ -20,6 +20,7 @@ version = "0.1.0"
 dependencies = [
  "forge-core",
  "forge-doctor",
+ "forge-domain",
  "forge-hardware",
  "forge-libvirt",
  "forge-profiles",
@@ -36,6 +37,13 @@ dependencies = [
  "forge-core",
  "forge-hardware",
  "forge-host",
+]
+
+[[package]]
+name = "forge-domain"
+version = "0.1.0"
+dependencies = [
+ "forge-core",
 ]
 
 [[package]]
