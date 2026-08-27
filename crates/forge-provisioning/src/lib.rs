@@ -13,6 +13,282 @@ pub const REBUILD_OVERLAY_VOLUME: &str = "fedora-lab.rebuild.qcow2";
 pub const REBUILD_SEED_VOLUME: &str = "fedora-lab-rebuild-seed.iso";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationVolumeStatus {
+    pub name: String,
+    pub path: String,
+    pub exists: bool,
+    pub capacity_bytes: Option<u64>,
+    pub format: Option<String>,
+    pub backing_path: Option<String>,
+    pub referenced_by_domains: Vec<String>,
+    pub backing_for_volumes: Vec<String>,
+    pub ownership_marker: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FedoraLabLifecycleStatus {
+    pub domain_state: VmState,
+    pub domain_uuid: String,
+    pub persistent: bool,
+    pub autostart: bool,
+    pub default_network: DefaultNetworkStatus,
+    pub active_overlay_path: String,
+    pub active_backing_path: Option<String>,
+    pub active_seed_path: Option<String>,
+    pub guest_agent_channel: bool,
+    pub guest_agent_status: GuestAgentStatus,
+    pub ip_addresses: Vec<String>,
+    pub base: GenerationVolumeStatus,
+    pub current_overlay: GenerationVolumeStatus,
+    pub current_seed: GenerationVolumeStatus,
+    pub legacy_overlay: GenerationVolumeStatus,
+    pub legacy_seed: GenerationVolumeStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultNetworkStatus {
+    Active,
+    Inactive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupResourceKind {
+    Overlay,
+    Seed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupCandidate {
+    pub kind: CleanupResourceKind,
+    pub name: String,
+    pub path: String,
+    pub capacity_bytes: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationCleanupPlan {
+    pub domain_state: VmState,
+    pub safe: bool,
+    pub requires_shutdown: bool,
+    pub preserve: Vec<String>,
+    pub candidates: Vec<CleanupCandidate>,
+    pub retained_unproven: Vec<String>,
+    pub preconditions: Vec<String>,
+    pub future_steps: Vec<String>,
+}
+
+/// Plans cleanup of the known Prompt 08 legacy generation without mutation.
+///
+/// # Errors
+/// Refuses to nominate any resource unless the active domain unambiguously
+/// uses the rebuilt overlay/seed and the verified base relationship.
+pub fn plan_generation_cleanup(
+    status: &FedoraLabLifecycleStatus,
+) -> Result<GenerationCleanupPlan, ProvisioningError> {
+    if !status.persistent
+        || status.active_overlay_path != status.current_overlay.path
+        || status.active_backing_path.as_deref() != Some(status.base.path.as_str())
+        || status.active_seed_path.as_deref() != Some(status.current_seed.path.as_str())
+        || !status.base.exists
+        || status.base.format.as_deref() != Some("qcow2")
+        || status.base.capacity_bytes != Some(5 * 1024 * 1024 * 1024)
+        || status.base.backing_path.is_some()
+        || !status.current_overlay.exists
+        || !status.current_seed.exists
+        || !status.guest_agent_channel
+    {
+        return Err(ProvisioningError::CleanupUnsafe(
+            "active Fedora-Lab generation cannot be proven from domain and storage metadata"
+                .to_owned(),
+        ));
+    }
+    let mut candidates = Vec::new();
+    let mut retained_unproven = Vec::new();
+    for (kind, volume) in [
+        (CleanupResourceKind::Overlay, &status.legacy_overlay),
+        (CleanupResourceKind::Seed, &status.legacy_seed),
+    ] {
+        if !volume.exists {
+            continue;
+        }
+        let expected_shape = match kind {
+            CleanupResourceKind::Overlay => {
+                volume.format.as_deref() == Some("qcow2")
+                    && volume.capacity_bytes == Some(64 * 1024 * 1024 * 1024)
+                    && volume.backing_path.as_deref() == Some(status.base.path.as_str())
+            }
+            CleanupResourceKind::Seed => {
+                matches!(volume.format.as_deref(), Some("raw" | "iso"))
+                    && volume.capacity_bytes.is_some_and(|capacity| capacity > 0)
+                    && volume.backing_path.is_none()
+            }
+        };
+        let unreferenced = volume.path != status.active_overlay_path
+            && Some(volume.path.as_str()) != status.active_seed_path.as_deref()
+            && Some(volume.path.as_str()) != status.active_backing_path.as_deref()
+            && volume.referenced_by_domains.is_empty()
+            && volume.backing_for_volumes.is_empty();
+        if expected_shape && unreferenced && volume.ownership_marker.is_some() {
+            candidates.push(CleanupCandidate {
+                kind,
+                name: volume.name.clone(),
+                path: volume.path.clone(),
+                capacity_bytes: volume.capacity_bytes.unwrap_or(0),
+                reason: "same-pool Forge-owned legacy resource with expected shape and no domain or backing references".to_owned(),
+            });
+        } else {
+            retained_unproven.push(format!(
+                "{}: retained; ownership is not proven by durable metadata (shape valid: {expected_shape}, unreferenced: {unreferenced})",
+                volume.path
+            ));
+        }
+    }
+    Ok(GenerationCleanupPlan {
+        domain_state: status.domain_state,
+        safe: true,
+        requires_shutdown: status.domain_state == VmState::Running,
+        preserve: vec![
+            format!("verified base volume: {}", status.base.path),
+            format!("active writable overlay: {}", status.current_overlay.path),
+            format!("active NoCloud seed: {}", status.current_seed.path),
+            format!("persistent domain UUID: {}", status.domain_uuid),
+        ],
+        candidates,
+        retained_unproven,
+        preconditions: vec![
+            "obtain separate explicit confirmation for real cleanup".to_owned(),
+            "perform controlled shutdown and observe unambiguous shut off".to_owned(),
+            "re-read persistent domain XML and all volume metadata".to_owned(),
+            "prove no cleanup candidate is referenced by the domain or a backing chain".to_owned(),
+        ],
+        future_steps: vec![
+            "delete only the exact legacy seed and overlay names listed as candidates".to_owned(),
+            "verify active overlay, active seed, base, and domain definition remain unchanged"
+                .to_owned(),
+            "report partial cleanup without deleting any additional resource if one deletion fails"
+                .to_owned(),
+        ],
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleAction {
+    Start,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleActionPlan {
+    pub action: LifecycleAction,
+    pub current_state: VmState,
+    pub idempotent_result: Option<LifecycleNoop>,
+    pub timeout_seconds: u64,
+    pub checks: Vec<String>,
+    pub steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleNoop {
+    AlreadyRunning,
+    AlreadyShutoff,
+}
+
+/// Plans start or graceful shutdown after validating the managed Fedora-Lab topology.
+///
+/// # Errors
+/// Rejects transient domains and storage/device configurations outside the
+/// current Forge-managed Fedora-Lab generation.
+pub fn plan_lifecycle_action(
+    status: &FedoraLabLifecycleStatus,
+    action: LifecycleAction,
+) -> Result<LifecycleActionPlan, ProvisioningError> {
+    if !status.persistent
+        || !status.base.exists
+        || status.base.format.as_deref() != Some("qcow2")
+        || status.base.capacity_bytes != Some(5 * 1024 * 1024 * 1024)
+        || status.base.backing_path.is_some()
+        || !status.current_overlay.exists
+        || !status.current_seed.exists
+        || status.active_overlay_path != status.current_overlay.path
+        || status.active_backing_path.as_deref() != Some(status.base.path.as_str())
+        || status.active_seed_path.as_deref() != Some(status.current_seed.path.as_str())
+        || status.current_overlay.format.as_deref() != Some("qcow2")
+        || status.current_overlay.capacity_bytes != Some(64 * 1024 * 1024 * 1024)
+        || status.current_overlay.backing_path.as_deref() != Some(status.base.path.as_str())
+        || !matches!(status.current_seed.format.as_deref(), Some("raw" | "iso"))
+        || !status.guest_agent_channel
+        || (action == LifecycleAction::Start
+            && status.default_network != DefaultNetworkStatus::Active)
+    {
+        return Err(ProvisioningError::LifecycleUnsafe(
+            "persistent Fedora-Lab identity and active base/overlay/seed topology could not be proven"
+                .to_owned(),
+        ));
+    }
+    let (idempotent_result, timeout_seconds, steps) = match action {
+        LifecycleAction::Start if status.domain_state == VmState::Running => (
+            Some(LifecycleNoop::AlreadyRunning),
+            60,
+            vec!["return typed AlreadyRunning without calling libvirt create".to_owned()],
+        ),
+        LifecycleAction::Start if status.domain_state == VmState::Shutoff => (
+            None,
+            180,
+            vec![
+                "call libvirt create exactly once".to_owned(),
+                "wait at most 60s for running".to_owned(),
+                "run typed DHCP, QGA, and SSH/cloud-init observability with finite timeouts"
+                    .to_owned(),
+            ],
+        ),
+        LifecycleAction::Start => {
+            return Err(ProvisioningError::LifecycleUnsafe(format!(
+                "domain cannot be started from state {}",
+                status.domain_state
+            )));
+        }
+        LifecycleAction::Shutdown if status.domain_state == VmState::Shutoff => (
+            Some(LifecycleNoop::AlreadyShutoff),
+            120,
+            vec!["return typed AlreadyShutoff without calling libvirt shutdown".to_owned()],
+        ),
+        LifecycleAction::Shutdown if status.domain_state == VmState::Running => (
+            None,
+            120,
+            vec![
+                "request graceful libvirt shutdown exactly once".to_owned(),
+                "wait at most 120s for unambiguous shut off".to_owned(),
+                "never fall back to destroy or force-off".to_owned(),
+            ],
+        ),
+        LifecycleAction::Shutdown => {
+            return Err(ProvisioningError::LifecycleUnsafe(format!(
+                "domain cannot be gracefully shut down from state {}",
+                status.domain_state
+            )));
+        }
+    };
+    let mut checks = vec![
+        "persistent domain".to_owned(),
+        "active qcow2 overlay has the trusted base backing".to_owned(),
+        "active NoCloud seed is present".to_owned(),
+        "declarative QGA channel is present".to_owned(),
+    ];
+    if action == LifecycleAction::Start {
+        checks.push("libvirt default network is active".to_owned());
+    }
+    Ok(LifecycleActionPlan {
+        action,
+        current_state: status.domain_state,
+        idempotent_result,
+        timeout_seconds,
+        checks,
+        steps,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebuildEnvironment {
     pub domain_state: VmState,
     pub domain_uuid: String,
@@ -482,6 +758,8 @@ pub enum ProvisioningError {
         primary: String,
         rollback: Vec<String>,
     },
+    CleanupUnsafe(String),
+    LifecycleUnsafe(String),
     Backend(String),
 }
 
@@ -528,6 +806,10 @@ impl fmt::Display for ProvisioningError {
                 "rebuild failed before switch: {primary}; rollback failures: {}",
                 rollback.join("; ")
             ),
+            Self::CleanupUnsafe(reason) => write!(formatter, "cleanup is unsafe: {reason}"),
+            Self::LifecycleUnsafe(reason) => {
+                write!(formatter, "lifecycle action is unsafe: {reason}")
+            }
             Self::Backend(message) => formatter.write_str(message),
         }
     }
@@ -851,6 +1133,132 @@ mod tests {
         assert!(plan.steps.last().unwrap().contains("only after"));
         assert!(plan.rollback_boundaries[0].contains("old instance remains intact"));
         assert_eq!(plan.domain_xml.matches("org.qemu.guest_agent.0").count(), 1);
+    }
+
+    fn lifecycle_status() -> FedoraLabLifecycleStatus {
+        let volume = |name: &str, exists: bool, capacity| GenerationVolumeStatus {
+            name: name.to_owned(),
+            path: format!("/pool/{name}"),
+            exists,
+            capacity_bytes: capacity,
+            format: Some(
+                if matches!(name, SEED_VOLUME | REBUILD_SEED_VOLUME) {
+                    "raw"
+                } else {
+                    "qcow2"
+                }
+                .to_owned(),
+            ),
+            backing_path: matches!(name, OVERLAY_VOLUME | REBUILD_OVERLAY_VOLUME)
+                .then(|| format!("/pool/{BASE_VOLUME}")),
+            referenced_by_domains: Vec::new(),
+            backing_for_volumes: Vec::new(),
+            ownership_marker: None,
+        };
+        FedoraLabLifecycleStatus {
+            domain_state: VmState::Running,
+            domain_uuid: "11111111-2222-3333-4444-555555555555".to_owned(),
+            persistent: true,
+            autostart: false,
+            default_network: DefaultNetworkStatus::Active,
+            active_overlay_path: "/pool/fedora-lab.rebuild.qcow2".to_owned(),
+            active_backing_path: Some("/pool/forge-base-fedora-44.qcow2".to_owned()),
+            active_seed_path: Some("/pool/fedora-lab-rebuild-seed.iso".to_owned()),
+            guest_agent_channel: true,
+            guest_agent_status: GuestAgentStatus::Available,
+            ip_addresses: vec!["192.0.2.10".to_owned()],
+            base: volume(BASE_VOLUME, true, Some(5 * 1024 * 1024 * 1024)),
+            current_overlay: volume(REBUILD_OVERLAY_VOLUME, true, Some(64 * 1024 * 1024 * 1024)),
+            current_seed: volume(REBUILD_SEED_VOLUME, true, Some(374_784)),
+            legacy_overlay: volume(OVERLAY_VOLUME, true, Some(64 * 1024 * 1024 * 1024)),
+            legacy_seed: volume(SEED_VOLUME, true, Some(374_784)),
+        }
+    }
+
+    #[test]
+    fn cleanup_retains_legacy_generation_without_durable_ownership() {
+        let plan = plan_generation_cleanup(&lifecycle_status()).unwrap();
+        assert!(plan.safe);
+        assert!(plan.requires_shutdown);
+        assert!(plan.candidates.is_empty());
+        assert_eq!(plan.retained_unproven.len(), 2);
+        assert!(
+            plan.preserve
+                .iter()
+                .any(|resource| resource.contains(REBUILD_OVERLAY_VOLUME))
+        );
+        assert!(
+            !plan
+                .candidates
+                .iter()
+                .any(|candidate| candidate.name == BASE_VOLUME)
+        );
+    }
+
+    #[test]
+    fn cleanup_requires_shape_references_and_ownership_marker() {
+        let mut status = lifecycle_status();
+        status.legacy_overlay.ownership_marker = Some("forge-generation:v1".to_owned());
+        status.legacy_seed.ownership_marker = Some("forge-generation:v1".to_owned());
+        let plan = plan_generation_cleanup(&status).unwrap();
+        assert_eq!(plan.candidates.len(), 2);
+
+        status
+            .legacy_overlay
+            .referenced_by_domains
+            .push("other-vm".to_owned());
+        let plan = plan_generation_cleanup(&status).unwrap();
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].kind, CleanupResourceKind::Seed);
+    }
+
+    #[test]
+    fn lifecycle_start_is_idempotent_and_shutdown_is_graceful_only() {
+        let status = lifecycle_status();
+        let start = plan_lifecycle_action(&status, LifecycleAction::Start).unwrap();
+        assert_eq!(start.idempotent_result, Some(LifecycleNoop::AlreadyRunning));
+        let shutdown = plan_lifecycle_action(&status, LifecycleAction::Shutdown).unwrap();
+        assert!(shutdown.idempotent_result.is_none());
+        assert!(
+            shutdown
+                .steps
+                .iter()
+                .any(|step| step.contains("never fall back"))
+        );
+    }
+
+    #[test]
+    fn start_requires_network_but_shutdown_does_not() {
+        let mut status = lifecycle_status();
+        status.default_network = DefaultNetworkStatus::Inactive;
+        assert!(matches!(
+            plan_lifecycle_action(&status, LifecycleAction::Start),
+            Err(ProvisioningError::LifecycleUnsafe(_))
+        ));
+        assert!(plan_lifecycle_action(&status, LifecycleAction::Shutdown).is_ok());
+    }
+
+    #[test]
+    fn shutoff_start_preflight_accepts_storage_verified_backing() {
+        let mut status = lifecycle_status();
+        status.domain_state = VmState::Shutoff;
+        let plan = plan_lifecycle_action(&status, LifecycleAction::Start).unwrap();
+        assert!(plan.idempotent_result.is_none());
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.contains("create exactly once"))
+        );
+    }
+
+    #[test]
+    fn cleanup_is_denied_when_active_generation_is_ambiguous() {
+        let mut status = lifecycle_status();
+        status.active_overlay_path = status.legacy_overlay.path.clone();
+        assert!(matches!(
+            plan_generation_cleanup(&status),
+            Err(ProvisioningError::CleanupUnsafe(_))
+        ));
     }
 
     #[test]

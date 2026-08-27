@@ -566,6 +566,101 @@ fn domain_disk_path(xml: &str) -> Option<String> {
     xml_attribute(disk, "source", "file")
 }
 
+fn domain_cdrom_path(xml: &str) -> Option<String> {
+    let disk = xml.split("<disk ").find(|section| {
+        section.contains("device='cdrom'") || section.contains("device=\"cdrom\"")
+    })?;
+    xml_attribute(disk, "source", "file")
+}
+
+fn domain_source_paths(xml: &str) -> Vec<String> {
+    xml.split("<source ")
+        .skip(1)
+        .filter_map(|section| xml_attribute(&format!("<source {section}"), "source", "file"))
+        .collect()
+}
+
+fn active_volume_backing(
+    domain_xml: &str,
+    volume_backings: &[(String, Option<String>)],
+) -> Option<String> {
+    let active_path = domain_disk_path(domain_xml)?;
+    volume_backings
+        .iter()
+        .find(|(path, _)| path == &active_path)
+        .and_then(|(_, backing)| backing.clone())
+}
+
+fn generation_volume_status(
+    pool: &StoragePool,
+    pool_path: &str,
+    name: &str,
+    domain_references: &[(String, Vec<String>)],
+    volume_backings: &[(String, Option<String>)],
+) -> Result<forge_provisioning::GenerationVolumeStatus, forge_provisioning::ProvisioningError> {
+    let expected_path = format!("{pool_path}/{name}");
+    let volume = match StorageVol::lookup_by_name(pool, name) {
+        Ok(volume) => volume,
+        Err(error) if error.code() == ErrorNumber::NoStorageVolume => {
+            return Ok(forge_provisioning::GenerationVolumeStatus {
+                name: name.to_owned(),
+                path: expected_path,
+                exists: false,
+                capacity_bytes: None,
+                format: None,
+                backing_path: None,
+                referenced_by_domains: Vec::new(),
+                backing_for_volumes: Vec::new(),
+                ownership_marker: None,
+            });
+        }
+        Err(error) => return Err(provisioning_backend_error(error)),
+    };
+    let info = volume.get_info().map_err(provisioning_backend_error)?;
+    let path = volume.get_path().map_err(provisioning_backend_error)?;
+    let xml = volume.get_xml_desc(0).map_err(provisioning_backend_error)?;
+    Ok(forge_provisioning::GenerationVolumeStatus {
+        name: name.to_owned(),
+        path: path.clone(),
+        exists: true,
+        capacity_bytes: Some(info.capacity),
+        format: xml_attribute(&xml, "format", "type"),
+        backing_path: backing_store_path(&xml),
+        referenced_by_domains: domain_references
+            .iter()
+            .filter(|(_, paths)| paths.contains(&path))
+            .map(|(name, _)| name.clone())
+            .collect(),
+        backing_for_volumes: volume_backings
+            .iter()
+            .filter(|(_, backing)| backing.as_deref() == Some(path.as_str()))
+            .map(|(volume_path, _)| volume_path.clone())
+            .collect(),
+        ownership_marker: None,
+    })
+}
+
+fn domain_ip_addresses(domain: &Domain) -> Vec<String> {
+    let mut addresses = Vec::new();
+    for source in [
+        sys::VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT,
+        sys::VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE,
+    ] {
+        if let Ok(interfaces) = domain.interface_addresses(source, 0) {
+            addresses.extend(
+                interfaces
+                    .into_iter()
+                    .flat_map(|interface| interface.addrs)
+                    .map(|address| address.addr)
+                    .filter(|address| !address.starts_with("127.") && address != "::1"),
+            );
+        }
+    }
+    addresses.sort();
+    addresses.dedup();
+    addresses
+}
+
 fn backing_store_path(xml: &str) -> Option<String> {
     let backing = xml
         .split_once("<backingStore")?
@@ -675,6 +770,110 @@ impl LibvirtBootBackend {
             seed_path: format!("{pool_path}/{}", forge_provisioning::SEED_VOLUME),
             seed_exists: seed.is_some(),
             pool_path,
+        })
+    }
+
+    /// Reads the active Fedora-Lab generation and known cleanup candidates.
+    ///
+    /// # Errors
+    /// Returns an error when domain or storage metadata cannot be mapped.
+    pub fn inspect_lifecycle(
+        &self,
+    ) -> Result<forge_provisioning::FedoraLabLifecycleStatus, forge_provisioning::ProvisioningError>
+    {
+        let domain = self.domain()?;
+        let (raw_state, _) = domain.get_state().map_err(provisioning_backend_error)?;
+        let domain_state = map_domain_state(raw_state)
+            .map_err(|error| forge_provisioning::ProvisioningError::Backend(error.to_string()))?;
+        let domain_xml = domain.get_xml_desc(0).map_err(provisioning_backend_error)?;
+        let pool = self.pool()?;
+        let pool_xml = pool.get_xml_desc(0).map_err(provisioning_backend_error)?;
+        let pool_path = xml_element(&pool_xml, "path").ok_or_else(|| {
+            forge_provisioning::ProvisioningError::Backend(
+                "default pool has no target path".to_owned(),
+            )
+        })?;
+        let domain_references = self
+            .connection
+            .list_all_domains(0)
+            .map_err(provisioning_backend_error)?
+            .iter()
+            .map(|candidate| {
+                let name = candidate.get_name().map_err(provisioning_backend_error)?;
+                let xml = candidate
+                    .get_xml_desc(0)
+                    .map_err(provisioning_backend_error)?;
+                Ok((name, domain_source_paths(&xml)))
+            })
+            .collect::<Result<Vec<_>, forge_provisioning::ProvisioningError>>()?;
+        let volume_backings = pool
+            .list_all_volumes(0)
+            .map_err(provisioning_backend_error)?
+            .iter()
+            .map(|candidate| {
+                let path = candidate.get_path().map_err(provisioning_backend_error)?;
+                let xml = candidate
+                    .get_xml_desc(0)
+                    .map_err(provisioning_backend_error)?;
+                Ok((path, backing_store_path(&xml)))
+            })
+            .collect::<Result<Vec<_>, forge_provisioning::ProvisioningError>>()?;
+        let volume_status = |name: &str| {
+            generation_volume_status(
+                &pool,
+                &pool_path,
+                name,
+                &domain_references,
+                &volume_backings,
+            )
+        };
+        let ip_addresses = if domain_state == VmState::Running {
+            domain_ip_addresses(&domain)
+        } else {
+            Vec::new()
+        };
+        let guest_agent_channel = domain_xml.contains("org.qemu.guest_agent.0");
+        let guest_agent_status = if !guest_agent_channel {
+            forge_provisioning::GuestAgentStatus::Unavailable
+        } else if domain_state == VmState::Running
+            && domain
+                .qemu_agent_command("{\"execute\":\"guest-ping\"}", 5, 0)
+                .is_ok()
+        {
+            forge_provisioning::GuestAgentStatus::Available
+        } else {
+            forge_provisioning::GuestAgentStatus::Unavailable
+        };
+        let default_network_active = Network::lookup_by_name(&self.connection, "default")
+            .and_then(|network| network.is_active())
+            .map_err(provisioning_backend_error)?;
+        Ok(forge_provisioning::FedoraLabLifecycleStatus {
+            domain_state,
+            domain_uuid: domain
+                .get_uuid_string()
+                .map_err(provisioning_backend_error)?,
+            persistent: domain.is_persistent().map_err(provisioning_backend_error)?,
+            autostart: domain.get_autostart().map_err(provisioning_backend_error)?,
+            default_network: if default_network_active {
+                forge_provisioning::DefaultNetworkStatus::Active
+            } else {
+                forge_provisioning::DefaultNetworkStatus::Inactive
+            },
+            active_overlay_path: domain_disk_path(&domain_xml).ok_or_else(|| {
+                forge_provisioning::ProvisioningError::Backend(
+                    "Fedora-Lab domain has no file-backed vda".to_owned(),
+                )
+            })?,
+            active_backing_path: active_volume_backing(&domain_xml, &volume_backings),
+            active_seed_path: domain_cdrom_path(&domain_xml),
+            guest_agent_channel,
+            guest_agent_status,
+            ip_addresses,
+            base: volume_status(forge_provisioning::BASE_VOLUME)?,
+            current_overlay: volume_status(forge_provisioning::REBUILD_OVERLAY_VOLUME)?,
+            current_seed: volume_status(forge_provisioning::REBUILD_SEED_VOLUME)?,
+            legacy_overlay: volume_status(forge_provisioning::OVERLAY_VOLUME)?,
+            legacy_seed: volume_status(forge_provisioning::SEED_VOLUME)?,
         })
     }
 }
@@ -1253,6 +1452,23 @@ mod tests {
             seed_volume_xml("fedora-lab-seed.iso", 374_784),
             "<volume type='file'><name>fedora-lab-seed.iso</name><capacity unit='bytes'>374784</capacity><allocation unit='bytes'>0</allocation><target><format type='raw'/></target></volume>"
         );
+    }
+
+    #[test]
+    fn shutoff_domain_backing_is_recovered_from_storage_metadata() {
+        let domain_xml = "<domain><devices><disk type='file' device='disk'><source file='/pool/fedora-lab.rebuild.qcow2'/><target dev='vda'/></disk></devices></domain>";
+        let volumes = vec![
+            (
+                "/pool/fedora-lab.rebuild.qcow2".to_owned(),
+                Some("/pool/forge-base-fedora-44.qcow2".to_owned()),
+            ),
+            ("/pool/forge-base-fedora-44.qcow2".to_owned(), None),
+        ];
+        assert_eq!(
+            active_volume_backing(domain_xml, &volumes).as_deref(),
+            Some("/pool/forge-base-fedora-44.qcow2")
+        );
+        assert!(!domain_xml.contains("backingStore"));
     }
 
     #[test]

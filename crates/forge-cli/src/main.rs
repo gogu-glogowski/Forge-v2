@@ -1,8 +1,9 @@
 use forge_core::{DoctorReport, DomainSummary, HostState, LibvirtInfo, VmResourcePlan};
-use forge_provisioning::BootBackend;
+use forge_provisioning::{BootBackend, RebuildBackend};
 use std::env;
 use std::io;
 use std::process::ExitCode;
+use std::time::Duration;
 
 fn main() -> ExitCode {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
@@ -35,6 +36,12 @@ fn main() -> ExitCode {
         ["profile", "plan", profile_name] => plan_profile(profile_name),
         ["hypervisor", "info"] => hypervisor_info(),
         ["vm", "list"] => vm_list(),
+        ["vm", "status", "fedora-lab"] => lifecycle_status(),
+        ["vm", "cleanup", "fedora-lab", "--dry-run"] => cleanup_vm_dry_run(),
+        ["vm", "start", "fedora-lab", "--dry-run"] => lifecycle_action(true, true),
+        ["vm", "start", "fedora-lab"] => lifecycle_action(true, false),
+        ["vm", "shutdown", "fedora-lab", "--dry-run"] => lifecycle_action(false, true),
+        ["vm", "shutdown", "fedora-lab"] => lifecycle_action(false, false),
         ["vm", "define", "fedora-lab"] => define_vm(false),
         ["vm", "define", "fedora-lab", "--dry-run"] => define_vm(true),
         ["vm", "prepare", "fedora-lab"] => prepare_vm(false),
@@ -51,6 +58,256 @@ fn main() -> ExitCode {
             print_usage();
             ExitCode::from(2)
         }
+    }
+}
+
+fn discover_lifecycle_status() -> Result<forge_provisioning::FedoraLabLifecycleStatus, String> {
+    let backend = forge_libvirt::LibvirtBootBackend::connect_local()
+        .map_err(|error| format!("libvirt connection failed: {error}"))?;
+    backend
+        .inspect_lifecycle()
+        .map_err(|error| format!("Fedora-Lab lifecycle discovery failed: {error}"))
+}
+
+fn lifecycle_status() -> ExitCode {
+    match discover_lifecycle_status() {
+        Ok(status) => {
+            print_lifecycle_status(&status);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn cleanup_vm_dry_run() -> ExitCode {
+    let status = match discover_lifecycle_status() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+    let plan = match forge_provisioning::plan_generation_cleanup(&status) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("Fedora-Lab cleanup cannot be planned safely: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    println!("Cleanup mode: dry-run (zero mutation)");
+    print_lifecycle_status(&status);
+    println!("Cleanup safe: {}", plan.safe);
+    println!(
+        "Controlled shutdown required for real cleanup: {}",
+        plan.requires_shutdown
+    );
+    println!("Preserve:");
+    for resource in &plan.preserve {
+        println!("- {resource}");
+    }
+    println!("Cleanup candidates:");
+    if plan.candidates.is_empty() {
+        println!("- none");
+    }
+    for candidate in &plan.candidates {
+        println!(
+            "- {:?}: {} ({}, {} bytes) — {}",
+            candidate.kind,
+            candidate.name,
+            candidate.path,
+            candidate.capacity_bytes,
+            candidate.reason
+        );
+    }
+    println!("Retained because ownership is unproven:");
+    if plan.retained_unproven.is_empty() {
+        println!("- none");
+    }
+    for resource in &plan.retained_unproven {
+        println!("- {resource}");
+    }
+    println!("Preconditions for a future real cleanup:");
+    for condition in &plan.preconditions {
+        println!("- {condition}");
+    }
+    println!("Future cleanup steps:");
+    for step in &plan.future_steps {
+        println!("- {step}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn lifecycle_action(start: bool, dry_run: bool) -> ExitCode {
+    let status = match discover_lifecycle_status() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+    let action = if start {
+        forge_provisioning::LifecycleAction::Start
+    } else {
+        forge_provisioning::LifecycleAction::Shutdown
+    };
+    let plan = match forge_provisioning::plan_lifecycle_action(&status, action) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("Fedora-Lab lifecycle action denied: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    println!(
+        "Mode: {}",
+        if dry_run {
+            "dry-run (zero mutation)"
+        } else {
+            "real"
+        }
+    );
+    println!("Action: {:?}", plan.action);
+    println!("Current state: {}", plan.current_state);
+    println!("Timeout: {} seconds", plan.timeout_seconds);
+    println!(
+        "Idempotent result: {}",
+        plan.idempotent_result
+            .map_or_else(|| "none".to_owned(), |result| format!("{result:?}"))
+    );
+    println!("Preflight checks:");
+    for check in &plan.checks {
+        println!("- {check}");
+    }
+    println!("Execution steps:");
+    for step in &plan.steps {
+        println!("- {step}");
+    }
+    if dry_run || plan.idempotent_result.is_some() {
+        return ExitCode::SUCCESS;
+    }
+    eprint!(
+        "{} Fedora-Lab now? [y/N] ",
+        if start { "Start" } else { "Shutdown" }
+    );
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err()
+        || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    {
+        eprintln!("Lifecycle action cancelled.");
+        return ExitCode::SUCCESS;
+    }
+    let mut backend = match forge_libvirt::LibvirtBootBackend::connect_local() {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("libvirt connection failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let fresh = match backend.inspect_lifecycle() {
+        Ok(fresh) => fresh,
+        Err(error) => {
+            eprintln!("pre-mutation lifecycle revalidation failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if fresh.domain_uuid != status.domain_uuid
+        || fresh.domain_state != status.domain_state
+        || fresh.active_overlay_path != status.active_overlay_path
+        || fresh.active_backing_path != status.active_backing_path
+        || fresh.active_seed_path != status.active_seed_path
+        || forge_provisioning::plan_lifecycle_action(&fresh, action).is_err()
+    {
+        eprintln!("pre-mutation lifecycle state changed; action denied");
+        return ExitCode::from(1);
+    }
+    let result = if start {
+        execute_lifecycle_start(&mut backend)
+    } else {
+        backend.shutdown_and_wait(Duration::from_secs(plan.timeout_seconds))
+    };
+    match result {
+        Ok(()) => {
+            println!("Lifecycle action completed.");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Lifecycle action failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn execute_lifecycle_start(
+    backend: &mut forge_libvirt::LibvirtBootBackend,
+) -> Result<(), forge_provisioning::ProvisioningError> {
+    let timeouts = forge_provisioning::BootTimeouts::default();
+    backend.start()?;
+    backend.wait_running(Duration::from_secs(timeouts.domain_running_seconds))?;
+    let ip = backend.discover_ip(Duration::from_secs(timeouts.dhcp_lease_seconds))?;
+    let guest_agent =
+        backend.wait_guest_agent(Duration::from_secs(timeouts.guest_agent_seconds))?;
+    println!("DomainBootStatus: Running");
+    println!("GuestAgentStatus: {guest_agent:?}");
+    if let Some(ip) = ip {
+        println!("DhcpLeaseStatus: Available({ip})");
+        let key = env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(".ssh/forge_ed25519");
+        let ssh = backend.observe_ssh(
+            &ip,
+            key.to_string_lossy().as_ref(),
+            Duration::from_secs(timeouts.ssh_seconds),
+        )?;
+        println!("SshStatus: {:?}", ssh.status);
+        println!("CloudInitStatus: {:?}", ssh.cloud_init);
+    } else {
+        println!("DhcpLeaseStatus: TimedOut");
+    }
+    Ok(())
+}
+
+fn print_lifecycle_status(status: &forge_provisioning::FedoraLabLifecycleStatus) {
+    println!("Domain: fedora-lab");
+    println!("State: {}", status.domain_state);
+    println!("UUID: {}", status.domain_uuid);
+    println!("Persistent: {}", status.persistent);
+    println!("Autostart: {}", status.autostart);
+    println!("Default network: {:?}", status.default_network);
+    println!("Active vda: {}", status.active_overlay_path);
+    println!(
+        "Active backing: {}",
+        status.active_backing_path.as_deref().unwrap_or("none")
+    );
+    println!(
+        "Active seed: {}",
+        status.active_seed_path.as_deref().unwrap_or("none")
+    );
+    println!("Guest-agent channel: {}", status.guest_agent_channel);
+    println!("Guest-agent status: {:?}", status.guest_agent_status);
+    println!(
+        "IP addresses: {}",
+        if status.ip_addresses.is_empty() {
+            "none".to_owned()
+        } else {
+            status.ip_addresses.join(", ")
+        }
+    );
+    for (label, volume) in [
+        ("Base", &status.base),
+        ("Current overlay", &status.current_overlay),
+        ("Current seed", &status.current_seed),
+        ("Legacy overlay", &status.legacy_overlay),
+        ("Legacy seed", &status.legacy_seed),
+    ] {
+        println!(
+            "{label}: {} (exists: {}, capacity: {} bytes)",
+            volume.path,
+            volume.exists,
+            volume.capacity_bytes.unwrap_or(0)
+        );
     }
 }
 
@@ -832,6 +1089,10 @@ fn print_usage() {
     eprintln!("  forge profile plan <profile>");
     eprintln!("  forge hypervisor info");
     eprintln!("  forge vm list");
+    eprintln!("  forge vm status fedora-lab");
+    eprintln!("  forge vm cleanup fedora-lab --dry-run");
+    eprintln!("  forge vm start fedora-lab [--dry-run]");
+    eprintln!("  forge vm shutdown fedora-lab [--dry-run]");
     eprintln!("  forge vm define fedora-lab [--dry-run]");
     eprintln!("  forge vm prepare fedora-lab [--dry-run]");
     eprintln!("  forge vm boot fedora-lab [--dry-run]");
