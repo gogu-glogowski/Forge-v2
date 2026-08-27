@@ -1,12 +1,17 @@
 //! Read-only adapter for the local libvirt API.
 
 use forge_core::{DomainSummary, HostCapabilities, LibvirtInfo, VmState};
+use serde::Deserialize;
 use std::fmt;
+use std::fs::File;
+use std::io::{self, Read};
+use std::process::Command;
 use virt::connect::Connect;
 use virt::domain::Domain;
 use virt::error::{Error as VirtError, ErrorNumber};
 use virt::storage_pool::StoragePool;
 use virt::storage_vol::StorageVol;
+use virt::stream::Stream;
 use virt::sys;
 
 pub const LOCAL_QEMU_URI: &str = "qemu:///system";
@@ -282,6 +287,317 @@ impl forge_storage::DefineBackend for LibvirtDefineBackend {
         let volume = StorageVol::lookup_by_name(&pool, name).map_err(storage_backend_error)?;
         volume.delete(0).map_err(storage_backend_error)
     }
+}
+
+impl forge_storage::ImagePrepareBackend for LibvirtDefineBackend {
+    fn inspect_pool(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<forge_storage::StoragePoolInfo>, forge_storage::ImagePrepareError> {
+        forge_storage::DefineBackend::inspect_pool(self, name)
+            .map_err(forge_storage::ImagePrepareError::from)
+    }
+
+    fn inspect_domain(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<forge_storage::ExistingDomainInfo>, forge_storage::ImagePrepareError> {
+        let domain = match Domain::lookup_by_name(&self.connection, name) {
+            Ok(domain) => domain,
+            Err(error) if error.code() == ErrorNumber::NoDomain => return Ok(None),
+            Err(error) => return Err(image_backend_error(error)),
+        };
+        let (raw_state, _) = domain.get_state().map_err(image_backend_error)?;
+        let state = map_domain_state(raw_state)
+            .map_err(|error| forge_storage::ImagePrepareError::Backend(error.to_string()))?;
+        let persistent = domain.is_persistent().map_err(image_backend_error)?;
+        let autostart = domain.get_autostart().map_err(image_backend_error)?;
+        let uuid = domain.get_uuid_string().map_err(image_backend_error)?;
+        let xml = domain.get_xml_desc(0).map_err(image_backend_error)?;
+        let disk_path = domain_disk_path(&xml).ok_or_else(|| {
+            forge_storage::ImagePrepareError::UnsafeExistingVolume(
+                "domain XML has no file-backed disk".to_owned(),
+            )
+        })?;
+        Ok(Some(forge_storage::ExistingDomainInfo {
+            name: name.to_owned(),
+            uuid,
+            state,
+            persistent,
+            autostart,
+            disk_path,
+            matches_legacy_forge_policy: matches_legacy_fedora_lab_xml(&xml),
+        }))
+    }
+
+    fn inspect_volume(
+        &mut self,
+        pool: &str,
+        name: &str,
+    ) -> Result<Option<forge_storage::OverlayVolume>, forge_storage::ImagePrepareError> {
+        let pool = self
+            .pool(pool)
+            .map_err(forge_storage::ImagePrepareError::from)?;
+        let volume = match StorageVol::lookup_by_name(&pool, name) {
+            Ok(volume) => volume,
+            Err(error) if error.code() == ErrorNumber::NoStorageVolume => return Ok(None),
+            Err(error) => return Err(image_backend_error(error)),
+        };
+        let info = volume.get_info().map_err(image_backend_error)?;
+        let path = volume.get_path().map_err(image_backend_error)?;
+        let xml = volume.get_xml_desc(0).map_err(image_backend_error)?;
+        Ok(Some(forge_storage::OverlayVolume {
+            name: name.to_owned(),
+            path,
+            capacity_bytes: info.capacity,
+            allocation_bytes: info.allocation,
+            format: xml_attribute(&xml, "format", "type").unwrap_or_else(|| "unknown".to_owned()),
+            backing_path: backing_store_path(&xml),
+        }))
+    }
+
+    fn verify_source_checksum(
+        &mut self,
+        path: &str,
+        expected: &str,
+    ) -> Result<(), forge_storage::ImagePrepareError> {
+        let actual = forge_images::sha256_file(std::path::Path::new(path))
+            .map_err(|error| forge_storage::ImagePrepareError::Backend(error.to_string()))?;
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(forge_storage::ImagePrepareError::SourceImageNotVerified)
+        }
+    }
+
+    fn diagnose_qcow2(
+        &mut self,
+        path: &str,
+        capacity: u64,
+        backing_path: Option<&str>,
+    ) -> forge_storage::QemuImgDiagnostic {
+        let output = match Command::new("qemu-img")
+            .args(["info", "--output=json", path])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return forge_storage::QemuImgDiagnostic::Unavailable;
+            }
+            Err(error) => return forge_storage::QemuImgDiagnostic::Warning(error.to_string()),
+        };
+        if !output.status.success() {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            if message.to_ascii_lowercase().contains("permission denied") {
+                return forge_storage::QemuImgDiagnostic::SkippedInsufficientPermissions;
+            }
+            return forge_storage::QemuImgDiagnostic::Warning(format!(
+                "qemu-img info failed for {path}: {message}"
+            ));
+        }
+        let info: QemuImgInfo = match serde_json::from_slice(&output.stdout) {
+            Ok(info) => info,
+            Err(error) => {
+                return forge_storage::QemuImgDiagnostic::Warning(format!(
+                    "cannot decode qemu-img information for {path}: {error}"
+                ));
+            }
+        };
+        if info.format != "qcow2"
+            || info.virtual_size != capacity
+            || info.backing_filename.as_deref() != backing_path
+        {
+            return forge_storage::QemuImgDiagnostic::Warning(format!(
+                "qemu-img validation mismatch for {path}: format={}, virtual-size={}, backing={}",
+                info.format,
+                info.virtual_size,
+                info.backing_filename.as_deref().unwrap_or("none")
+            ));
+        }
+        forge_storage::QemuImgDiagnostic::Verified
+    }
+
+    fn import_base(
+        &mut self,
+        pool: &str,
+        base: &forge_storage::BaseImageVolume,
+        source_path: &str,
+    ) -> Result<forge_storage::VolumeInfo, forge_storage::ImagePrepareError> {
+        let pool_handle = self
+            .pool(pool)
+            .map_err(forge_storage::ImagePrepareError::from)?;
+        let xml = format!(
+            "<volume><name>{}</name><capacity unit='bytes'>{}</capacity><allocation unit='bytes'>0</allocation><target><format type='qcow2'/><permissions><mode>0444</mode></permissions></target></volume>",
+            base.name, base.capacity_bytes
+        );
+        let volume =
+            StorageVol::create_xml(&pool_handle, &xml, sys::VIR_STORAGE_VOL_CREATE_VALIDATE)
+                .map_err(image_backend_error)?;
+        let upload_result =
+            upload_file(&self.connection, &volume, source_path, base.imported_bytes);
+        if let Err(error) = upload_result {
+            let _ = volume.delete(0);
+            return Err(error);
+        }
+        pool_handle.refresh(0).map_err(image_backend_error)?;
+        volume_info(&volume, &base.name)
+    }
+
+    fn create_overlay(
+        &mut self,
+        pool: &str,
+        overlay: &forge_storage::OverlayVolume,
+    ) -> Result<forge_storage::VolumeInfo, forge_storage::ImagePrepareError> {
+        let pool = self
+            .pool(pool)
+            .map_err(forge_storage::ImagePrepareError::from)?;
+        let backing = overlay.backing_path.as_deref().ok_or_else(|| {
+            forge_storage::ImagePrepareError::BackingStoreMismatch {
+                expected: "a libvirt base volume".to_owned(),
+                actual: None,
+            }
+        })?;
+        let xml = format!(
+            "<volume><name>{}</name><capacity unit='bytes'>{}</capacity><allocation unit='bytes'>0</allocation><target><format type='qcow2'/></target><backingStore><path>{backing}</path><format type='qcow2'/></backingStore></volume>",
+            overlay.name, overlay.capacity_bytes
+        );
+        let volume = StorageVol::create_xml(&pool, &xml, sys::VIR_STORAGE_VOL_CREATE_VALIDATE)
+            .map_err(image_backend_error)?;
+        volume_info(&volume, &overlay.name)
+    }
+
+    fn delete_volume(
+        &mut self,
+        pool: &str,
+        name: &str,
+    ) -> Result<(), forge_storage::ImagePrepareError> {
+        forge_storage::DefineBackend::delete_volume(self, pool, name)
+            .map_err(forge_storage::ImagePrepareError::from)
+    }
+
+    fn redefine_domain(
+        &mut self,
+        xml: &str,
+    ) -> Result<forge_storage::DefinedDomain, forge_storage::DomainDefineError> {
+        forge_storage::DefineBackend::define_domain(self, xml)
+    }
+}
+
+#[derive(Deserialize)]
+struct QemuImgInfo {
+    format: String,
+    #[serde(rename = "virtual-size")]
+    virtual_size: u64,
+    #[serde(rename = "backing-filename")]
+    backing_filename: Option<String>,
+}
+
+fn upload_file(
+    connection: &Connect,
+    volume: &StorageVol,
+    source_path: &str,
+    length: u64,
+) -> Result<(), forge_storage::ImagePrepareError> {
+    let mut file = File::open(source_path)
+        .map_err(|error| forge_storage::ImagePrepareError::Backend(error.to_string()))?;
+    let stream = Stream::new(connection, 0).map_err(image_backend_error)?;
+    volume
+        .upload(&stream, 0, length, 0)
+        .map_err(image_backend_error)?;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| forge_storage::ImagePrepareError::Backend(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        let mut sent = 0;
+        while sent < read {
+            let count = stream
+                .send(&buffer[sent..read])
+                .map_err(image_backend_error)?;
+            if count == 0 {
+                return Err(forge_storage::ImagePrepareError::Backend(
+                    "libvirt upload stream stopped accepting data".to_owned(),
+                ));
+            }
+            sent += count;
+        }
+        total = total.checked_add(read as u64).ok_or_else(|| {
+            forge_storage::ImagePrepareError::Backend("upload byte count overflowed".to_owned())
+        })?;
+    }
+    if total != length {
+        stream.abort().map_err(image_backend_error)?;
+        return Err(forge_storage::ImagePrepareError::Backend(format!(
+            "source size changed during upload: expected {length}, sent {total}"
+        )));
+    }
+    stream.finish().map_err(image_backend_error)
+}
+
+fn volume_info(
+    volume: &StorageVol,
+    name: &str,
+) -> Result<forge_storage::VolumeInfo, forge_storage::ImagePrepareError> {
+    let info = volume.get_info().map_err(image_backend_error)?;
+    let path = volume.get_path().map_err(image_backend_error)?;
+    Ok(forge_storage::VolumeInfo {
+        name: name.to_owned(),
+        path,
+        capacity_bytes: info.capacity,
+        allocation_bytes: info.allocation,
+    })
+}
+
+fn image_backend_error(error: VirtError) -> forge_storage::ImagePrepareError {
+    let message = error.to_string();
+    drop(error);
+    forge_storage::ImagePrepareError::Backend(format!("libvirt image operation failed: {message}"))
+}
+
+fn domain_disk_path(xml: &str) -> Option<String> {
+    let disk = xml
+        .split("<disk ")
+        .find(|section| section.contains("device='disk'") || section.contains("device=\"disk\""))?;
+    xml_attribute(disk, "source", "file")
+}
+
+fn backing_store_path(xml: &str) -> Option<String> {
+    let backing = xml
+        .split_once("<backingStore")?
+        .1
+        .split_once("</backingStore>")?
+        .0;
+    xml_element(backing, "path")
+}
+
+fn xml_attribute(xml: &str, element: &str, attribute: &str) -> Option<String> {
+    let start = xml.find(&format!("<{element} "))?;
+    let end = xml[start..].find('>')? + start;
+    let tag = &xml[start..=end];
+    for quote in ['\'', '"'] {
+        let marker = format!("{attribute}={quote}");
+        if let Some(value_start) = tag.find(&marker) {
+            let value_start = value_start + marker.len();
+            let value_end = tag[value_start..].find(quote)? + value_start;
+            return Some(tag[value_start..value_end].to_owned());
+        }
+    }
+    None
+}
+
+fn matches_legacy_fedora_lab_xml(xml: &str) -> bool {
+    xml_attribute(xml, "type", "machine").is_some_and(|machine| machine.contains("q35"))
+        && (xml.contains("mode='host-passthrough'") || xml.contains("mode=\"host-passthrough\""))
+        && xml.contains("fedora-lab.qcow2")
+        && (xml.contains("type='qcow2'") || xml.contains("type=\"qcow2\""))
+        && (xml.contains("bus='virtio'") || xml.contains("bus=\"virtio\""))
+        && (xml.contains("network='default'") || xml.contains("network=\"default\""))
+        && !xml.contains("<filesystem")
+        && !xml.contains("<hostdev")
 }
 
 fn storage_backend_error(error: VirtError) -> forge_storage::StorageError {

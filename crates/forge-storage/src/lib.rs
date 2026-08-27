@@ -4,6 +4,9 @@ use forge_core::{GuestProfileKind, VmProfile, VmResourcePlan, VmState};
 use forge_domain::{DomainMetadata, DomainSpec, DomainSpecError};
 use std::fmt;
 
+mod image_prepare;
+pub use image_prepare::*;
+
 pub const DEFAULT_POOL: &str = "default";
 pub const FEDORA_LAB_VOLUME: &str = "fedora-lab.qcow2";
 

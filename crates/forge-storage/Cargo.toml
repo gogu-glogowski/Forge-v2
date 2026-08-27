@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 forge-core = { path = "../forge-core" }
 forge-domain = { path = "../forge-domain" }
+forge-images = { path = "../forge-images" }
 
 [lints]
 workspace = true

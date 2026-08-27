@@ -65,6 +65,7 @@ pub struct DomainMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainSpec {
     pub name: String,
+    pub uuid: Option<String>,
     pub architecture: Architecture,
     pub machine: MachineType,
     pub firmware: FirmwareMode,
@@ -83,6 +84,7 @@ pub struct DomainSpec {
 pub enum DomainSpecError {
     UnsupportedProfile(GuestProfileKind),
     InvalidName,
+    InvalidUuid,
     InvalidDiskPath,
     ZeroVcpus,
     ZeroMemory,
@@ -101,6 +103,7 @@ impl fmt::Display for DomainSpecError {
         let message = match self {
             Self::UnsupportedProfile(_) => "only the fedora-lab domain profile is supported",
             Self::InvalidName => "domain name must not be empty",
+            Self::InvalidUuid => "domain UUID is invalid",
             Self::InvalidDiskPath => "disk path must be an absolute file path",
             Self::ZeroVcpus => "domain must have at least one vCPU",
             Self::ZeroMemory => "domain memory must be greater than zero",
@@ -148,6 +151,7 @@ pub fn fedora_lab_spec(
 
     let spec = DomainSpec {
         name: metadata.name,
+        uuid: None,
         architecture: Architecture::X86_64,
         machine: MachineType::Q35,
         firmware: FirmwareMode::Uefi,
@@ -181,6 +185,14 @@ pub fn fedora_lab_spec(
 pub fn validate(spec: &DomainSpec) -> Result<(), DomainSpecError> {
     if spec.name.trim().is_empty() {
         return Err(DomainSpecError::InvalidName);
+    }
+    if spec.uuid.as_deref().is_some_and(|uuid| {
+        uuid.len() != 36
+            || !uuid
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() || character == '-')
+    }) {
+        return Err(DomainSpecError::InvalidUuid);
     }
     if spec.vcpus == 0 {
         return Err(DomainSpecError::ZeroVcpus);
@@ -235,6 +247,9 @@ pub fn render_xml(spec: &DomainSpec) -> Result<String, DomainSpecError> {
     let mut xml = XmlWriter::default();
     xml.line(0, "<domain type='kvm'>");
     xml.text_element(1, "name", &spec.name);
+    if let Some(uuid) = &spec.uuid {
+        xml.text_element(1, "uuid", uuid);
+    }
     xml.line(
         1,
         &format!(

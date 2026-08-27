@@ -36,6 +36,8 @@ fn main() -> ExitCode {
         ["vm", "list"] => vm_list(),
         ["vm", "define", "fedora-lab"] => define_vm(false),
         ["vm", "define", "fedora-lab", "--dry-run"] => define_vm(true),
+        ["vm", "prepare", "fedora-lab"] => prepare_vm(false),
+        ["vm", "prepare", "fedora-lab", "--dry-run"] => prepare_vm(true),
         ["domain", "render", profile_name] => render_domain(profile_name),
         ["image", "list"] => image_list(),
         ["image", "inspect", "fedora"] => image_inspect(),
@@ -45,6 +47,151 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn prepare_vm(dry_run: bool) -> ExitCode {
+    let Some(profile) = forge_profiles::find("fedora-lab") else {
+        eprintln!("fedora-lab profile is unavailable");
+        return ExitCode::from(2);
+    };
+    let directories = match image_directories() {
+        Ok(directories) => directories,
+        Err(code) => return code,
+    };
+    let source = match forge_images::verified_fedora(&directories) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("verified Fedora source is unavailable: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let source_size = match std::fs::metadata(&source.local_path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            eprintln!("cannot inspect verified Fedora source: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let source_capacity = match forge_images::qcow2_virtual_size(&source.local_path) {
+        Ok(capacity) => capacity,
+        Err(error) => {
+            eprintln!("cannot inspect verified Fedora qcow2 capacity: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let hardware = match forge_hardware::collect() {
+        Ok(hardware) => hardware,
+        Err(error) => {
+            eprintln!("hardware detection failed: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let resources = match forge_profiles::plan(&hardware, &profile) {
+        Ok(resources) => resources,
+        Err(error) => {
+            eprintln!("cannot plan fedora-lab: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut backend = match forge_libvirt::LibvirtDefineBackend::connect_local() {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("libvirt connection failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let plan = match forge_storage::plan_image_prepare(
+        &mut backend,
+        &profile,
+        &resources,
+        &source,
+        source_size,
+        source_capacity,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("cannot safely prepare Fedora-Lab: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    print_image_prepare_plan(&plan);
+    if dry_run {
+        println!("\nPlanned domain XML:\n{}", plan.xml);
+        return ExitCode::SUCCESS;
+    }
+    eprint!("Prepare Fedora-Lab disk from verified Fedora image? [y/N] ");
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err()
+        || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    {
+        eprintln!("Preparation cancelled.");
+        return ExitCode::SUCCESS;
+    }
+    match forge_storage::execute_image_prepare(&mut backend, &plan) {
+        Ok(result) => {
+            println!("Base volume: {}", result.base.path);
+            println!("Overlay volume: {}", result.overlay.path);
+            println!("Domain UUID: {}", result.domain.uuid);
+            println!("Domain state: {}", result.domain.state);
+            for (path, diagnostic) in result.context.qemu_img_diagnostics {
+                println!("qemu-img {path}: {diagnostic}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Fedora-Lab preparation failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn print_image_prepare_plan(plan: &forge_storage::ImagePreparePlan) {
+    println!("Verified source: {}", plan.source.local_path.display());
+    println!("Source status: {}", plan.source.status);
+    println!(
+        "Source SHA-256: {}",
+        plan.source.actual_checksum.as_deref().unwrap_or("unknown")
+    );
+    println!("Source size: {} bytes", plan.source_size_bytes);
+    println!(
+        "Source virtual capacity: {} bytes",
+        plan.source_capacity_bytes
+    );
+    println!(
+        "Storage pool: {} ({})",
+        plan.pool.name, plan.pool.target_path
+    );
+    println!("Base volume: {}", plan.base.name);
+    println!("Base path: {}", plan.base.path);
+    println!("Base policy: imported immutable qcow2; never a guest disk");
+    println!("Overlay volume: {}", plan.overlay.name);
+    println!("Overlay path: {}", plan.overlay.path);
+    println!(
+        "Backing store: {} -> {}",
+        plan.overlay.path,
+        plan.overlay.backing_path.as_deref().unwrap_or("none")
+    );
+    println!("Domain state: {}", plan.existing_domain.state);
+    println!("Domain persistent: {}", plan.existing_domain.persistent);
+    println!("Domain autostart: {}", plan.existing_domain.autostart);
+    println!("Existing volume: {}", plan.existing_volume.path);
+    println!("Existing format: {}", plan.existing_volume.format);
+    println!(
+        "Existing capacity: {} bytes",
+        plan.existing_volume.capacity_bytes
+    );
+    println!(
+        "Existing allocation: {} bytes",
+        plan.existing_volume.allocation_bytes
+    );
+    println!(
+        "Existing backing store: {}",
+        plan.existing_volume
+            .backing_path
+            .as_deref()
+            .unwrap_or("none")
+    );
+    println!("Migration safe: {}", plan.migration_safe);
 }
 
 fn image_directories() -> Result<forge_images::ImageDirectories, ExitCode> {
@@ -358,6 +505,7 @@ fn print_usage() {
     eprintln!("  forge hypervisor info");
     eprintln!("  forge vm list");
     eprintln!("  forge vm define fedora-lab [--dry-run]");
+    eprintln!("  forge vm prepare fedora-lab [--dry-run]");
     eprintln!("  forge domain render fedora-lab");
     eprintln!("  forge image list");
     eprintln!("  forge image inspect fedora");

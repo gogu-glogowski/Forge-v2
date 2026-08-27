@@ -62,6 +62,7 @@ pub enum ImageError {
     VerifiedImageExists(PathBuf),
     InvalidTransition { from: ImageStatus, to: ImageStatus },
     UnsupportedImage(String),
+    SourceNotVerified,
 }
 
 impl fmt::Display for ImageError {
@@ -96,6 +97,9 @@ impl fmt::Display for ImageError {
                 write!(formatter, "invalid image state transition: {from} -> {to}")
             }
             Self::UnsupportedImage(name) => write!(formatter, "unsupported image: {name}"),
+            Self::SourceNotVerified => formatter.write_str(
+                "Fedora image is not locally verified against its authenticated checksum",
+            ),
         }
     }
 }
@@ -208,6 +212,27 @@ pub fn inspect(directories: &ImageDirectories) -> Result<ImageMetadata, ImageErr
 /// Returns an error when Fedora metadata is corrupt or unreadable.
 pub fn list(directories: &ImageDirectories) -> Result<Vec<ImageMetadata>, ImageError> {
     Ok(vec![inspect(directories)?])
+}
+
+/// Revalidates the trusted Fedora artifact against its recorded authenticated checksum.
+///
+/// # Errors
+/// Returns an error unless metadata is Verified, both checksums agree, the file exists,
+/// and a fresh SHA-256 calculation matches the authenticated checksum.
+pub fn verified_fedora(directories: &ImageDirectories) -> Result<ImageMetadata, ImageError> {
+    let metadata = inspect(directories)?;
+    let expected = metadata
+        .expected_checksum
+        .as_deref()
+        .ok_or(ImageError::SourceNotVerified)?;
+    if metadata.status != ImageStatus::Verified
+        || metadata.actual_checksum.as_deref() != Some(expected)
+        || !metadata.local_path.is_file()
+        || sha256_file(&metadata.local_path)? != expected
+    {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(metadata)
 }
 
 /// Fetches and cryptographically verifies the official Fedora Cloud image.
@@ -370,6 +395,30 @@ pub fn sha256_file(path: &Path) -> Result<String, ImageError> {
         hasher.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Reads the virtual capacity from a qcow2 v1+ header without invoking QEMU.
+///
+/// # Errors
+/// Returns an error when the file is unreadable, truncated, not qcow2, or has zero capacity.
+pub fn qcow2_virtual_size(path: &Path) -> Result<u64, ImageError> {
+    let mut file = File::open(path)?;
+    let mut header = [0_u8; 32];
+    file.read_exact(&mut header)?;
+    if &header[..4] != b"QFI\xfb" {
+        return Err(ImageError::Metadata("source is not qcow2".to_owned()));
+    }
+    let size = u64::from_be_bytes(
+        header[24..32]
+            .try_into()
+            .map_err(|_| ImageError::Metadata("truncated qcow2 header".to_owned()))?,
+    );
+    if size == 0 {
+        return Err(ImageError::Metadata(
+            "qcow2 virtual size is zero".to_owned(),
+        ));
+    }
+    Ok(size)
 }
 
 #[cfg(test)]
@@ -565,5 +614,31 @@ mod tests {
             inspect(&test.directories).unwrap().status,
             ImageStatus::Invalid
         );
+    }
+
+    #[test]
+    fn verified_source_is_rehashed_before_use() {
+        let test = TestDirectories::new();
+        let mut fetcher = FixtureFetcher::valid(b"trusted image");
+        let metadata = fetch_fedora(&test.directories, &mut fetcher).unwrap();
+        assert_eq!(verified_fedora(&test.directories).unwrap(), metadata);
+        fs::write(&metadata.local_path, b"tampered").unwrap();
+        assert!(matches!(
+            verified_fedora(&test.directories),
+            Err(ImageError::SourceNotVerified)
+        ));
+    }
+
+    #[test]
+    fn reads_qcow2_virtual_capacity_from_header() {
+        let test = TestDirectories::new();
+        fs::create_dir_all(&test.directories.downloads).unwrap();
+        let path = test.directories.downloads.join("header.qcow2");
+        let mut header = [0_u8; 32];
+        header[..4].copy_from_slice(b"QFI\xfb");
+        header[4..8].copy_from_slice(&3_u32.to_be_bytes());
+        header[24..32].copy_from_slice(&(5 * 1024_u64.pow(3)).to_be_bytes());
+        fs::write(&path, header).unwrap();
+        assert_eq!(qcow2_virtual_size(&path).unwrap(), 5 * 1024_u64.pow(3));
     }
 }
