@@ -1,4 +1,4 @@
-use forge_core::{DoctorReport, HostState, VmResourcePlan};
+use forge_core::{DoctorReport, DomainSummary, HostState, LibvirtInfo, VmResourcePlan};
 use std::env;
 use std::process::ExitCode;
 
@@ -31,11 +31,71 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         ["profile", "plan", profile_name] => plan_profile(profile_name),
+        ["hypervisor", "info"] => hypervisor_info(),
+        ["vm", "list"] => vm_list(),
         _ => {
             print_usage();
             ExitCode::from(2)
         }
     }
+}
+
+fn hypervisor_info() -> ExitCode {
+    match forge_libvirt::discover_local() {
+        Ok(info) => {
+            print_hypervisor_info(&info);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("hypervisor discovery failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn vm_list() -> ExitCode {
+    match forge_libvirt::discover_local() {
+        Ok(info) => {
+            print!("{}", format_domain_list(&info.domains));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("VM discovery failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn print_hypervisor_info(info: &LibvirtInfo) {
+    println!(
+        "Connection: {}",
+        if info.alive { "alive" } else { "not alive" }
+    );
+    println!("URI: {}", info.uri);
+    println!(
+        "Hypervisor: {} {}",
+        info.hypervisor_type, info.hypervisor_version
+    );
+    println!("libvirt: {}", info.libvirt_version);
+    println!("Domains: {}", info.domains.len());
+    println!(
+        "Host: {} ({} CPUs, {} MiB RAM)",
+        info.capabilities.cpu_model,
+        info.capabilities.logical_cpus,
+        info.capabilities.memory_bytes / 1024 / 1024
+    );
+}
+
+fn format_domain_list(domains: &[DomainSummary]) -> String {
+    if domains.is_empty() {
+        return "No virtual machines defined.\n".to_owned();
+    }
+    let mut output = "NAME\tSTATE\tUUID\tTYPE\n".to_owned();
+    for domain in domains {
+        output.push_str(&domain.to_string());
+        output.push('\n');
+    }
+    output
 }
 
 fn plan_profile(profile_name: &str) -> ExitCode {
@@ -78,6 +138,8 @@ fn print_usage() {
     eprintln!("  forge doctor");
     eprintln!("  forge profile list");
     eprintln!("  forge profile plan <profile>");
+    eprintln!("  forge hypervisor info");
+    eprintln!("  forge vm list");
 }
 
 fn print_report(report: &DoctorReport) {
@@ -109,4 +171,29 @@ fn print_report(report: &DoctorReport) {
 
 const fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_core::VmState;
+
+    #[test]
+    fn empty_domain_list_is_not_an_error() {
+        assert_eq!(format_domain_list(&[]), "No virtual machines defined.\n");
+    }
+
+    #[test]
+    fn domain_list_has_readable_columns() {
+        let domains = [DomainSummary {
+            name: "fedora-lab".to_owned(),
+            uuid: "example-uuid".to_owned(),
+            state: VmState::Shutoff,
+            persistent: true,
+        }];
+        assert_eq!(
+            format_domain_list(&domains),
+            "NAME\tSTATE\tUUID\tTYPE\nfedora-lab\tshutoff\texample-uuid\tpersistent\n"
+        );
+    }
 }

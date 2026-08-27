@@ -203,3 +203,68 @@ impl fmt::Display for ResourcePlanError {
 }
 
 impl std::error::Error for ResourcePlanError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum VmState {
+    Running,
+    Shutoff,
+    Paused,
+    Crashed,
+    Unknown,
+}
+
+impl fmt::Display for VmState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Running => "running",
+            Self::Shutoff => "shutoff",
+            Self::Paused => "paused",
+            Self::Crashed => "crashed",
+            Self::Unknown => "unknown",
+        };
+        formatter.write_str(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainSummary {
+    pub name: String,
+    pub uuid: String,
+    pub state: VmState,
+    pub persistent: bool,
+}
+
+impl fmt::Display for DomainSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}\t{}\t{}\t{}",
+            self.name,
+            self.state,
+            self.uuid,
+            if self.persistent {
+                "persistent"
+            } else {
+                "transient"
+            }
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostCapabilities {
+    pub cpu_model: String,
+    pub logical_cpus: u32,
+    pub memory_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibvirtInfo {
+    pub uri: String,
+    pub libvirt_version: String,
+    pub hypervisor_version: String,
+    pub hypervisor_type: String,
+    pub alive: bool,
+    pub capabilities: HostCapabilities,
+    pub domains: Vec<DomainSummary>,
+}
