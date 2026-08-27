@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+mod managed;
+pub use managed::*;
+
 pub const SCHEMA_VERSION: u32 = 1;
 pub const STATE_DIRECTORY_MODE: u32 = 0o700;
 pub const STATE_FILE_MODE: u32 = 0o600;
@@ -24,8 +27,11 @@ pub enum ResourceRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GenerationStatus {
+    Preparing,
     Active,
     Retained,
+    Failed,
+    Cleaned,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +71,7 @@ pub struct ObservedResource {
     pub capacity_bytes: u64,
     pub backing_path: Option<String>,
     pub referenced_by_domains: Vec<String>,
+    pub backing_for_volumes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,7 +246,8 @@ pub fn write_manifest_atomic(path: &Path, manifest: &GenerationManifest) -> Resu
     result
 }
 
-fn generation_id() -> String {
+#[must_use]
+pub fn new_generation_id() -> String {
     format!("gen-{}", Uuid::new_v4())
 }
 
@@ -304,7 +312,7 @@ pub fn plan_adoption(
         schema_version: SCHEMA_VERSION,
         domain_name: observed.domain_name.clone(),
         domain_uuid: observed.domain_uuid.clone(),
-        generation_id: generation_id(),
+        generation_id: new_generation_id(),
         created_unix_seconds: duration.as_secs(),
         libvirt_uri: observed.libvirt_uri.clone(),
         storage_pool_name: observed.storage_pool_name.clone(),
@@ -522,6 +530,7 @@ mod tests {
             capacity_bytes: capacity,
             backing_path: backing.map(str::to_owned),
             referenced_by_domains: referenced,
+            backing_for_volumes: Vec::new(),
         };
         ObservedGeneration {
             domain_name: "fedora-lab".to_owned(),

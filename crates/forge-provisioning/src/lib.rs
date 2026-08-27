@@ -324,6 +324,8 @@ pub struct RebuildContext {
     pub overlay_created: bool,
     pub seed_created: bool,
     pub domain_switched: bool,
+    pub overlay_name: Option<String>,
+    pub seed_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,6 +346,33 @@ pub fn plan_rebuild(
     new_seed_sha256: String,
     domain_xml: String,
 ) -> Result<RebuildPlan, ProvisioningError> {
+    plan_rebuild_named(
+        environment,
+        verified_source_path,
+        public_key_path,
+        new_overlay_capacity_bytes,
+        new_seed_sha256,
+        domain_xml,
+        REBUILD_OVERLAY_VOLUME,
+        REBUILD_SEED_VOLUME,
+    )
+}
+
+/// Builds a rebuild plan with resource names bound to a durable generation.
+///
+/// # Errors
+/// Applies the same topology and XML invariants as [`plan_rebuild`].
+#[allow(clippy::too_many_arguments)]
+pub fn plan_rebuild_named(
+    environment: &RebuildEnvironment,
+    verified_source_path: &str,
+    public_key_path: &str,
+    new_overlay_capacity_bytes: u64,
+    new_seed_sha256: String,
+    domain_xml: String,
+    overlay_name: &str,
+    seed_name: &str,
+) -> Result<RebuildPlan, ProvisioningError> {
     if !environment.domain_persistent {
         return Err(ProvisioningError::InvalidDomainXml);
     }
@@ -360,8 +389,15 @@ pub fn plan_rebuild(
     {
         return Err(ProvisioningError::InvalidDomainXml);
     }
-    let new_overlay_path = format!("{}/{}", environment.pool_path, REBUILD_OVERLAY_VOLUME);
-    let new_seed_path = format!("{}/{}", environment.pool_path, REBUILD_SEED_VOLUME);
+    if overlay_name.contains('/')
+        || seed_name.contains('/')
+        || overlay_name.is_empty()
+        || seed_name.is_empty()
+    {
+        return Err(ProvisioningError::InvalidDomainXml);
+    }
+    let new_overlay_path = format!("{}/{overlay_name}", environment.pool_path);
+    let new_seed_path = format!("{}/{seed_name}", environment.pool_path);
     Ok(RebuildPlan {
         environment: environment.clone(),
         verified_source_path: verified_source_path.to_owned(),
@@ -594,7 +630,10 @@ pub trait RebuildBackend: BootBackend {
     fn validate_rebuild_seed(&mut self, plan: &RebuildPlan) -> Result<(), ProvisioningError>;
     /// # Errors
     /// Returns an error or timeout if controlled shutdown does not reach shut off.
-    fn shutdown_and_wait(&mut self, timeout: Duration) -> Result<(), ProvisioningError>;
+    fn shutdown_and_wait(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ManagedShutdownStatus, ProvisioningError>;
     /// # Errors
     /// Returns an error if durable resources or domain identity changed before switch.
     fn verify_pre_switch(&mut self, expected: &RebuildEnvironment)
@@ -604,6 +643,28 @@ pub trait RebuildBackend: BootBackend {
     fn switch_and_verify(&mut self, plan: &RebuildPlan) -> Result<(), ProvisioningError>;
     /// Deletes only newly named rebuild resources after failure before switch.
     fn rollback_new_resources(&mut self, context: &RebuildContext) -> Vec<String>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedShutdownStatus {
+    GracefulShutdownCompleted,
+    AlreadyShutoff,
+}
+
+/// Decides whether managed rebuild may request shutdown. All states other than
+/// Running and Shutoff fail closed before the persistent domain switch.
+/// # Errors
+/// Returns a typed lifecycle error for ambiguous or unsafe domain states.
+pub fn managed_shutdown_status(
+    state: VmState,
+) -> Result<Option<ManagedShutdownStatus>, ProvisioningError> {
+    match state {
+        VmState::Running => Ok(None),
+        VmState::Shutoff => Ok(Some(ManagedShutdownStatus::AlreadyShutoff)),
+        other => Err(ProvisioningError::LifecycleUnsafe(format!(
+            "managed rebuild cannot continue from domain state {other}"
+        ))),
+    }
 }
 
 /// Executes the approved rebuild without cleaning up the old generation.
@@ -616,7 +677,17 @@ pub fn execute_rebuild<B: RebuildBackend>(
     plan: &RebuildPlan,
     seed: &SeedPlan,
 ) -> Result<RebuildResult, ProvisioningError> {
-    let mut context = RebuildContext::default();
+    let mut context = RebuildContext {
+        overlay_name: std::path::Path::new(&plan.new_overlay_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(str::to_owned),
+        seed_name: std::path::Path::new(&plan.new_seed_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(str::to_owned),
+        ..RebuildContext::default()
+    };
     let before_switch: Result<(), ProvisioningError> = (|| {
         backend.create_rebuild_overlay(plan)?;
         context.overlay_created = true;
@@ -1225,6 +1296,27 @@ mod tests {
                 .iter()
                 .any(|step| step.contains("never fall back"))
         );
+    }
+
+    #[test]
+    fn managed_rebuild_with_active_a_preparing_b_and_shutoff_domain_reaches_pre_switch() {
+        let shutdown = managed_shutdown_status(VmState::Shutoff).unwrap();
+        assert_eq!(shutdown, Some(ManagedShutdownStatus::AlreadyShutoff));
+        assert!(
+            shutdown.is_some(),
+            "pre-switch validation remains reachable"
+        );
+    }
+
+    #[test]
+    fn managed_rebuild_shutdown_fails_closed_for_ambiguous_domain_states() {
+        for state in [VmState::Paused, VmState::Crashed, VmState::Unknown] {
+            assert!(matches!(
+                managed_shutdown_status(state),
+                Err(ProvisioningError::LifecycleUnsafe(_))
+            ));
+        }
+        assert_eq!(managed_shutdown_status(VmState::Running).unwrap(), None);
     }
 
     #[test]
