@@ -876,6 +876,77 @@ impl LibvirtBootBackend {
             legacy_seed: volume_status(forge_provisioning::SEED_VOLUME)?,
         })
     }
+
+    /// Reads the domain, pool, and active volume identities for Forge state reconciliation.
+    ///
+    /// # Errors
+    /// Returns an error when any required libvirt identity or storage field is unavailable.
+    pub fn inspect_state(
+        &self,
+    ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
+        let lifecycle = self.inspect_lifecycle()?;
+        let pool = self.pool()?;
+        let observed_resource =
+            |role: forge_state::ResourceRole,
+             status: &forge_provisioning::GenerationVolumeStatus| {
+                if !status.exists {
+                    return Err(forge_provisioning::ProvisioningError::Backend(format!(
+                        "required state resource is missing: {}",
+                        status.path
+                    )));
+                }
+                let volume = StorageVol::lookup_by_path(&self.connection, &status.path)
+                    .map_err(provisioning_backend_error)?;
+                Ok(forge_state::ObservedResource {
+                    role,
+                    volume_name: status.name.clone(),
+                    volume_key: volume.get_key().map_err(provisioning_backend_error)?,
+                    path: status.path.clone(),
+                    format: status.format.clone().ok_or_else(|| {
+                        forge_provisioning::ProvisioningError::Backend(format!(
+                            "volume format is unavailable: {}",
+                            status.path
+                        ))
+                    })?,
+                    capacity_bytes: status.capacity_bytes.ok_or_else(|| {
+                        forge_provisioning::ProvisioningError::Backend(format!(
+                            "volume capacity is unavailable: {}",
+                            status.path
+                        ))
+                    })?,
+                    backing_path: status.backing_path.clone(),
+                    referenced_by_domains: status.referenced_by_domains.clone(),
+                })
+            };
+        let unmanaged_resources = [&lifecycle.legacy_overlay, &lifecycle.legacy_seed]
+            .into_iter()
+            .filter(|volume| volume.exists)
+            .map(|volume| volume.path.clone())
+            .collect();
+        Ok(forge_state::ObservedGeneration {
+            domain_name: "fedora-lab".to_owned(),
+            domain_uuid: lifecycle.domain_uuid,
+            domain_persistent: lifecycle.persistent,
+            libvirt_uri: self
+                .connection
+                .get_uri()
+                .map_err(provisioning_backend_error)?,
+            storage_pool_name: forge_storage::DEFAULT_POOL.to_owned(),
+            storage_pool_uuid: pool.get_uuid_string().map_err(provisioning_backend_error)?,
+            resources: vec![
+                observed_resource(forge_state::ResourceRole::SharedBase, &lifecycle.base)?,
+                observed_resource(
+                    forge_state::ResourceRole::WritableOverlay,
+                    &lifecycle.current_overlay,
+                )?,
+                observed_resource(
+                    forge_state::ResourceRole::NoCloudSeed,
+                    &lifecycle.current_seed,
+                )?,
+            ],
+            unmanaged_resources,
+        })
+    }
 }
 
 impl forge_provisioning::BootBackend for LibvirtBootBackend {

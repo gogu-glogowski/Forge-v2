@@ -18,6 +18,7 @@ forge-libvirt = { path = "../forge-libvirt" }
 forge-profiles = { path = "../forge-profiles" }
 forge-provisioning = { path = "../forge-provisioning" }
 forge-storage = { path = "../forge-storage" }
+forge-state = { path = "../forge-state" }
 
 [lints]
 workspace = true

@@ -42,6 +42,10 @@ fn main() -> ExitCode {
         ["vm", "start", "fedora-lab"] => lifecycle_action(true, false),
         ["vm", "shutdown", "fedora-lab", "--dry-run"] => lifecycle_action(false, true),
         ["vm", "shutdown", "fedora-lab"] => lifecycle_action(false, false),
+        ["state", "show", "fedora-lab"] => state_show(),
+        ["state", "reconcile", "fedora-lab"] => state_reconcile(),
+        ["state", "adopt", "fedora-lab", "--dry-run"] => state_adopt(true),
+        ["state", "adopt", "fedora-lab"] => state_adopt(false),
         ["vm", "define", "fedora-lab"] => define_vm(false),
         ["vm", "define", "fedora-lab", "--dry-run"] => define_vm(true),
         ["vm", "prepare", "fedora-lab"] => prepare_vm(false),
@@ -59,6 +63,221 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn state_manifest_path() -> Result<std::path::PathBuf, String> {
+    let home = env::var_os("HOME").ok_or_else(|| "HOME is unavailable".to_owned())?;
+    Ok(forge_state::manifest_path(
+        &forge_state::state_directory(std::path::Path::new(&home)),
+        "fedora-lab",
+    ))
+}
+
+fn state_show() -> ExitCode {
+    let path = match state_manifest_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("Forge state path failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match forge_state::read_manifest(&path) {
+        Ok(Some(manifest)) => match forge_state::serialize(&manifest) {
+            Ok(json) => {
+                print!("{}", String::from_utf8_lossy(&json));
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("Forge state serialization failed: {error}");
+                ExitCode::from(1)
+            }
+        },
+        Ok(None) => {
+            println!("State: Missing");
+            println!("Manifest path: {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            println!("State: CorruptState");
+            eprintln!("Forge state cannot be read: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn discover_state() -> Result<forge_state::ObservedGeneration, String> {
+    let backend = forge_libvirt::LibvirtBootBackend::connect_local()
+        .map_err(|error| format!("libvirt connection failed: {error}"))?;
+    backend
+        .inspect_state()
+        .map_err(|error| format!("Forge state discovery failed: {error}"))
+}
+
+fn state_reconcile() -> ExitCode {
+    let path = match state_manifest_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("Forge state path failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let manifest = match forge_state::read_manifest(&path) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => {
+            println!("ReconciliationStatus: Missing");
+            println!("Manifest path: {}", path.display());
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            println!("ReconciliationStatus: CorruptState");
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+    let observed = match discover_state() {
+        Ok(observed) => observed,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+    let report = forge_state::reconcile(&manifest, &observed);
+    println!("ReconciliationStatus: {:?}", report.status);
+    for issue in report.issues {
+        println!(
+            "- {:?} {}: expected {}, actual {}",
+            issue.status, issue.field, issue.expected, issue.actual
+        );
+    }
+    if report.status == forge_state::ReconciliationStatus::Consistent {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+fn state_adopt(dry_run: bool) -> ExitCode {
+    let path = match state_manifest_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("Forge state path failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match forge_state::read_manifest(&path) {
+        Ok(Some(_)) => {
+            eprintln!("Forge state adoption refused: manifest already exists");
+            return ExitCode::from(1);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("Forge state adoption refused: {error}");
+            return ExitCode::from(1);
+        }
+    }
+    let observed = match discover_state() {
+        Ok(observed) => observed,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+    let plan =
+        match forge_state::plan_adoption(&observed, path.clone(), std::time::SystemTime::now()) {
+            Ok(plan) => plan,
+            Err(error) => {
+                eprintln!("Forge state adoption denied: {error}");
+                return ExitCode::from(1);
+            }
+        };
+    print_adoption_plan(&plan, &observed, dry_run);
+    if dry_run {
+        return ExitCode::SUCCESS;
+    }
+    eprint!("Adopt current Fedora-Lab generation into Forge state? [y/N] ");
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err()
+        || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    {
+        eprintln!("State adoption cancelled.");
+        return ExitCode::SUCCESS;
+    }
+    let fresh = match discover_state() {
+        Ok(fresh) => fresh,
+        Err(error) => {
+            eprintln!("pre-write discovery failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if forge_state::reconcile(&plan.manifest, &fresh).status
+        != forge_state::ReconciliationStatus::Consistent
+        || !matches!(forge_state::read_manifest(&path), Ok(None))
+    {
+        eprintln!("state changed before adoption; manifest write denied");
+        return ExitCode::from(1);
+    }
+    match forge_state::write_manifest_atomic(&path, &plan.manifest) {
+        Ok(()) => {
+            println!(
+                "Forge state manifest written atomically: {}",
+                path.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Forge state adoption failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn print_adoption_plan(
+    plan: &forge_state::AdoptionPlan,
+    observed: &forge_state::ObservedGeneration,
+    dry_run: bool,
+) {
+    println!(
+        "Adoption mode: {}",
+        if dry_run {
+            "dry-run (zero mutation)"
+        } else {
+            "real"
+        }
+    );
+    println!("Domain: {}", observed.domain_name);
+    println!("Domain UUID: {}", observed.domain_uuid);
+    println!("Libvirt URI: {}", observed.libvirt_uri);
+    println!(
+        "Storage pool: {} ({})",
+        observed.storage_pool_name, observed.storage_pool_uuid
+    );
+    println!("Planned generation ID: {}", plan.manifest.generation_id);
+    println!(
+        "State exists: false{}",
+        if dry_run {
+            " (dry-run does not write the manifest)"
+        } else {
+            " (manifest is written only after confirmation and revalidation)"
+        }
+    );
+    println!("Manifest path: {}", plan.manifest_path.display());
+    println!("Adoptable active resources:");
+    for resource in &plan.adoptable_resources {
+        println!(
+            "- {:?}: {} | key={} | format={} | capacity={} | backing={}",
+            resource.role,
+            resource.path,
+            resource.volume_key,
+            resource.format,
+            resource.capacity_bytes,
+            resource.backing_path.as_deref().unwrap_or("none")
+        );
+    }
+    println!("Unmanaged legacy resources:");
+    for resource in &plan.unmanaged_resources {
+        println!("- {resource}");
+    }
+    println!("Mutation: {}", plan.mutation);
 }
 
 fn discover_lifecycle_status() -> Result<forge_provisioning::FedoraLabLifecycleStatus, String> {
@@ -1093,6 +1312,9 @@ fn print_usage() {
     eprintln!("  forge vm cleanup fedora-lab --dry-run");
     eprintln!("  forge vm start fedora-lab [--dry-run]");
     eprintln!("  forge vm shutdown fedora-lab [--dry-run]");
+    eprintln!("  forge state show fedora-lab");
+    eprintln!("  forge state reconcile fedora-lab");
+    eprintln!("  forge state adopt fedora-lab [--dry-run]");
     eprintln!("  forge vm define fedora-lab [--dry-run]");
     eprintln!("  forge vm prepare fedora-lab [--dry-run]");
     eprintln!("  forge vm boot fedora-lab [--dry-run]");
