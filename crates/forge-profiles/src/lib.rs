@@ -15,7 +15,12 @@ const RATIO_SCALE_USIZE: usize = 1000;
 
 #[must_use]
 pub fn built_in_profiles() -> Vec<VmProfile> {
-    vec![fedora_lab(), luna_dev_fedora(), luna_lab_fedora()]
+    vec![
+        fedora_lab(),
+        kali_lab(),
+        luna_dev_fedora(),
+        luna_lab_fedora(),
+    ]
 }
 
 #[must_use]
@@ -31,10 +36,46 @@ pub fn base_volume_name(profile: &VmProfile) -> String {
         ImageSourcePolicy::FedoraCloudBase { release } => {
             format!("forge-base-fedora-{release}.qcow2")
         }
+        ImageSourcePolicy::KaliQemuArchive { release } => {
+            format!("forge-base-kali-{release}.qcow2")
+        }
         ImageSourcePolicy::VerifiedQcow2 { source_id } => {
             format!("forge-base-{source_id}.qcow2")
         }
     }
+}
+
+#[must_use]
+pub fn kali_lab() -> VmProfile {
+    let mut profile = profile(
+        ProfileMetadata {
+            id: "kali-lab",
+            display_name: "Kali Lab",
+            kind: GuestProfileKind::KaliLab,
+            instance_kind: InstanceKind::Lab,
+            guest_family: GuestFamily::Kali,
+        },
+        VmResources {
+            cpu_ratio_per_mille: 250,
+            min_vcpus: 2,
+            max_vcpus: 4,
+            memory_start_ratio_per_mille: 125,
+            memory_max_ratio_per_mille: 250,
+            min_memory_bytes: 2 * GIB,
+            host_memory_reserve_bytes: 2 * GIB,
+            disk_bytes: 86 * GIB,
+        },
+        ImagePolicy {
+            source: ImageSourcePolicy::KaliQemuArchive {
+                release: "2026.2".to_owned(),
+            },
+            verification: ImageVerificationPolicy::KaliDetachedSignedSha256Sums,
+        },
+        ProvisioningPolicy::None,
+        FirstBootSuccessPolicy::ManualGuest,
+    );
+    profile.firmware_machine = FirmwareMachinePolicy::BiosQ35;
+    profile
 }
 
 #[must_use]
@@ -218,6 +259,7 @@ pub struct InstancePlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceImageFormat {
     Qcow2,
+    SevenZipQcow2Archive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -401,7 +443,12 @@ pub fn plan_create(
         prepared_base: PreparedBaseImagePlan {
             source: instance.image.source.clone(),
             verification: instance.image.verification,
-            source_format: SourceImageFormat::Qcow2,
+            source_format: match &instance.image.source {
+                ImageSourcePolicy::KaliQemuArchive { .. } => {
+                    SourceImageFormat::SevenZipQcow2Archive
+                }
+                _ => SourceImageFormat::Qcow2,
+            },
             base_volume_name: instance.image.base_volume_name.clone(),
         },
         instance,
@@ -549,6 +596,60 @@ mod tests {
     }
 
     #[test]
+    fn kali_lab_is_registered_as_persistent_manual_default_nat() {
+        let profile = find("kali-lab").unwrap();
+        assert_eq!(profile.guest_family, GuestFamily::Kali);
+        assert_eq!(profile.kind, GuestProfileKind::KaliLab);
+        assert_eq!(profile.instance_kind, InstanceKind::Lab);
+        assert_eq!(profile.provisioning, ProvisioningPolicy::None);
+        assert_eq!(
+            profile.first_boot_success,
+            FirstBootSuccessPolicy::ManualGuest
+        );
+        assert_eq!(profile.persistence, PersistencePolicy::Persistent);
+        assert_eq!(profile.network_policy, NetworkPolicy::DefaultNat);
+        assert_eq!(profile.firmware_machine, FirmwareMachinePolicy::BiosQ35);
+    }
+
+    #[test]
+    fn kali_create_plan_is_manual_archive_without_seed_or_guest_requirements() {
+        let profile = kali_lab();
+        let instance = plan_instance(
+            &hardware(16, 32),
+            &profile,
+            InstanceIdentity {
+                name: InstanceName::new("kali-lab").unwrap(),
+                profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap();
+        let resources = generation("kali-lab", false);
+        let plan = plan_create(instance, resources).unwrap();
+        assert_eq!(
+            plan.prepared_base.source_format,
+            SourceImageFormat::SevenZipQcow2Archive
+        );
+        assert!(plan.generation.seed.is_none());
+        assert!(!plan.auto_boot);
+        assert!(plan.observations.is_empty());
+        assert_eq!(
+            plan.instance.lifecycle,
+            LifecyclePlan::PersistentManaged {
+                state_directory_name: "kali-lab".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn kali_and_fedora_have_isolated_state_and_generation_resources() {
+        let kali = generation("kali-lab", false);
+        let fedora = generation("fedora-lab", true);
+        assert_ne!(kali.overlay, fedora.overlay);
+        assert_ne!(kali.seed, fedora.seed);
+        assert_ne!("kali-lab", "fedora-lab");
+    }
+
+    #[test]
     fn luna_lab_uses_its_own_policy() {
         let profile = luna_lab_fedora();
         let plan = plan(&hardware(16, 32), &profile).unwrap();
@@ -564,7 +665,15 @@ mod tests {
             .into_iter()
             .map(|profile| profile.id.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["fedora-lab", "luna-dev-fedora", "luna-lab-fedora"]);
+        assert_eq!(
+            names,
+            [
+                "fedora-lab",
+                "kali-lab",
+                "luna-dev-fedora",
+                "luna-lab-fedora"
+            ]
+        );
     }
 
     #[test]

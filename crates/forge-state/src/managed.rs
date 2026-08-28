@@ -554,8 +554,16 @@ fn generation_identity_matches_exact(
         && manifest.libvirt_uri == observed.libvirt_uri
         && manifest.storage_pool_name == observed.storage_pool_name
         && manifest.storage_pool_uuid == observed.storage_pool_uuid
-        && manifest.resources.len() == 3
-        && observed.resources.len() == 3
+        && matches!(manifest.resources.len(), 2 | 3)
+        && manifest.resources.len() == observed.resources.len()
+        && manifest
+            .resources
+            .iter()
+            .any(|resource| resource.role == ResourceRole::SharedBase)
+        && manifest
+            .resources
+            .iter()
+            .any(|resource| resource.role == ResourceRole::WritableOverlay)
         && manifest.resources.iter().all(|expected| {
             observed.resources.iter().any(|actual| {
                 expected.role == actual.role
@@ -594,15 +602,74 @@ fn generation_identity_matches(
         .resources
         .iter()
         .find(|resource| resource.role == ResourceRole::NoCloudSeed);
-    matches!(
-        (expected_overlay, expected_seed, actual_overlay, actual_seed),
-        (Some(expected_overlay), Some(expected_seed), Some(actual_overlay), Some(actual_seed))
-            if expected_overlay.volume_key == actual_overlay.volume_key
-                && expected_overlay.path == actual_overlay.path
-                && expected_overlay.backing_path == actual_overlay.backing_path
-                && expected_seed.volume_key == actual_seed.volume_key
-                && expected_seed.path == actual_seed.path
-    )
+    let overlay_matches = matches!(
+        (expected_overlay, actual_overlay),
+        (Some(expected), Some(actual))
+            if expected.volume_key == actual.volume_key
+                && expected.path == actual.path
+                && expected.backing_path == actual.backing_path
+    );
+    let seed_matches = match (expected_seed, actual_seed) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => {
+            expected.volume_key == actual.volume_key && expected.path == actual.path
+        }
+        _ => false,
+    };
+    overlay_matches && seed_matches
+}
+
+/// Publishes immutable Preparing ownership before the first domain definition.
+///
+/// # Errors
+/// Refuses an existing index/manifest or a manifest that is not Preparing.
+pub fn publish_initial_preparing(
+    layout: &StateLayout,
+    manifest: &GenerationManifest,
+) -> Result<(), StateError> {
+    if manifest.status != GenerationStatus::Preparing {
+        return Err(StateError::InvalidObservedState(
+            "initial generation manifest must be Preparing".to_owned(),
+        ));
+    }
+    if layout.index.exists() || layout.generation_path(&manifest.generation_id).exists() {
+        return Err(StateError::AlreadyExists(layout.domain_directory.clone()));
+    }
+    write_manifest_atomic(&layout.generation_path(&manifest.generation_id), manifest)
+}
+
+/// Atomically publishes the first Active index after exact domain/storage proof.
+///
+/// # Errors
+/// Refuses mismatched observation, missing Preparing intent, or an existing index.
+pub fn activate_initial_generation(
+    layout: &StateLayout,
+    manifest: &GenerationManifest,
+    observed: &ObservedGeneration,
+) -> Result<GenerationIndex, StateError> {
+    if layout.index.exists()
+        || read_manifest(&layout.generation_path(&manifest.generation_id))?.as_ref()
+            != Some(manifest)
+        || !generation_identity_matches_exact(manifest, observed)
+    {
+        return Err(StateError::InvalidObservedState(
+            "initial activation identity or durable intent changed".to_owned(),
+        ));
+    }
+    let index = GenerationIndex {
+        schema_version: INDEX_SCHEMA_VERSION,
+        domain_name: manifest.domain_name.clone(),
+        domain_uuid: manifest.domain_uuid.clone(),
+        active_generation_id: manifest.generation_id.clone(),
+        generations: vec![GenerationEntry {
+            generation_id: manifest.generation_id.clone(),
+            status: GenerationStatus::Active,
+            manifest_file: format!("generations/{}.json", manifest.generation_id),
+        }],
+        cleanup_progress: Vec::new(),
+    };
+    write_index_atomic(&layout.index, &index)?;
+    Ok(index)
 }
 
 /// Plans a lossless migration. The legacy manifest remains as a recovery source.

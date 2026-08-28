@@ -41,6 +41,7 @@ fn main() -> ExitCode {
         ["vm", "create", profile_name, instance_name, "--dry-run"] => {
             create_vm_dry_run(profile_name, instance_name)
         }
+        ["vm", "create", profile_name, instance_name] => create_vm(profile_name, instance_name),
         ["hypervisor", "info"] => hypervisor_info(),
         ["vm", "list"] => vm_list(),
         ["vm", "status", instance] => lifecycle_status(instance),
@@ -677,18 +678,37 @@ fn validate_profile_binding(
     };
     let base = resource(forge_state::ResourceRole::SharedBase)?;
     let overlay = resource(forge_state::ResourceRole::WritableOverlay)?;
-    let seed = resource(forge_state::ResourceRole::NoCloudSeed)?;
     if base.volume_name != forge_profiles::base_volume_name(&profile)
         || overlay.capacity_bytes != profile.resources.disk_bytes
-        || !matches!(
-            profile.provisioning,
-            forge_core::ProvisioningPolicy::NoCloud { .. }
-        )
-        || seed.capacity_bytes == 0
     {
         return Err("active generation topology differs from profile policy".to_owned());
     }
+    validate_provisioning_topology(&profile.provisioning, &active.resources)?;
     Ok(profile)
+}
+
+fn validate_provisioning_topology(
+    policy: &forge_core::ProvisioningPolicy,
+    resources: &[forge_state::ManagedResource],
+) -> Result<(), String> {
+    let seeds = resources
+        .iter()
+        .filter(|resource| resource.role == forge_state::ResourceRole::NoCloudSeed)
+        .collect::<Vec<_>>();
+    match policy {
+        forge_core::ProvisioningPolicy::NoCloud { .. }
+            if seeds.len() == 1 && seeds[0].capacity_bytes > 0 =>
+        {
+            Ok(())
+        }
+        forge_core::ProvisioningPolicy::NoCloud { .. } => {
+            Err("NoCloud profile requires exactly one non-empty seed".to_owned())
+        }
+        forge_core::ProvisioningPolicy::None if seeds.is_empty() => Ok(()),
+        forge_core::ProvisioningPolicy::None => {
+            Err("manual provisioning profile forbids a seed".to_owned())
+        }
+    }
 }
 
 struct OperationalInstance {
@@ -2645,6 +2665,9 @@ fn print_create_plan(plan: &forge_profiles::GenericCreatePlan, domain: &forge_do
         domain.name, domain.firmware, domain.machine
     );
     println!("Provisioning plan: {:?}", plan.instance.provisioning);
+    println!("Network plan: {:?}", plan.instance.network);
+    println!("Graphics plan: {:?}", plan.instance.graphics);
+    println!("Persistence plan: {:?}", plan.instance.lifecycle);
     println!(
         "First-boot success policy: {:?}",
         plan.instance.first_boot_success
@@ -2661,6 +2684,308 @@ fn print_create_plan(plan: &forge_profiles::GenericCreatePlan, domain: &forge_do
         plan.instance.identity.name
     );
     println!("Mutation: {}", plan.mutation);
+}
+
+struct KaliCreateBackend {
+    storage: forge_libvirt::LibvirtDefineBackend,
+    instance: InstanceName,
+    domain_uuid: String,
+    source: forge_images::KaliImageMetadata,
+    source_file_bytes: u64,
+    source_capacity_bytes: u64,
+    layout: forge_state::StateLayout,
+    base_created: bool,
+    overlay_created: bool,
+}
+
+impl forge_storage::GenericCreateBackend for KaliCreateBackend {
+    fn revalidate_absent(
+        &mut self,
+        plan: &forge_storage::GenericCreateExecutionPlan,
+    ) -> Result<(), String> {
+        use forge_storage::{DefineBackend, ImagePrepareBackend};
+        if !matches!(
+            forge_state::inspect_layout(&self.layout).map_err(|error| error.to_string())?,
+            forge_state::ManagedState::Missing
+        ) || DefineBackend::domain_exists(&mut self.storage, self.instance.as_str())
+            .map_err(|error| error.to_string())?
+            || !self
+                .storage
+                .default_network_active()
+                .map_err(|error| error.to_string())?
+        {
+            return Err("domain, state, or default network precondition changed".to_owned());
+        }
+        let pool =
+            ImagePrepareBackend::inspect_pool(&mut self.storage, forge_storage::DEFAULT_POOL)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "default pool is absent".to_owned())?;
+        if !pool.active || pool.available_bytes < plan.factory.instance.resources.disk_bytes {
+            return Err("default pool is inactive or lacks required capacity".to_owned());
+        }
+        for name in [
+            plan.factory.prepared_base.base_volume_name.as_str(),
+            plan.factory.generation.overlay.as_str(),
+        ] {
+            if ImagePrepareBackend::inspect_volume(
+                &mut self.storage,
+                forge_storage::DEFAULT_POOL,
+                name,
+            )
+            .map_err(|error| error.to_string())?
+            .is_some()
+            {
+                return Err(format!("exact planned volume already exists: {name}"));
+            }
+        }
+        forge_images::verified_kali(
+            &forge_images::default_directories()
+                .ok_or_else(|| "Forge image directories are unavailable".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn prepare_storage(
+        &mut self,
+        plan: &forge_storage::GenericCreateExecutionPlan,
+    ) -> Result<(), String> {
+        use forge_storage::ImagePrepareBackend;
+        let pool =
+            ImagePrepareBackend::inspect_pool(&mut self.storage, forge_storage::DEFAULT_POOL)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "default pool is absent".to_owned())?;
+        let base_path = format!(
+            "{}/{}",
+            pool.target_path.trim_end_matches('/'),
+            plan.factory.prepared_base.base_volume_name
+        );
+        let base = forge_storage::BaseImageVolume {
+            name: plan.factory.prepared_base.base_volume_name.clone(),
+            path: base_path.clone(),
+            imported_bytes: self.source_file_bytes,
+            capacity_bytes: self.source_capacity_bytes,
+            format: "qcow2".to_owned(),
+        };
+        ImagePrepareBackend::import_base(
+            &mut self.storage,
+            forge_storage::DEFAULT_POOL,
+            &base,
+            self.source.prepared_qcow2_path.to_string_lossy().as_ref(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.base_created = true;
+        let overlay = forge_storage::OverlayVolume {
+            name: plan.factory.generation.overlay.clone(),
+            path: format!(
+                "{}/{}",
+                pool.target_path.trim_end_matches('/'),
+                plan.factory.generation.overlay
+            ),
+            capacity_bytes: plan.factory.instance.resources.disk_bytes,
+            allocation_bytes: 0,
+            format: "qcow2".to_owned(),
+            backing_path: Some(base_path),
+        };
+        ImagePrepareBackend::create_overlay(
+            &mut self.storage,
+            forge_storage::DEFAULT_POOL,
+            &overlay,
+        )
+        .map_err(|error| error.to_string())?;
+        self.overlay_created = true;
+        Ok(())
+    }
+
+    fn inspect_preparing(
+        &mut self,
+        plan: &forge_storage::GenericCreateExecutionPlan,
+    ) -> Result<forge_state::ObservedGeneration, String> {
+        self.storage
+            .inspect_preparing_generation(
+                &self.instance,
+                &self.domain_uuid,
+                &plan.factory.generation.overlay,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    fn persist_preparing(
+        &mut self,
+        manifest: &forge_state::GenerationManifest,
+    ) -> Result<(), String> {
+        forge_state::publish_initial_preparing(&self.layout, manifest)
+            .map_err(|error| error.to_string())
+    }
+
+    fn define_domain(&mut self, domain_xml: &str) -> Result<(), String> {
+        let domain = forge_storage::DefineBackend::define_domain(&mut self.storage, domain_xml)
+            .map_err(|error| error.error.to_string())?;
+        if domain.uuid != self.domain_uuid || domain.state != forge_core::VmState::Shutoff {
+            return Err("defined domain identity/state differs from the plan".to_owned());
+        }
+        Ok(())
+    }
+
+    fn inspect_defined(
+        &mut self,
+        plan: &forge_storage::GenericCreateExecutionPlan,
+    ) -> Result<forge_state::ObservedGeneration, String> {
+        forge_libvirt::LibvirtBootBackend::connect_instance(self.instance.clone())
+            .map_err(|error| error.to_string())?
+            .inspect_generation_overlay_only(&format!(
+                "/var/lib/libvirt/images/{}",
+                plan.factory.generation.overlay
+            ))
+            .map_err(|error| error.to_string())
+    }
+
+    fn activate(
+        &mut self,
+        manifest: &forge_state::GenerationManifest,
+        observed: &forge_state::ObservedGeneration,
+    ) -> Result<forge_state::GenerationIndex, String> {
+        forge_state::activate_initial_generation(&self.layout, manifest, observed)
+            .map_err(|error| error.to_string())
+    }
+
+    fn rollback_before_ownership(
+        &mut self,
+        plan: &forge_storage::GenericCreateExecutionPlan,
+    ) -> Result<(), String> {
+        let mut failures = Vec::new();
+        if self.overlay_created
+            && let Err(error) = forge_storage::DefineBackend::delete_volume(
+                &mut self.storage,
+                forge_storage::DEFAULT_POOL,
+                &plan.factory.generation.overlay,
+            )
+        {
+            failures.push(error.to_string());
+        }
+        if self.base_created
+            && let Err(error) = forge_storage::DefineBackend::delete_volume(
+                &mut self.storage,
+                forge_storage::DEFAULT_POOL,
+                &plan.factory.prepared_base.base_volume_name,
+            )
+        {
+            failures.push(error.to_string());
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+}
+
+fn create_vm(profile_name: &str, instance_name: &str) -> ExitCode {
+    if profile_name != "kali-lab" {
+        eprintln!("real generic create is currently enabled only for the reviewed kali-lab policy");
+        return ExitCode::from(2);
+    }
+    eprint!("Create persistent ManualGuest {instance_name} from {profile_name}? [y/N] ");
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err()
+        || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    {
+        eprintln!("Creation cancelled.");
+        return ExitCode::SUCCESS;
+    }
+    match execute_kali_create(profile_name, instance_name) {
+        Ok(index) => {
+            println!("Active generation: {}", index.active_generation_id);
+            println!("Kali ManualGuest created shut off; use Virt-Manager or forge vm start.");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Kali create failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn execute_kali_create(
+    profile_name: &str,
+    instance_name: &str,
+) -> Result<forge_state::GenerationIndex, String> {
+    let profile = forge_profiles::find(profile_name)
+        .ok_or_else(|| format!("unknown VM profile: {profile_name}"))?;
+    let instance = InstanceName::new(instance_name).map_err(|error| error.to_string())?;
+    let hardware = forge_hardware::collect().map_err(|error| error.to_string())?;
+    let instance_plan = forge_profiles::plan_instance(
+        &hardware,
+        &profile,
+        forge_profiles::InstanceIdentity {
+            name: instance.clone(),
+            profile_id: profile.id.clone(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let generation_id = forge_state::new_generation_id();
+    let generation = forge_state::plan_generation_resources(&instance, generation_id, false)
+        .map_err(|error| error.to_string())?;
+    let factory = forge_profiles::plan_create(instance_plan, generation)
+        .map_err(|error| error.to_string())?;
+    let directories = forge_images::default_directories()
+        .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
+    let source = forge_images::fetch_kali(&directories, &mut forge_images::SystemArtifactFetcher)
+        .map_err(|error| error.to_string())?;
+    let source_file_bytes = std::fs::metadata(&source.prepared_qcow2_path)
+        .map_err(|error| error.to_string())?
+        .len();
+    let source_capacity_bytes = forge_images::qcow2_virtual_size(&source.prepared_qcow2_path)
+        .map_err(|error| error.to_string())?;
+    if source_capacity_bytes > factory.instance.resources.disk_bytes {
+        return Err("Kali source capacity exceeds the profile disk policy".to_owned());
+    }
+    let domain_uuid = forge_state::new_generation_id()
+        .strip_prefix("gen-")
+        .expect("Forge generation IDs have a stable prefix")
+        .to_owned();
+    let mut domain = forge_domain::profile_spec(
+        &profile,
+        &factory.instance.resources,
+        forge_domain::DomainMetadata {
+            name: instance.to_string(),
+            disk_path: format!("/var/lib/libvirt/images/{}", factory.generation.overlay),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    domain.uuid = Some(domain_uuid.clone());
+    let domain_xml = forge_domain::render_xml(&domain).map_err(|error| error.to_string())?;
+    let created_unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_secs();
+    let home = env::var_os("HOME").ok_or_else(|| "HOME is unavailable".to_owned())?;
+    let layout = forge_state::StateLayout::for_instance(
+        &forge_state::state_directory(std::path::Path::new(&home)),
+        &instance,
+    );
+    let mut backend = KaliCreateBackend {
+        storage: forge_libvirt::LibvirtDefineBackend::connect_local()
+            .map_err(|error| error.to_string())?,
+        instance,
+        domain_uuid,
+        source,
+        source_file_bytes,
+        source_capacity_bytes,
+        layout,
+        base_created: false,
+        overlay_created: false,
+    };
+    forge_storage::execute_generic_create(
+        &mut backend,
+        &forge_storage::GenericCreateExecutionPlan {
+            factory,
+            created_unix_seconds,
+            domain_xml,
+        },
+    )
+    .map(|result| result.index)
+    .map_err(|error| error.to_string())
 }
 
 fn print_plan(profile_name: &str, plan: VmResourcePlan) {
@@ -2738,7 +3063,19 @@ const fn yes_no(value: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_core::VmState;
+    use forge_core::{ProvisioningPolicy, VmState};
+
+    fn seed() -> forge_state::ManagedResource {
+        forge_state::ManagedResource {
+            role: forge_state::ResourceRole::NoCloudSeed,
+            volume_name: "seed.iso".to_owned(),
+            volume_key: "/pool/seed.iso".to_owned(),
+            path: "/pool/seed.iso".to_owned(),
+            format: "raw".to_owned(),
+            capacity_bytes: 4096,
+            backing_path: None,
+        }
+    }
 
     #[test]
     fn empty_domain_list_is_not_an_error() {
@@ -2757,5 +3094,28 @@ mod tests {
             format_domain_list(&domains),
             "NAME\tSTATE\tUUID\tTYPE\nfedora-lab\tshutoff\texample-uuid\tpersistent\n"
         );
+    }
+
+    #[test]
+    fn provisioning_policy_drives_seed_reconciliation() {
+        let no_cloud = ProvisioningPolicy::NoCloud {
+            default_user: "forge".to_owned(),
+            guest_agent: true,
+        };
+        assert!(validate_provisioning_topology(&no_cloud, &[]).is_err());
+        assert!(validate_provisioning_topology(&no_cloud, &[seed()]).is_ok());
+        assert!(validate_provisioning_topology(&ProvisioningPolicy::None, &[]).is_ok());
+        assert!(validate_provisioning_topology(&ProvisioningPolicy::None, &[seed()]).is_err());
+    }
+
+    #[test]
+    fn fedora_profile_still_requires_its_nocloud_seed() {
+        let fedora = forge_profiles::find("fedora-lab").unwrap();
+        assert!(matches!(
+            fedora.provisioning,
+            ProvisioningPolicy::NoCloud { .. }
+        ));
+        assert!(validate_provisioning_topology(&fedora.provisioning, &[seed()]).is_ok());
+        assert!(validate_provisioning_topology(&fedora.provisioning, &[]).is_err());
     }
 }

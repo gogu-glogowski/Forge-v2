@@ -271,6 +271,16 @@ fn plan_lifecycle_with_policy(
     action: LifecycleAction,
     policy: &LifecyclePolicyEvidence,
 ) -> Result<LifecycleActionPlan, ProvisioningError> {
+    let seed_topology_matches = match policy.provisioning {
+        ProvisioningPolicy::NoCloud { .. } => {
+            status.current_seed.exists
+                && status.active_seed_path.as_deref() == Some(status.current_seed.path.as_str())
+                && matches!(status.current_seed.format.as_deref(), Some("raw" | "iso"))
+        }
+        ProvisioningPolicy::None => {
+            !status.current_seed.exists && status.active_seed_path.is_none()
+        }
+    };
     if policy.reconciliation != ReconciliationEvidence::Consistent
         || policy.persistence != PersistencePolicy::Persistent
         || !status.persistent
@@ -281,14 +291,12 @@ fn plan_lifecycle_with_policy(
             .is_some_and(|capacity| status.base.capacity_bytes != Some(capacity))
         || status.base.backing_path.is_some()
         || !status.current_overlay.exists
-        || !status.current_seed.exists
+        || !seed_topology_matches
         || status.active_overlay_path != status.current_overlay.path
         || status.active_backing_path.as_deref() != Some(status.base.path.as_str())
-        || status.active_seed_path.as_deref() != Some(status.current_seed.path.as_str())
         || status.current_overlay.format.as_deref() != Some("qcow2")
         || status.current_overlay.capacity_bytes != Some(policy.disk_bytes)
         || status.current_overlay.backing_path.as_deref() != Some(status.base.path.as_str())
-        || !matches!(status.current_seed.format.as_deref(), Some("raw" | "iso"))
         || (matches!(
             policy.provisioning,
             ProvisioningPolicy::NoCloud {
@@ -311,16 +319,9 @@ fn plan_lifecycle_with_policy(
             60,
             vec!["return typed AlreadyRunning without calling libvirt create".to_owned()],
         ),
-        LifecycleAction::Start if status.domain_state == VmState::Shutoff => (
-            None,
-            180,
-            vec![
-                "call libvirt create exactly once".to_owned(),
-                "wait at most 60s for running".to_owned(),
-                "run typed DHCP, QGA, and SSH/cloud-init observability with finite timeouts"
-                    .to_owned(),
-            ],
-        ),
+        LifecycleAction::Start if status.domain_state == VmState::Shutoff => {
+            (None, 180, start_steps(&policy.provisioning))
+        }
         LifecycleAction::Start => {
             return Err(ProvisioningError::LifecycleUnsafe(format!(
                 "domain cannot be started from state {}",
@@ -351,9 +352,11 @@ fn plan_lifecycle_with_policy(
     let mut checks = vec![
         "persistent domain".to_owned(),
         "active qcow2 overlay has the trusted base backing".to_owned(),
-        "active NoCloud seed is present".to_owned(),
-        "declarative QGA channel is present".to_owned(),
     ];
+    if matches!(policy.provisioning, ProvisioningPolicy::NoCloud { .. }) {
+        checks.push("active NoCloud seed is present".to_owned());
+        checks.push("declarative QGA channel follows profile policy".to_owned());
+    }
     if action == LifecycleAction::Start {
         checks.push("libvirt default network is active".to_owned());
     }
@@ -365,6 +368,22 @@ fn plan_lifecycle_with_policy(
         checks,
         steps,
     })
+}
+
+fn start_steps(provisioning: &ProvisioningPolicy) -> Vec<String> {
+    let mut steps = vec![
+        "call libvirt create exactly once".to_owned(),
+        "wait at most 60s for running".to_owned(),
+    ];
+    match provisioning {
+        ProvisioningPolicy::NoCloud { .. } => steps.push(
+            "run typed DHCP, QGA, and SSH/cloud-init observability with finite timeouts".to_owned(),
+        ),
+        ProvisioningPolicy::None => steps.push(
+            "return after domain running; profile requires no guest observability".to_owned(),
+        ),
+    }
+    steps
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1409,6 +1428,9 @@ mod tests {
             graphics_policy: forge_core::GraphicsPolicy::Virtual,
             persistence: PersistencePolicy::Persistent,
         };
+        status.current_seed.exists = false;
+        status.current_seed.path.clear();
+        status.active_seed_path = None;
         assert!(
             plan_instance_lifecycle(&status, &profile, true, LifecycleAction::Shutdown).is_ok()
         );
@@ -1436,10 +1458,28 @@ mod tests {
             require_guest_agent: true,
         };
         profile.network_policy = NetworkPolicy::DefaultNat;
+        let fedora_status = lifecycle_status();
+        status.current_seed = fedora_status.current_seed;
+        status.active_seed_path = fedora_status.active_seed_path;
         assert_eq!(
             plan_instance_lifecycle(&status, &profile, true, LifecycleAction::Shutdown).unwrap(),
             plan_lifecycle_action(&status, LifecycleAction::Shutdown).unwrap()
         );
+    }
+
+    #[test]
+    fn kali_manual_guest_uses_shared_status_start_and_shutdown_planning() {
+        let profile = forge_profiles::kali_lab();
+        let mut status = lifecycle_status();
+        status.current_overlay.capacity_bytes = Some(profile.resources.disk_bytes);
+        status.current_seed.exists = false;
+        status.current_seed.path.clear();
+        status.active_seed_path = None;
+        assert!(
+            plan_instance_lifecycle(&status, &profile, true, LifecycleAction::Shutdown).is_ok()
+        );
+        status.domain_state = VmState::Shutoff;
+        assert!(plan_instance_lifecycle(&status, &profile, true, LifecycleAction::Start).is_ok());
     }
 
     #[test]

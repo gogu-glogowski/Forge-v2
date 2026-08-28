@@ -8,5 +8,8 @@ license.workspace = true
 forge-core = { path = "../forge-core" }
 sha2 = "0.10"
 
+[dev-dependencies]
+forge-profiles = { path = "../forge-profiles" }
+
 [lints]
 workspace = true

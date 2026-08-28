@@ -86,6 +86,7 @@ name = "forge-domain"
 version = "0.1.0"
 dependencies = [
  "forge-core",
+ "forge-profiles",
 ]
 
 [[package]]
@@ -137,6 +138,7 @@ name = "forge-provisioning"
 version = "0.1.0"
 dependencies = [
  "forge-core",
+ "forge-profiles",
  "sha2",
 ]
 
@@ -157,6 +159,8 @@ dependencies = [
  "forge-core",
  "forge-domain",
  "forge-images",
+ "forge-profiles",
+ "forge-state",
 ]
 
 [[package]]

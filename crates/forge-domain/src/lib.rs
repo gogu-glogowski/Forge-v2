@@ -1,8 +1,8 @@
 //! Pure VM domain specification, validation, and deterministic libvirt XML.
 
 use forge_core::{
-    GpuMode, GraphicsPolicy, GuestProfileKind, NetworkMode, NetworkPolicy, ProvisioningPolicy,
-    VmProfile, VmResourcePlan,
+    FirmwareMachinePolicy, GpuMode, GraphicsPolicy, GuestProfileKind, NetworkMode, NetworkPolicy,
+    ProvisioningPolicy, VmProfile, VmResourcePlan,
 };
 use std::fmt;
 
@@ -12,6 +12,7 @@ const MEMORY_STEP_BYTES: u64 = 256 * MIB;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirmwareMode {
     Uefi,
+    Bios,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,7 +226,10 @@ pub fn profile_spec(
         uuid: None,
         architecture: Architecture::X86_64,
         machine: MachineType::Q35,
-        firmware: FirmwareMode::Uefi,
+        firmware: match profile.firmware_machine {
+            FirmwareMachinePolicy::UefiQ35 => FirmwareMode::Uefi,
+            FirmwareMachinePolicy::BiosQ35 => FirmwareMode::Bios,
+        },
         cpu_mode: CpuMode::HostPassthrough,
         vcpus: plan.vcpus,
         memory_start_bytes: round_memory_down(plan.memory_start_bytes),
@@ -354,13 +358,22 @@ pub fn render_xml(spec: &DomainSpec) -> Result<String, DomainSpecError> {
         1,
         &format!("<vcpu placement='static'>{}</vcpu>", spec.vcpus),
     );
-    xml.line(1, "<os firmware='efi'>");
-    xml.line(2, "<type arch='x86_64' machine='q35'>hvm</type>");
-    xml.line(2, "<firmware>");
-    xml.line(3, "<feature enabled='no' name='secure-boot'/>");
-    xml.line(3, "<feature enabled='no' name='enrolled-keys'/>");
-    xml.line(2, "</firmware>");
-    xml.line(1, "</os>");
+    match spec.firmware {
+        FirmwareMode::Uefi => {
+            xml.line(1, "<os firmware='efi'>");
+            xml.line(2, "<type arch='x86_64' machine='q35'>hvm</type>");
+            xml.line(2, "<firmware>");
+            xml.line(3, "<feature enabled='no' name='secure-boot'/>");
+            xml.line(3, "<feature enabled='no' name='enrolled-keys'/>");
+            xml.line(2, "</firmware>");
+            xml.line(1, "</os>");
+        }
+        FirmwareMode::Bios => {
+            xml.line(1, "<os>");
+            xml.line(2, "<type arch='x86_64' machine='q35'>hvm</type>");
+            xml.line(1, "</os>");
+        }
+    }
     xml.line(1, "<features>");
     xml.line(2, "<acpi/>");
     xml.line(2, "<apic/>");
@@ -688,6 +701,44 @@ mod tests {
         let xml = render_xml(&spec).unwrap();
         assert!(!xml.contains("<interface"));
         assert!(!xml.contains("<channel"));
+    }
+
+    #[test]
+    fn kali_manual_guest_uses_bios_q35_without_guest_agent_channel() {
+        let profile = forge_profiles::kali_lab();
+        let resources = forge_profiles::plan(
+            &forge_core::HardwareInfo {
+                cpu: forge_core::CpuInfo {
+                    model: "test".to_owned(),
+                    logical_cores: 8,
+                    virtualization: true,
+                },
+                memory_bytes: 16 * 1024 * 1024 * 1024,
+                gpus: vec![],
+                storage: vec![],
+                kvm: forge_core::KvmInfo {
+                    present: true,
+                    accessible: true,
+                },
+            },
+            &profile,
+        )
+        .unwrap();
+        let spec = profile_spec(
+            &profile,
+            &resources,
+            DomainMetadata {
+                name: "kali-lab".to_owned(),
+                disk_path: "/pool/kali.qcow2".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(spec.firmware, FirmwareMode::Bios);
+        assert!(!spec.guest_agent_required);
+        assert!(spec.channels.is_empty());
+        let xml = render_xml(&spec).unwrap();
+        assert!(!xml.contains("firmware='efi'"));
+        assert!(!xml.contains("org.qemu.guest_agent.0"));
     }
 
     #[test]

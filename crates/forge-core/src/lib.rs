@@ -218,6 +218,7 @@ pub enum InstanceKind {
 pub enum GuestFamily {
     Fedora,
     Debian,
+    Kali,
     Other,
 }
 
@@ -229,6 +230,7 @@ impl fmt::Display for GuestFamily {
             match self {
                 Self::Fedora => "fedora",
                 Self::Debian => "debian",
+                Self::Kali => "kali",
                 Self::Other => "other",
             }
         )
@@ -243,17 +245,20 @@ pub enum GuestArchitecture {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirmwareMachinePolicy {
     UefiQ35,
+    BiosQ35,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageSourcePolicy {
     FedoraCloudBase { release: String },
+    KaliQemuArchive { release: String },
     VerifiedQcow2 { source_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageVerificationPolicy {
     SignedSha256Checksums,
+    KaliDetachedSignedSha256Sums,
     Sha256Digest,
 }
 

@@ -185,6 +185,126 @@ impl LibvirtDefineBackend {
     fn pool(&self, name: &str) -> Result<StoragePool, forge_storage::StorageError> {
         StoragePool::lookup_by_name(&self.connection, name).map_err(storage_backend_error)
     }
+
+    /// Reads exact base/overlay identities before the planned domain exists.
+    ///
+    /// # Errors
+    /// Refuses missing backing, unavailable libvirt metadata, and referenced resources.
+    pub fn inspect_preparing_generation(
+        &self,
+        instance: &forge_core::InstanceName,
+        domain_uuid: &str,
+        overlay_name: &str,
+    ) -> Result<forge_state::ObservedGeneration, forge_storage::ImagePrepareError> {
+        let pool = self
+            .pool(forge_storage::DEFAULT_POOL)
+            .map_err(forge_storage::ImagePrepareError::from)?;
+        let pool_xml = pool.get_xml_desc(0).map_err(image_backend_error)?;
+        let pool_path = xml_element(&pool_xml, "path").ok_or_else(|| {
+            forge_storage::ImagePrepareError::Backend("default pool has no target path".to_owned())
+        })?;
+        let domain_references = self
+            .connection
+            .list_all_domains(0)
+            .map_err(image_backend_error)?
+            .iter()
+            .map(|domain| {
+                Ok((
+                    domain.get_name().map_err(image_backend_error)?,
+                    domain_source_paths(&domain.get_xml_desc(0).map_err(image_backend_error)?),
+                ))
+            })
+            .collect::<Result<Vec<_>, forge_storage::ImagePrepareError>>()?;
+        let volume_backings = pool
+            .list_all_volumes(0)
+            .map_err(image_backend_error)?
+            .iter()
+            .map(|volume| {
+                let path = volume.get_path().map_err(image_backend_error)?;
+                Ok((
+                    path,
+                    backing_store_path(&volume.get_xml_desc(0).map_err(image_backend_error)?),
+                ))
+            })
+            .collect::<Result<Vec<_>, forge_storage::ImagePrepareError>>()?;
+        let overlay = generation_volume_status(
+            &pool,
+            &pool_path,
+            overlay_name,
+            &domain_references,
+            &volume_backings,
+        )
+        .map_err(|error| forge_storage::ImagePrepareError::Backend(error.to_string()))?;
+        let base_path = overlay.backing_path.clone().ok_or_else(|| {
+            forge_storage::ImagePrepareError::Backend("overlay has no backing path".to_owned())
+        })?;
+        let base_name = std::path::Path::new(&base_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                forge_storage::ImagePrepareError::Backend("invalid base path".to_owned())
+            })?;
+        let base = generation_volume_status(
+            &pool,
+            &pool_path,
+            base_name,
+            &domain_references,
+            &volume_backings,
+        )
+        .map_err(|error| forge_storage::ImagePrepareError::Backend(error.to_string()))?;
+        let mut resources = Vec::new();
+        for (role, status) in [
+            (forge_state::ResourceRole::SharedBase, base),
+            (forge_state::ResourceRole::WritableOverlay, overlay),
+        ] {
+            if !status.exists || !status.referenced_by_domains.is_empty() {
+                return Err(forge_storage::ImagePrepareError::Backend(
+                    "preparing storage is missing or already domain-referenced".to_owned(),
+                ));
+            }
+            let volume = StorageVol::lookup_by_path(&self.connection, &status.path)
+                .map_err(image_backend_error)?;
+            resources.push(forge_state::ObservedResource {
+                role,
+                volume_name: status.name,
+                volume_key: volume.get_key().map_err(image_backend_error)?,
+                path: status.path,
+                format: status.format.ok_or_else(|| {
+                    forge_storage::ImagePrepareError::Backend(
+                        "volume format unavailable".to_owned(),
+                    )
+                })?,
+                capacity_bytes: status.capacity_bytes.ok_or_else(|| {
+                    forge_storage::ImagePrepareError::Backend(
+                        "volume capacity unavailable".to_owned(),
+                    )
+                })?,
+                backing_path: status.backing_path,
+                referenced_by_domains: status.referenced_by_domains,
+                backing_for_volumes: status.backing_for_volumes,
+            });
+        }
+        Ok(forge_state::ObservedGeneration {
+            domain_name: instance.to_string(),
+            domain_uuid: domain_uuid.to_owned(),
+            domain_persistent: true,
+            libvirt_uri: self.connection.get_uri().map_err(image_backend_error)?,
+            storage_pool_name: forge_storage::DEFAULT_POOL.to_owned(),
+            storage_pool_uuid: pool.get_uuid_string().map_err(image_backend_error)?,
+            resources,
+            unmanaged_resources: Vec::new(),
+        })
+    }
+
+    /// Returns whether the default libvirt network is active.
+    ///
+    /// # Errors
+    /// Returns a libvirt mapping error when the network cannot be inspected.
+    pub fn default_network_active(&self) -> Result<bool, forge_storage::StorageError> {
+        Network::lookup_by_name(&self.connection, "default")
+            .and_then(|network| network.is_active())
+            .map_err(storage_backend_error)
+    }
 }
 
 impl forge_storage::DefineBackend for LibvirtDefineBackend {
@@ -573,6 +693,25 @@ fn domain_cdrom_path(xml: &str) -> Option<String> {
     xml_attribute(disk, "source", "file")
 }
 
+fn validate_managed_seed_topology(
+    expected_seed: Option<&str>,
+    observed_seed: Option<&str>,
+) -> Result<(), forge_provisioning::ProvisioningError> {
+    match (expected_seed, observed_seed) {
+        (None, None) => Ok(()),
+        (Some(expected), Some(observed)) if expected == observed => Ok(()),
+        (Some(_), None) => Err(forge_provisioning::ProvisioningError::Backend(
+            "NoCloud generation is missing its exact active seed".to_owned(),
+        )),
+        (None, Some(_)) => Err(forge_provisioning::ProvisioningError::Backend(
+            "manual provisioning generation has an unexpected active seed".to_owned(),
+        )),
+        (Some(_), Some(_)) => Err(forge_provisioning::ProvisioningError::Backend(
+            "active seed differs from durable generation identity".to_owned(),
+        )),
+    }
+}
+
 fn domain_source_paths(xml: &str) -> Vec<String> {
     xml.split("<source ")
         .skip(1)
@@ -923,10 +1062,28 @@ impl LibvirtBootBackend {
             forge_state::ResourceRole::WritableOverlay,
             forge_provisioning::REBUILD_OVERLAY_VOLUME,
         );
-        let seed_name = managed_name(
-            forge_state::ResourceRole::NoCloudSeed,
-            forge_provisioning::REBUILD_SEED_VOLUME,
-        );
+        let managed_seed_name = active.and_then(|manifest| {
+            manifest
+                .resources
+                .iter()
+                .find(|resource| resource.role == forge_state::ResourceRole::NoCloudSeed)
+                .map(|resource| resource.volume_name.as_str())
+        });
+        let current_seed = if active.is_some() && managed_seed_name.is_none() {
+            forge_provisioning::GenerationVolumeStatus {
+                name: "none".to_owned(),
+                path: "none".to_owned(),
+                exists: false,
+                capacity_bytes: None,
+                format: None,
+                backing_path: None,
+                referenced_by_domains: Vec::new(),
+                backing_for_volumes: Vec::new(),
+                ownership_marker: None,
+            }
+        } else {
+            volume_status(managed_seed_name.unwrap_or(forge_provisioning::REBUILD_SEED_VOLUME))?
+        };
         Ok(forge_provisioning::FedoraLabLifecycleStatus {
             domain_state,
             domain_uuid: domain
@@ -951,7 +1108,7 @@ impl LibvirtBootBackend {
             ip_addresses,
             base: volume_status(&base_name)?,
             current_overlay: volume_status(&overlay_name)?,
-            current_seed: volume_status(&seed_name)?,
+            current_seed,
             legacy_overlay: volume_status(forge_provisioning::OVERLAY_VOLUME)?,
             legacy_seed: volume_status(forge_provisioning::SEED_VOLUME)?,
         })
@@ -996,7 +1153,22 @@ impl LibvirtBootBackend {
         overlay_path: &str,
         seed_path: &str,
     ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
-        self.inspect_generation_paths_in_pool(forge_storage::DEFAULT_POOL, overlay_path, seed_path)
+        self.inspect_generation_paths_in_pool(
+            forge_storage::DEFAULT_POOL,
+            overlay_path,
+            Some(seed_path),
+        )
+    }
+
+    /// Reads exact identities for a generation whose profile has no seed resource.
+    ///
+    /// # Errors
+    /// Returns a typed discovery/mapping error when any exact identity is unavailable.
+    pub fn inspect_generation_overlay_only(
+        &self,
+        overlay_path: &str,
+    ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
+        self.inspect_generation_paths_in_pool(forge_storage::DEFAULT_POOL, overlay_path, None)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1004,7 +1176,7 @@ impl LibvirtBootBackend {
         &self,
         pool_name: &str,
         overlay_path: &str,
-        seed_path: &str,
+        seed_path: Option<&str>,
     ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
         let domain = self.domain()?;
         let domain_uuid = domain
@@ -1077,10 +1249,12 @@ impl LibvirtBootBackend {
             &domain_references,
             &volume_backings,
         )?;
-        let statuses = [
+        let mut statuses = vec![
             (forge_state::ResourceRole::SharedBase, base_status),
             (forge_state::ResourceRole::WritableOverlay, overlay_status),
-            (
+        ];
+        if let Some(seed_path) = seed_path {
+            statuses.push((
                 forge_state::ResourceRole::NoCloudSeed,
                 generation_volume_status(
                     &pool,
@@ -1089,8 +1263,8 @@ impl LibvirtBootBackend {
                     &domain_references,
                     &volume_backings,
                 )?,
-            ),
-        ];
+            ));
+        }
         let mut resources = Vec::new();
         for (role, status) in statuses {
             if !status.exists {
@@ -1161,10 +1335,20 @@ impl LibvirtBootBackend {
                     ))
                 })
         };
+        let seed = active
+            .resources
+            .iter()
+            .find(|resource| resource.role == forge_state::ResourceRole::NoCloudSeed)
+            .map(|resource| resource.path.as_str());
+        let domain_xml = self
+            .domain()?
+            .get_xml_desc(0)
+            .map_err(provisioning_backend_error)?;
+        validate_managed_seed_topology(seed, domain_cdrom_path(&domain_xml).as_deref())?;
         self.inspect_generation_paths_in_pool(
             &active.storage_pool_name,
             resource_path(forge_state::ResourceRole::WritableOverlay)?,
-            resource_path(forge_state::ResourceRole::NoCloudSeed)?,
+            seed,
         )
     }
 
@@ -1966,6 +2150,20 @@ mod tests {
             Some("/pool/forge-base-fedora-44.qcow2")
         );
         assert!(!domain_xml.contains("backingStore"));
+    }
+
+    #[test]
+    fn managed_seed_topology_accepts_policy_exact_presence_or_absence() {
+        assert!(validate_managed_seed_topology(None, None).is_ok());
+        assert!(
+            validate_managed_seed_topology(Some("/pool/seed.iso"), Some("/pool/seed.iso")).is_ok()
+        );
+        assert!(validate_managed_seed_topology(Some("/pool/seed.iso"), None).is_err());
+        assert!(validate_managed_seed_topology(None, Some("/pool/seed.iso")).is_err());
+        assert!(
+            validate_managed_seed_topology(Some("/pool/expected.iso"), Some("/pool/other.iso"))
+                .is_err()
+        );
     }
 
     #[test]
