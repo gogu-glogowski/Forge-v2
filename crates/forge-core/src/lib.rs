@@ -223,6 +223,7 @@ pub enum GuestProfileKind {
 pub enum InstanceKind {
     Lab,
     Development,
+    NetworkProvider,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +231,7 @@ pub enum GuestFamily {
     Fedora,
     Debian,
     Kali,
+    Whonix,
     Other,
 }
 
@@ -242,6 +244,7 @@ impl fmt::Display for GuestFamily {
                 Self::Fedora => "fedora",
                 Self::Debian => "debian",
                 Self::Kali => "kali",
+                Self::Whonix => "whonix",
                 Self::Other => "other",
             }
         )
@@ -263,6 +266,7 @@ pub enum FirmwareMachinePolicy {
 pub enum ImageSourcePolicy {
     FedoraCloudBase { release: String },
     KaliQemuArchive { release: String },
+    WhonixLibvirtBundle { release: String },
     VerifiedQcow2 { source_id: String },
 }
 
@@ -270,6 +274,7 @@ pub enum ImageSourcePolicy {
 pub enum ImageVerificationPolicy {
     SignedSha256Checksums,
     KaliDetachedSignedSha256Sums,
+    WhonixDetachedOpenPgp,
     Sha256Digest,
 }
 

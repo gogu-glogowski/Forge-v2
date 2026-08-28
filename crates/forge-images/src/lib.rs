@@ -26,6 +26,249 @@ pub const KALI_SUMS_URL: &str = "https://cdimage.kali.org/current/SHA256SUMS";
 pub const KALI_SUMS_SIGNATURE_URL: &str = "https://cdimage.kali.org/current/SHA256SUMS.gpg";
 pub const KALI_KEY_URL: &str = "https://archive.kali.org/archive-key.asc";
 pub const KALI_SIGNING_KEY_FINGERPRINT: &str = "827C8569F2518CC677FECA1AED65462EC8D5E4C5";
+pub const WHONIX_RELEASE: &str = "18.2.1.9";
+pub const WHONIX_ARCHIVE_FILENAME: &str = "Whonix-LXQt-18.2.1.9.Intel_AMD64.qcow2.libvirt.xz";
+pub const WHONIX_SOURCE_URL: &str = "https://www.whonix.org/download/libvirt/18.2.1.9/Whonix-LXQt-18.2.1.9.Intel_AMD64.qcow2.libvirt.xz";
+pub const WHONIX_SIGNATURE_URL: &str = "https://www.whonix.org/download/libvirt/18.2.1.9/Whonix-LXQt-18.2.1.9.Intel_AMD64.qcow2.libvirt.xz.asc";
+pub const WHONIX_SHA512SUMS_URL: &str = "https://www.whonix.org/download/libvirt/18.2.1.9/Whonix-LXQt-18.2.1.9.Intel_AMD64.qcow2.libvirt.xz.sha512sums";
+pub const WHONIX_SHA512SUMS_SIGNIFY_URL: &str = "https://www.whonix.org/download/libvirt/18.2.1.9/Whonix-LXQt-18.2.1.9.Intel_AMD64.qcow2.libvirt.xz.sha512sums.sig";
+pub const WHONIX_SIGNING_KEY_URL: &str = "https://www.whonix.org/keys/derivative.asc";
+pub const WHONIX_SIGNING_KEY_FINGERPRINT: &str = "916B8D99C38EAF5E8ADC7A2A8D66066A2EEACCDA";
+pub const WHONIX_SIGNATURE_NOTATION: &str =
+    "file@name=Whonix-LXQt-18.2.1.9.Intel_AMD64.qcow2.libvirt.xz";
+pub const WHONIX_RELEASE_SIGNATURE_NOT_BEFORE: u64 = 1_784_073_600;
+pub const WHONIX_GATEWAY_DISK_FILENAME: &str = "Whonix-Gateway-LXQt-18.2.1.9.Intel_AMD64.qcow2";
+pub const WHONIX_GATEWAY_XML_FILENAME: &str = "Whonix-Gateway.xml";
+pub const WHONIX_WORKSTATION_DISK_FILENAME: &str =
+    "Whonix-Workstation-LXQt-18.2.1.9.Intel_AMD64.qcow2";
+pub const WHONIX_WORKSTATION_XML_FILENAME: &str = "Whonix-Workstation.xml";
+pub const WHONIX_LICENSE_FILENAME: &str = "WHONIX_BINARY_LICENSE_AGREEMENT";
+pub const WHONIX_DISCLAIMER_FILENAME: &str = "WHONIX_DISCLAIMER";
+const WHONIX_TAR_EXTRACTION_OPTIONS: &[&str] = &[
+    "--extract",
+    "--xz",
+    "--no-same-owner",
+    "--no-same-permissions",
+    "--no-xattrs",
+    "--no-acls",
+    "--no-selinux",
+    "--touch",
+    "--keep-old-files",
+    "--no-wildcards",
+    "--no-unquote",
+    "--file",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum BundleArtifactRole {
+    GatewayDisk,
+    GatewayXml,
+    WorkstationDisk,
+    WorkstationXml,
+    License,
+    Disclaimer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveEntryKind {
+    RegularFile,
+    Directory,
+    SymbolicLink,
+    HardLink,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveEntry {
+    pub path: String,
+    pub kind: ArchiveEntryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedBundleEntry {
+    pub role: BundleArtifactRole,
+    pub path: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WhonixBundleProvenance {
+    pub release: String,
+    pub archive_filename: String,
+    pub source_url: String,
+    pub signer_fingerprint: String,
+    pub signature_notation: String,
+    pub signature_unix_seconds: u64,
+    pub archive_sha256: String,
+    pub artifact_sha256: Vec<(BundleArtifactRole, String)>,
+    pub bundle_identity_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhonixSignatureEvidence {
+    pub signature_valid: bool,
+    pub primary_signer_fingerprint: String,
+    pub notation: String,
+    pub signature_unix_seconds: u64,
+}
+
+#[must_use]
+pub fn whonix_bundle_layout() -> Vec<ExpectedBundleEntry> {
+    vec![
+        ExpectedBundleEntry {
+            role: BundleArtifactRole::GatewayDisk,
+            path: WHONIX_GATEWAY_DISK_FILENAME,
+        },
+        ExpectedBundleEntry {
+            role: BundleArtifactRole::GatewayXml,
+            path: WHONIX_GATEWAY_XML_FILENAME,
+        },
+        ExpectedBundleEntry {
+            role: BundleArtifactRole::WorkstationDisk,
+            path: WHONIX_WORKSTATION_DISK_FILENAME,
+        },
+        ExpectedBundleEntry {
+            role: BundleArtifactRole::WorkstationXml,
+            path: WHONIX_WORKSTATION_XML_FILENAME,
+        },
+        ExpectedBundleEntry {
+            role: BundleArtifactRole::License,
+            path: WHONIX_LICENSE_FILENAME,
+        },
+        ExpectedBundleEntry {
+            role: BundleArtifactRole::Disclaimer,
+            path: WHONIX_DISCLAIMER_FILENAME,
+        },
+    ]
+}
+
+/// Validates the complete flat allowlist emitted by the official Whonix
+/// release builder. No path or file type is inferred from a basename pattern.
+///
+/// # Errors
+/// Refuses missing, duplicate, additional, nested, absolute, traversal, link,
+/// directory, or other non-regular entries.
+pub fn validate_whonix_bundle_entries(
+    entries: &[ArchiveEntry],
+) -> Result<Vec<(BundleArtifactRole, String)>, ImageError> {
+    let expected = whonix_bundle_layout();
+    if entries.len() != expected.len() {
+        return Err(ImageError::UnsupportedImage(
+            "Whonix bundle entry count differs from the official layout".to_owned(),
+        ));
+    }
+    let mut identified = Vec::with_capacity(expected.len());
+    for entry in entries {
+        if entry.kind != ArchiveEntryKind::RegularFile
+            || unsafe_archive_path(&entry.path)
+            || entry.path.contains(['/', '\\'])
+        {
+            return Err(ImageError::UnsupportedImage(format!(
+                "unsafe Whonix bundle entry: {}",
+                entry.path
+            )));
+        }
+        let Some(contract) = expected.iter().find(|item| item.path == entry.path) else {
+            return Err(ImageError::UnsupportedImage(format!(
+                "unexpected Whonix bundle entry: {}",
+                entry.path
+            )));
+        };
+        if identified
+            .iter()
+            .any(|(role, _): &(BundleArtifactRole, String)| *role == contract.role)
+        {
+            return Err(ImageError::UnsupportedImage(format!(
+                "duplicate Whonix bundle role: {:?}",
+                contract.role
+            )));
+        }
+        identified.push((contract.role, entry.path.clone()));
+    }
+    identified.sort_by_key(|(role, _)| *role);
+    Ok(identified)
+}
+
+/// Validates detached-signature evidence according to current upstream
+/// requirements, including pinned primary signer, exact filename notation,
+/// release floor, future-time refusal and rollback prevention.
+///
+/// # Errors
+/// Returns fail-closed verification errors for incomplete or mismatching evidence.
+pub fn validate_whonix_signature_evidence(
+    evidence: &WhonixSignatureEvidence,
+    now_unix_seconds: u64,
+    previous_verified_signature_time: Option<u64>,
+) -> Result<(), ImageError> {
+    const MAX_FUTURE_SKEW_SECONDS: u64 = 24 * 60 * 60;
+    if !evidence.signature_valid
+        || evidence.primary_signer_fingerprint != WHONIX_SIGNING_KEY_FINGERPRINT
+        || evidence.notation != WHONIX_SIGNATURE_NOTATION
+        || evidence.signature_unix_seconds < WHONIX_RELEASE_SIGNATURE_NOT_BEFORE
+        || evidence.signature_unix_seconds
+            > now_unix_seconds.saturating_add(MAX_FUTURE_SKEW_SECONDS)
+        || previous_verified_signature_time
+            .is_some_and(|previous| evidence.signature_unix_seconds < previous)
+    {
+        return Err(ImageError::SignatureVerification(
+            "Whonix signer, notation, or signature time could not be proven".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Constructs immutable same-bundle provenance only after every expected role
+/// has an exact SHA-256 digest.
+///
+/// # Errors
+/// Refuses incomplete or malformed digest evidence.
+pub fn whonix_bundle_provenance(
+    signature: &WhonixSignatureEvidence,
+    now_unix_seconds: u64,
+    archive_sha256: String,
+    mut artifact_sha256: Vec<(BundleArtifactRole, String)>,
+) -> Result<WhonixBundleProvenance, ImageError> {
+    validate_whonix_signature_evidence(signature, now_unix_seconds, None)?;
+    let expected_roles = whonix_bundle_layout()
+        .into_iter()
+        .map(|entry| entry.role)
+        .collect::<Vec<_>>();
+    artifact_sha256.sort_by_key(|(role, _)| *role);
+    let roles = artifact_sha256
+        .iter()
+        .map(|(role, _)| *role)
+        .collect::<Vec<_>>();
+    if !valid_sha256(&archive_sha256)
+        || roles != expected_roles
+        || artifact_sha256
+            .iter()
+            .any(|(_, checksum)| !valid_sha256(checksum))
+    {
+        return Err(ImageError::IncompleteVerificationData);
+    }
+    let mut identity = Sha256::new();
+    identity.update(WHONIX_RELEASE.as_bytes());
+    identity.update(archive_sha256.as_bytes());
+    for (role, checksum) in &artifact_sha256 {
+        identity.update(format!("{role:?}").as_bytes());
+        identity.update(checksum.as_bytes());
+    }
+    let bundle_identity_sha256 = format!("{:x}", identity.finalize());
+    Ok(WhonixBundleProvenance {
+        release: WHONIX_RELEASE.to_owned(),
+        archive_filename: WHONIX_ARCHIVE_FILENAME.to_owned(),
+        source_url: WHONIX_SOURCE_URL.to_owned(),
+        signer_fingerprint: signature.primary_signer_fingerprint.clone(),
+        signature_notation: signature.notation.clone(),
+        signature_unix_seconds: signature.signature_unix_seconds,
+        archive_sha256,
+        artifact_sha256,
+        bundle_identity_sha256,
+    })
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImageStatus {
@@ -68,6 +311,33 @@ pub struct KaliImageMetadata {
     pub signing_key_fingerprint: String,
     pub verified_at_unix_seconds: Option<u64>,
     pub status: ImageStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WhonixGatewayImageMetadata {
+    pub prepared_qcow2_path: PathBuf,
+    pub prepared_qcow2_checksum: String,
+    pub prepared_logical_bytes: u64,
+    pub prepared_allocated_bytes: u64,
+    pub prepared_virtual_bytes: u64,
+    pub provenance: WhonixBundleProvenance,
+    pub status: ImageStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WhonixPreparationState {
+    Missing,
+    Preparing,
+    Verified(Box<WhonixGatewayImageMetadata>),
+    OrphanedPreparedImage,
+    Conflict(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WhonixPreparationIntent {
+    status: String,
+    archive_path: PathBuf,
+    prepared_qcow2_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +468,35 @@ pub trait ArtifactFetcher {
     ) -> Result<(), ImageError> {
         Err(ImageError::UnsupportedImage(
             "qcow2 archive extraction is unsupported".to_owned(),
+        ))
+    }
+
+    /// Verifies the Whonix archive signature and returns its authenticated status evidence.
+    ///
+    /// # Errors
+    /// Returns an error unless signer, notation, and signature time can be inspected.
+    fn verify_whonix_signature(
+        &mut self,
+        _archive: &Path,
+        _signature: &Path,
+        _key: &Path,
+    ) -> Result<WhonixSignatureEvidence, ImageError> {
+        Err(ImageError::UnsupportedImage(
+            "Whonix signature verification is unsupported".to_owned(),
+        ))
+    }
+
+    /// Lists and extracts a Whonix bundle into the caller-owned empty directory.
+    ///
+    /// # Errors
+    /// Returns an error for an unsafe layout or failed controlled extraction.
+    fn extract_whonix_bundle(
+        &mut self,
+        _archive: &Path,
+        _destination: &Path,
+    ) -> Result<Vec<ArchiveEntry>, ImageError> {
+        Err(ImageError::UnsupportedImage(
+            "Whonix bundle extraction is unsupported".to_owned(),
         ))
     }
 }
@@ -403,6 +702,204 @@ impl ArtifactFetcher for SystemArtifactFetcher {
         }
         validate_extracted_file(&canonical_root, destination)
     }
+
+    fn verify_whonix_signature(
+        &mut self,
+        archive: &Path,
+        signature: &Path,
+        key: &Path,
+    ) -> Result<WhonixSignatureEvidence, ImageError> {
+        let keyring = key.with_extension("gpg");
+        let import = Command::new("gpg")
+            .args(["--batch", "--yes", "--dearmor", "--output"])
+            .arg(&keyring)
+            .arg(key)
+            .output()?;
+        if !import.status.success() {
+            return Err(ImageError::SignatureVerification(
+                String::from_utf8_lossy(&import.stderr).trim().to_owned(),
+            ));
+        }
+        let verify = Command::new("gpgv")
+            .args(["--status-fd", "1", "--keyring"])
+            .arg(&keyring)
+            .arg(signature)
+            .arg(archive)
+            .output()?;
+        if !verify.status.success() {
+            return Err(ImageError::SignatureVerification(
+                String::from_utf8_lossy(&verify.stderr).trim().to_owned(),
+            ));
+        }
+        parse_whonix_gpg_status(&String::from_utf8_lossy(&verify.stdout))
+    }
+
+    fn extract_whonix_bundle(
+        &mut self,
+        archive: &Path,
+        destination: &Path,
+    ) -> Result<Vec<ArchiveEntry>, ImageError> {
+        let root = fs::symlink_metadata(destination)?;
+        if !root.file_type().is_dir() || fs::read_dir(destination)?.next().is_some() {
+            return Err(ImageError::UnsupportedImage(
+                "Whonix extraction root is not an empty controlled directory".to_owned(),
+            ));
+        }
+        let listing = Command::new("tar")
+            .args([
+                "--list",
+                "--verbose",
+                "--quoting-style=escape",
+                "--numeric-owner",
+                "--full-time",
+                "--xz",
+                "--file",
+            ])
+            .arg(archive)
+            .output()?;
+        if !listing.status.success() {
+            return Err(ImageError::Download(
+                String::from_utf8_lossy(&listing.stderr).trim().to_owned(),
+            ));
+        }
+        let entries = parse_tar_verbose_listing(&String::from_utf8_lossy(&listing.stdout))?;
+        validate_whonix_bundle_entries(&entries)?;
+        let extraction = Command::new("tar")
+            .args(WHONIX_TAR_EXTRACTION_OPTIONS)
+            .arg(archive)
+            .arg("--directory")
+            .arg(destination)
+            .arg("--")
+            .args(whonix_bundle_layout().into_iter().map(|entry| entry.path))
+            .output()?;
+        if !extraction.status.success() {
+            return Err(ImageError::Download(
+                String::from_utf8_lossy(&extraction.stderr)
+                    .trim()
+                    .to_owned(),
+            ));
+        }
+        let canonical_root = fs::canonicalize(destination)?;
+        let actual_entries = fs::read_dir(destination)?
+            .map(|entry| {
+                let entry = entry?;
+                let path = entry.file_name().into_string().map_err(|_| {
+                    ImageError::UnsupportedImage(
+                        "Whonix extracted member name is not UTF-8".to_owned(),
+                    )
+                })?;
+                let file_type = entry.file_type()?;
+                let kind = if file_type.is_file() {
+                    ArchiveEntryKind::RegularFile
+                } else if file_type.is_dir() {
+                    ArchiveEntryKind::Directory
+                } else if file_type.is_symlink() {
+                    ArchiveEntryKind::SymbolicLink
+                } else {
+                    ArchiveEntryKind::Other
+                };
+                Ok(ArchiveEntry { path, kind })
+            })
+            .collect::<Result<Vec<_>, ImageError>>()?;
+        validate_whonix_bundle_entries(&actual_entries)?;
+        for entry in whonix_bundle_layout() {
+            let path = destination.join(entry.path);
+            validate_extracted_file(&canonical_root, &path)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            validate_extracted_file(&canonical_root, &path)?;
+        }
+        Ok(entries)
+    }
+}
+
+fn parse_whonix_gpg_status(status: &str) -> Result<WhonixSignatureEvidence, ImageError> {
+    let mut valid = None;
+    let mut notation_name = None;
+    let mut notation_data = None;
+    for line in status.lines() {
+        let Some(value) = line.strip_prefix("[GNUPG:] ") else {
+            continue;
+        };
+        let fields = value.split_whitespace().collect::<Vec<_>>();
+        match fields.first().copied() {
+            Some("VALIDSIG") if fields.len() >= 4 => {
+                let primary = fields.last().copied().unwrap_or(fields[1]);
+                let timestamp = fields[3].parse::<u64>().map_err(|_| {
+                    ImageError::SignatureVerification(
+                        "Whonix signature timestamp is malformed".to_owned(),
+                    )
+                })?;
+                valid = Some((primary.to_owned(), timestamp));
+            }
+            Some("NOTATION_NAME") => notation_name = fields.get(1).map(|value| (*value).to_owned()),
+            Some("NOTATION_DATA") => {
+                notation_data = value.strip_prefix("NOTATION_DATA ").map(str::to_owned);
+            }
+            _ => {}
+        }
+    }
+    let (primary_signer_fingerprint, signature_unix_seconds) = valid.ok_or_else(|| {
+        ImageError::SignatureVerification("Whonix VALIDSIG evidence is missing".to_owned())
+    })?;
+    let notation = match (notation_name, notation_data) {
+        (Some(name), Some(data)) => format!("{name}={data}"),
+        _ => {
+            return Err(ImageError::SignatureVerification(
+                "Whonix signature notation is missing".to_owned(),
+            ));
+        }
+    };
+    Ok(WhonixSignatureEvidence {
+        signature_valid: true,
+        primary_signer_fingerprint,
+        notation,
+        signature_unix_seconds,
+    })
+}
+
+fn parse_tar_verbose_listing(listing: &str) -> Result<Vec<ArchiveEntry>, ImageError> {
+    listing
+        .lines()
+        .map(|line| {
+            let kind = match line.as_bytes().first().copied() {
+                Some(b'-') => ArchiveEntryKind::RegularFile,
+                Some(b'd') => ArchiveEntryKind::Directory,
+                Some(b'l') => ArchiveEntryKind::SymbolicLink,
+                Some(b'h') => ArchiveEntryKind::HardLink,
+                _ => ArchiveEntryKind::Other,
+            };
+            let path = remainder_after_fields(line, 5).ok_or_else(|| {
+                ImageError::UnsupportedImage("malformed tar listing entry".to_owned())
+            })?;
+            Ok(ArchiveEntry {
+                path: path.to_owned(),
+                kind,
+            })
+        })
+        .collect()
+}
+
+fn remainder_after_fields(line: &str, fields: usize) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    for _ in 0..fields {
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if index == bytes.len() {
+            return None;
+        }
+        while bytes
+            .get(index)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            index += 1;
+        }
+    }
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    (index < bytes.len()).then(|| &line[index..])
 }
 
 #[must_use]
@@ -650,6 +1147,240 @@ pub fn fetch_kali<F: ArtifactFetcher>(
     Ok(metadata)
 }
 
+/// Acquires and prepares the Gateway disk from the authenticated Whonix bundle.
+///
+/// Every bundle role is validated and hashed before only the typed Gateway disk
+/// is published. The Workstation digest remains part of immutable provenance.
+///
+/// # Errors
+/// Refuses incomplete signature evidence, unsafe bundle layouts, interrupted
+/// preparation, existing untrusted outputs, and post-extraction source drift.
+pub fn fetch_whonix_gateway<F: ArtifactFetcher>(
+    directories: &ImageDirectories,
+    fetcher: &mut F,
+) -> Result<WhonixGatewayImageMetadata, ImageError> {
+    fs::create_dir_all(&directories.images)?;
+    fs::create_dir_all(&directories.downloads)?;
+    match inspect_whonix_preparation(directories)? {
+        WhonixPreparationState::Missing => {}
+        WhonixPreparationState::Verified(_) => return verified_whonix_gateway(directories),
+        state => {
+            return Err(ImageError::Metadata(format!(
+                "Whonix image preparation requires explicit recovery: {state:?}"
+            )));
+        }
+    }
+    let archive = directories.downloads.join(WHONIX_ARCHIVE_FILENAME);
+    let signature = directories
+        .downloads
+        .join(format!("{WHONIX_ARCHIVE_FILENAME}.asc"));
+    let key = directories.downloads.join("whonix-derivative.asc");
+    let prepared = directories.images.join(WHONIX_GATEWAY_DISK_FILENAME);
+    fetcher.download(WHONIX_SOURCE_URL, &archive)?;
+    fetcher.download(WHONIX_SIGNATURE_URL, &signature)?;
+    fetcher.download(WHONIX_SIGNING_KEY_URL, &key)?;
+    let signature_evidence = fetcher.verify_whonix_signature(&archive, &signature, &key)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| ImageError::Metadata(error.to_string()))?
+        .as_secs();
+    validate_whonix_signature_evidence(&signature_evidence, now, None)?;
+    if !is_single_regular_file(&archive) {
+        return Err(ImageError::UnsupportedImage(
+            "verified Whonix archive is not one regular file".to_owned(),
+        ));
+    }
+    let archive_sha256 = sha256_file(&archive)?;
+    write_json_atomic(
+        &directories.images,
+        "whonix.intent.json.tmp",
+        "whonix.intent.json",
+        &WhonixPreparationIntent {
+            status: "Preparing".to_owned(),
+            archive_path: archive.clone(),
+            prepared_qcow2_path: prepared.clone(),
+        },
+    )?;
+    let (prepared_qcow2_checksum, provenance) = prepare_whonix_bundle(
+        directories,
+        fetcher,
+        &archive,
+        &prepared,
+        &signature_evidence,
+        now,
+        &archive_sha256,
+    )?;
+    let prepared_file_metadata = fs::metadata(&prepared)?;
+    let prepared_virtual_bytes = qcow2_virtual_size(&prepared)?;
+    let metadata = WhonixGatewayImageMetadata {
+        prepared_qcow2_path: prepared,
+        prepared_qcow2_checksum,
+        prepared_logical_bytes: prepared_file_metadata.len(),
+        prepared_allocated_bytes: prepared_file_metadata.blocks().saturating_mul(512),
+        prepared_virtual_bytes,
+        provenance,
+        status: ImageStatus::Verified,
+    };
+    write_json_atomic(
+        &directories.images,
+        "whonix.metadata.json.tmp",
+        "whonix.metadata.json",
+        &metadata,
+    )?;
+    clear_whonix_intent(directories)?;
+    Ok(metadata)
+}
+
+fn prepare_whonix_bundle<F: ArtifactFetcher>(
+    directories: &ImageDirectories,
+    fetcher: &mut F,
+    archive: &Path,
+    prepared: &Path,
+    signature: &WhonixSignatureEvidence,
+    now: u64,
+    archive_sha256: &str,
+) -> Result<(String, WhonixBundleProvenance), ImageError> {
+    let extraction_root = create_extraction_root_for(&directories.downloads, ".whonix-extract-")?;
+    let extraction = (|| {
+        let entries = fetcher.extract_whonix_bundle(archive, &extraction_root)?;
+        let identified = validate_whonix_bundle_entries(&entries)?;
+        let canonical_root = fs::canonicalize(&extraction_root)?;
+        let mut hashes = Vec::with_capacity(identified.len());
+        for (role, path) in identified {
+            let extracted = extraction_root.join(path);
+            validate_extracted_file(&canonical_root, &extracted)?;
+            hashes.push((role, sha256_file(&extracted)?));
+        }
+        let archive_after_extraction = sha256_file(archive)?;
+        if archive_after_extraction != archive_sha256 {
+            return Err(ImageError::ChecksumMismatch {
+                expected: archive_sha256.to_owned(),
+                actual: archive_after_extraction,
+            });
+        }
+        let provenance =
+            whonix_bundle_provenance(signature, now, archive_sha256.to_owned(), hashes)?;
+        let gateway_checksum = provenance
+            .artifact_sha256
+            .iter()
+            .find_map(|(role, hash)| {
+                (*role == BundleArtifactRole::GatewayDisk).then(|| hash.clone())
+            })
+            .ok_or(ImageError::IncompleteVerificationData)?;
+        promote_without_overwrite(
+            &extraction_root.join(WHONIX_GATEWAY_DISK_FILENAME),
+            prepared,
+            &gateway_checksum,
+        )?;
+        Ok((gateway_checksum, provenance))
+    })();
+    let cleanup =
+        cleanup_extraction_root_for(&directories.downloads, &extraction_root, ".whonix-extract-");
+    match (extraction, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => {
+            clear_whonix_intent(directories)?;
+            Err(error)
+        }
+        (Err(error), Err(_)) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+/// Returns the Gateway base only when metadata and every exact identity still match.
+///
+/// # Errors
+/// Returns an error when no fully verified prepared Gateway base is available.
+pub fn verified_whonix_gateway(
+    directories: &ImageDirectories,
+) -> Result<WhonixGatewayImageMetadata, ImageError> {
+    match inspect_whonix_preparation(directories)? {
+        WhonixPreparationState::Verified(metadata) => Ok(*metadata),
+        _ => Err(ImageError::SourceNotVerified),
+    }
+}
+
+/// Classifies Whonix prepared-image state without trusting a file by name.
+///
+/// # Errors
+/// Returns an error when filesystem or metadata evidence cannot be read.
+pub fn inspect_whonix_preparation(
+    directories: &ImageDirectories,
+) -> Result<WhonixPreparationState, ImageError> {
+    let metadata_path = directories.images.join("whonix.metadata.json");
+    let metadata_temp = directories.images.join("whonix.metadata.json.tmp");
+    let intent = directories.images.join("whonix.intent.json");
+    let prepared = directories.images.join(WHONIX_GATEWAY_DISK_FILENAME);
+    if intent.exists() || metadata_temp.exists() {
+        return Ok(WhonixPreparationState::Preparing);
+    }
+    if !metadata_path.exists() {
+        return Ok(if prepared.exists() {
+            WhonixPreparationState::OrphanedPreparedImage
+        } else {
+            WhonixPreparationState::Missing
+        });
+    }
+    if !prepared.exists() {
+        return Ok(WhonixPreparationState::Preparing);
+    }
+    let metadata: WhonixGatewayImageMetadata =
+        match serde_json::from_slice(&fs::read(&metadata_path)?) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Ok(WhonixPreparationState::Conflict(format!(
+                    "Whonix metadata cannot be parsed: {error}"
+                )));
+            }
+        };
+    let archive = directories.downloads.join(WHONIX_ARCHIVE_FILENAME);
+    let rebuilt_provenance = whonix_bundle_provenance(
+        &WhonixSignatureEvidence {
+            signature_valid: true,
+            primary_signer_fingerprint: metadata.provenance.signer_fingerprint.clone(),
+            notation: metadata.provenance.signature_notation.clone(),
+            signature_unix_seconds: metadata.provenance.signature_unix_seconds,
+        },
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| ImageError::Metadata(error.to_string()))?
+            .as_secs(),
+        metadata.provenance.archive_sha256.clone(),
+        metadata.provenance.artifact_sha256.clone(),
+    )
+    .ok();
+    let prepared_metadata = fs::metadata(&prepared).ok();
+    if metadata.status != ImageStatus::Verified
+        || metadata.prepared_qcow2_path != prepared
+        || !is_single_regular_file(&prepared)
+        || !is_single_regular_file(&archive)
+        || sha256_file(&prepared)? != metadata.prepared_qcow2_checksum
+        || prepared_metadata.as_ref().map(fs::Metadata::len)
+            != Some(metadata.prepared_logical_bytes)
+        || qcow2_virtual_size(&prepared)? != metadata.prepared_virtual_bytes
+        || sha256_file(&archive)? != metadata.provenance.archive_sha256
+        || rebuilt_provenance.as_ref() != Some(&metadata.provenance)
+        || metadata.provenance.release != WHONIX_RELEASE
+        || metadata.provenance.archive_filename != WHONIX_ARCHIVE_FILENAME
+        || metadata.provenance.source_url != WHONIX_SOURCE_URL
+        || metadata.provenance.signer_fingerprint != WHONIX_SIGNING_KEY_FINGERPRINT
+        || metadata.provenance.signature_notation != WHONIX_SIGNATURE_NOTATION
+    {
+        return Ok(WhonixPreparationState::Conflict(
+            "prepared Gateway base differs from authenticated provenance".to_owned(),
+        ));
+    }
+    Ok(WhonixPreparationState::Verified(Box::new(metadata)))
+}
+
+fn clear_whonix_intent(directories: &ImageDirectories) -> Result<(), ImageError> {
+    let path = directories.images.join("whonix.intent.json");
+    if path.exists() {
+        fs::remove_file(path)?;
+        sync_directory(&directories.images)?;
+    }
+    Ok(())
+}
+
 /// Classifies on-disk Kali preparation without trusting an orphan by name.
 ///
 /// # Errors
@@ -770,11 +1501,15 @@ pub fn verified_kali(directories: &ImageDirectories) -> Result<KaliImageMetadata
 }
 
 fn create_extraction_root(downloads: &Path) -> Result<PathBuf, ImageError> {
+    create_extraction_root_for(downloads, ".kali-extract-")
+}
+
+fn create_extraction_root_for(downloads: &Path, prefix: &str) -> Result<PathBuf, ImageError> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| ImageError::Metadata(error.to_string()))?
         .as_nanos();
-    let root = downloads.join(format!(".kali-extract-{}-{nonce}", std::process::id()));
+    let root = downloads.join(format!("{prefix}{}-{nonce}", std::process::id()));
     fs::create_dir(&root)?;
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
     sync_directory(&root)?;
@@ -804,10 +1539,18 @@ fn kali_extraction_roots(downloads: &Path) -> Result<Vec<PathBuf>, ImageError> {
 }
 
 fn cleanup_extraction_root(downloads: &Path, root: &Path) -> Result<(), ImageError> {
+    cleanup_extraction_root_for(downloads, root, ".kali-extract-")
+}
+
+fn cleanup_extraction_root_for(
+    downloads: &Path,
+    root: &Path,
+    prefix: &str,
+) -> Result<(), ImageError> {
     let controlled_name = root
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with(".kali-extract-"));
+        .is_some_and(|name| name.starts_with(prefix));
     if root.parent() != Some(downloads) || !controlled_name {
         return Err(ImageError::Metadata(
             "refusing to clean an uncontrolled extraction path".to_owned(),
@@ -829,7 +1572,7 @@ fn validate_extracted_file(canonical_root: &Path, destination: &Path) -> Result<
         || !canonical_destination.starts_with(canonical_root)
     {
         return Err(ImageError::UnsupportedImage(
-            "extracted Kali qcow2 is not one regular file inside the controlled root".to_owned(),
+            "extracted artifact is not one regular file inside the controlled root".to_owned(),
         ));
     }
     Ok(())
@@ -847,7 +1590,7 @@ fn promote_without_overwrite(
 ) -> Result<(), ImageError> {
     let source_metadata = fs::symlink_metadata(source)?;
     let destination_parent = destination.parent().ok_or_else(|| {
-        ImageError::Metadata("prepared Kali destination has no parent".to_owned())
+        ImageError::Metadata("prepared image destination has no parent".to_owned())
     })?;
     let destination_parent_metadata = fs::symlink_metadata(destination_parent)?;
     if !source_metadata.file_type().is_file()
@@ -875,11 +1618,11 @@ fn promote_without_overwrite(
     }
     let source_parent = source
         .parent()
-        .ok_or_else(|| ImageError::Metadata("extracted Kali source has no parent".to_owned()))?;
+        .ok_or_else(|| ImageError::Metadata("extracted image source has no parent".to_owned()))?;
     sync_directory(source_parent)?;
     if !is_single_regular_file(destination) {
         return Err(ImageError::UnsupportedImage(
-            "promoted Kali qcow2 is not one regular file".to_owned(),
+            "promoted prepared image is not one regular file".to_owned(),
         ));
     }
     let actual = sha256_file(destination)?;
@@ -1120,7 +1863,7 @@ mod tests {
     impl ArtifactFetcher for FixtureFetcher {
         fn download(&mut self, url: &str, destination: &Path) -> Result<(), ImageError> {
             self.downloads += 1;
-            if matches!(url, FEDORA_SOURCE_URL | KALI_SOURCE_URL) {
+            if matches!(url, FEDORA_SOURCE_URL | KALI_SOURCE_URL | WHONIX_SOURCE_URL) {
                 fs::write(destination, &self.image)?;
             } else if url == KALI_SUMS_URL {
                 let checksum = self
@@ -1186,6 +1929,43 @@ mod tests {
             }
             fs::write(verified_output, &self.verified_checksum)?;
             Ok(())
+        }
+
+        fn verify_whonix_signature(
+            &mut self,
+            _: &Path,
+            _: &Path,
+            _: &Path,
+        ) -> Result<WhonixSignatureEvidence, ImageError> {
+            if self.signature_valid {
+                Ok(whonix_signature())
+            } else {
+                Err(ImageError::SignatureVerification(
+                    "bad Whonix signature".to_owned(),
+                ))
+            }
+        }
+
+        fn extract_whonix_bundle(
+            &mut self,
+            _: &Path,
+            destination: &Path,
+        ) -> Result<Vec<ArchiveEntry>, ImageError> {
+            if self.partial_extraction_failure {
+                fs::write(destination.join(WHONIX_GATEWAY_DISK_FILENAME), b"partial")?;
+                return Err(ImageError::Download(
+                    "simulated interrupted Whonix extraction".to_owned(),
+                ));
+            }
+            for entry in whonix_bundle_layout() {
+                let bytes = if entry.role == BundleArtifactRole::GatewayDisk {
+                    self.extracted.as_slice()
+                } else {
+                    entry.path.as_bytes()
+                };
+                fs::write(destination.join(entry.path), bytes)?;
+            }
+            Ok(whonix_entries())
         }
     }
 
@@ -1577,5 +2357,408 @@ mod tests {
         header[24..32].copy_from_slice(&(5 * 1024_u64.pow(3)).to_be_bytes());
         fs::write(&path, header).unwrap();
         assert_eq!(qcow2_virtual_size(&path).unwrap(), 5 * 1024_u64.pow(3));
+    }
+
+    fn whonix_entries() -> Vec<ArchiveEntry> {
+        whonix_bundle_layout()
+            .into_iter()
+            .map(|entry| ArchiveEntry {
+                path: entry.path.to_owned(),
+                kind: ArchiveEntryKind::RegularFile,
+            })
+            .collect()
+    }
+
+    fn whonix_signature() -> WhonixSignatureEvidence {
+        WhonixSignatureEvidence {
+            signature_valid: true,
+            primary_signer_fingerprint: WHONIX_SIGNING_KEY_FINGERPRINT.to_owned(),
+            notation: WHONIX_SIGNATURE_NOTATION.to_owned(),
+            signature_unix_seconds: 1_784_091_820,
+        }
+    }
+
+    fn qcow2_header(virtual_bytes: u64) -> Vec<u8> {
+        let mut header = vec![0_u8; 32];
+        header[..4].copy_from_slice(b"QFI\xfb");
+        header[4..8].copy_from_slice(&3_u32.to_be_bytes());
+        header[24..32].copy_from_slice(&virtual_bytes.to_be_bytes());
+        header
+    }
+
+    #[test]
+    fn whonix_gpg_status_parser_uses_primary_fingerprint_not_signing_subkey() {
+        let status = format!(
+            "[GNUPG:] VALIDSIG SUBKEY 2026-07-15 1784091820 0 4 0 1 10 00 {WHONIX_SIGNING_KEY_FINGERPRINT}\n[GNUPG:] NOTATION_NAME file@name\n[GNUPG:] NOTATION_DATA {WHONIX_ARCHIVE_FILENAME}\n"
+        );
+        assert_eq!(
+            parse_whonix_gpg_status(&status).unwrap(),
+            whonix_signature()
+        );
+    }
+
+    #[test]
+    fn whonix_gateway_preparation_publishes_only_the_typed_gateway_base() {
+        let test = TestDirectories::new();
+        let image = qcow2_header(100 * 1024 * 1024);
+        let mut fetcher = FixtureFetcher::valid(&image);
+        let metadata = fetch_whonix_gateway(&test.directories, &mut fetcher).unwrap();
+        assert_eq!(fs::read(&metadata.prepared_qcow2_path).unwrap(), image);
+        assert!(
+            !test
+                .directories
+                .images
+                .join(WHONIX_WORKSTATION_DISK_FILENAME)
+                .exists()
+        );
+        assert_eq!(metadata.provenance.artifact_sha256.len(), 6);
+        assert!(
+            metadata
+                .provenance
+                .artifact_sha256
+                .iter()
+                .any(|(role, _)| *role == BundleArtifactRole::WorkstationDisk)
+        );
+        assert_eq!(
+            verified_whonix_gateway(&test.directories).unwrap(),
+            metadata
+        );
+    }
+
+    #[test]
+    fn whonix_verification_failure_has_zero_prepared_image_mutation() {
+        let test = TestDirectories::new();
+        let image = qcow2_header(100 * 1024 * 1024);
+        let mut fetcher = FixtureFetcher::valid(&image);
+        fetcher.signature_valid = false;
+        assert!(matches!(
+            fetch_whonix_gateway(&test.directories, &mut fetcher),
+            Err(ImageError::SignatureVerification(_))
+        ));
+        assert!(
+            !test
+                .directories
+                .images
+                .join(WHONIX_GATEWAY_DISK_FILENAME)
+                .exists()
+        );
+        assert!(!test.directories.images.join("whonix.intent.json").exists());
+        assert!(
+            !test
+                .directories
+                .images
+                .join("whonix.metadata.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn whonix_preparation_failure_before_ownership_publishes_no_base() {
+        let test = TestDirectories::new();
+        let image = qcow2_header(100 * 1024 * 1024);
+        let mut fetcher = FixtureFetcher::valid(&image);
+        fetcher.partial_extraction_failure = true;
+        assert!(matches!(
+            fetch_whonix_gateway(&test.directories, &mut fetcher),
+            Err(ImageError::Download(_))
+        ));
+        assert!(
+            !test
+                .directories
+                .images
+                .join(WHONIX_GATEWAY_DISK_FILENAME)
+                .exists()
+        );
+        assert_eq!(
+            inspect_whonix_preparation(&test.directories).unwrap(),
+            WhonixPreparationState::Missing
+        );
+    }
+
+    #[test]
+    fn sparse_gateway_publication_preserves_holes_and_logical_checksum() {
+        let test = TestDirectories::new();
+        fs::create_dir_all(&test.directories.images).unwrap();
+        let source = test.directories.images.join("sparse-source.qcow2");
+        let destination = test.directories.images.join("sparse-final.qcow2");
+        fs::write(&source, qcow2_header(16 * 1024 * 1024)).unwrap();
+        File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len(16 * 1024 * 1024)
+            .unwrap();
+        let before = fs::metadata(&source).unwrap();
+        assert!(before.blocks() * 512 < before.len());
+        let checksum = sha256_file(&source).unwrap();
+        promote_without_overwrite(&source, &destination, &checksum).unwrap();
+        let after = fs::metadata(&destination).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert!(after.blocks() * 512 < after.len());
+        assert_eq!(sha256_file(&destination).unwrap(), checksum);
+    }
+
+    #[test]
+    fn whonix_preparation_states_refuse_orphan_and_incomplete_publication() {
+        let orphan = TestDirectories::new();
+        fs::create_dir_all(&orphan.directories.images).unwrap();
+        fs::write(
+            orphan.directories.images.join(WHONIX_GATEWAY_DISK_FILENAME),
+            qcow2_header(100 * 1024 * 1024),
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_whonix_preparation(&orphan.directories).unwrap(),
+            WhonixPreparationState::OrphanedPreparedImage
+        );
+
+        let incomplete = TestDirectories::new();
+        let image = qcow2_header(100 * 1024 * 1024);
+        let mut fetcher = FixtureFetcher::valid(&image);
+        fetch_whonix_gateway(&incomplete.directories, &mut fetcher).unwrap();
+        fs::remove_file(
+            incomplete
+                .directories
+                .images
+                .join(WHONIX_GATEWAY_DISK_FILENAME),
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_whonix_preparation(&incomplete.directories).unwrap(),
+            WhonixPreparationState::Preparing
+        );
+    }
+
+    #[test]
+    fn whonix_provenance_refuses_mixed_bundle_or_changed_release_identity() {
+        let test = TestDirectories::new();
+        let image = qcow2_header(100 * 1024 * 1024);
+        let mut fetcher = FixtureFetcher::valid(&image);
+        let metadata = fetch_whonix_gateway(&test.directories, &mut fetcher).unwrap();
+        let metadata_path = test.directories.images.join("whonix.metadata.json");
+
+        let mut mixed = metadata.clone();
+        mixed
+            .provenance
+            .artifact_sha256
+            .iter_mut()
+            .find(|(role, _)| *role == BundleArtifactRole::WorkstationDisk)
+            .unwrap()
+            .1 = "f".repeat(64);
+        fs::write(&metadata_path, serde_json::to_vec(&mixed).unwrap()).unwrap();
+        assert!(matches!(
+            inspect_whonix_preparation(&test.directories).unwrap(),
+            WhonixPreparationState::Conflict(_)
+        ));
+
+        let mut wrong_release = metadata;
+        wrong_release.provenance.release = "different-release".to_owned();
+        fs::write(&metadata_path, serde_json::to_vec(&wrong_release).unwrap()).unwrap();
+        assert!(matches!(
+            inspect_whonix_preparation(&test.directories).unwrap(),
+            WhonixPreparationState::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn exact_whonix_prepared_base_is_idempotently_reused_without_download() {
+        let test = TestDirectories::new();
+        let image = qcow2_header(100 * 1024 * 1024);
+        let mut fetcher = FixtureFetcher::valid(&image);
+        let first = fetch_whonix_gateway(&test.directories, &mut fetcher).unwrap();
+        let downloads = fetcher.downloads;
+        let second = fetch_whonix_gateway(&test.directories, &mut fetcher).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(fetcher.downloads, downloads);
+    }
+
+    #[test]
+    fn whonix_bundle_layout_identifies_every_exact_role() {
+        let roles = validate_whonix_bundle_entries(&whonix_entries()).unwrap();
+        assert_eq!(roles.len(), 6);
+        assert!(roles.contains(&(
+            BundleArtifactRole::GatewayDisk,
+            WHONIX_GATEWAY_DISK_FILENAME.to_owned()
+        )));
+        assert!(roles.contains(&(
+            BundleArtifactRole::WorkstationDisk,
+            WHONIX_WORKSTATION_DISK_FILENAME.to_owned()
+        )));
+        assert!(roles.contains(&(
+            BundleArtifactRole::GatewayXml,
+            WHONIX_GATEWAY_XML_FILENAME.to_owned()
+        )));
+        assert!(roles.contains(&(
+            BundleArtifactRole::WorkstationXml,
+            WHONIX_WORKSTATION_XML_FILENAME.to_owned()
+        )));
+    }
+
+    #[test]
+    fn whonix_tar_execution_disables_unneeded_metadata_and_overwrite_semantics() {
+        for required in [
+            "--no-same-owner",
+            "--no-same-permissions",
+            "--no-xattrs",
+            "--no-acls",
+            "--no-selinux",
+            "--touch",
+            "--keep-old-files",
+            "--no-wildcards",
+            "--no-unquote",
+        ] {
+            assert!(WHONIX_TAR_EXTRACTION_OPTIONS.contains(&required));
+        }
+        assert!(!WHONIX_TAR_EXTRACTION_OPTIONS.contains(&"--absolute-names"));
+    }
+
+    #[test]
+    fn system_tar_boundary_extracts_exact_allowlist_and_preserves_sparse_gateway() {
+        let test = TestDirectories::new();
+        let source = test.root.join("bundle-source");
+        let destination = test.root.join("bundle-output");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        for entry in whonix_bundle_layout() {
+            let path = source.join(entry.path);
+            if entry.role == BundleArtifactRole::GatewayDisk {
+                fs::write(&path, qcow2_header(8 * 1024 * 1024)).unwrap();
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(8 * 1024 * 1024)
+                    .unwrap();
+            } else {
+                fs::write(&path, entry.path.as_bytes()).unwrap();
+            }
+        }
+        let archive = test.root.join("fixture.tar.xz");
+        let output = Command::new("tar")
+            .args(["--create", "--xz", "--sparse", "--file"])
+            .arg(&archive)
+            .arg("--directory")
+            .arg(&source)
+            .arg("--")
+            .args(whonix_bundle_layout().into_iter().map(|entry| entry.path))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        let entries = SystemArtifactFetcher
+            .extract_whonix_bundle(&archive, &destination)
+            .unwrap();
+        assert_eq!(validate_whonix_bundle_entries(&entries).unwrap().len(), 6);
+        let gateway = destination.join(WHONIX_GATEWAY_DISK_FILENAME);
+        let metadata = fs::metadata(&gateway).unwrap();
+        assert!(metadata.blocks() * 512 < metadata.len());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(qcow2_virtual_size(&gateway).unwrap(), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn tar_listing_parser_preserves_the_complete_member_name_for_refusal() {
+        let listing = "-rw------- 0/0 1 2026-08-28 12:00:00 Whonix-Gateway.xml\n-rw------- 0/0 1 2026-08-28 12:00:00 nested path.xml\n";
+        let entries = parse_tar_verbose_listing(listing).unwrap();
+        assert_eq!(entries[0].path, WHONIX_GATEWAY_XML_FILENAME);
+        assert_eq!(entries[1].path, "nested path.xml");
+        assert!(validate_whonix_bundle_entries(&entries).is_err());
+    }
+
+    #[test]
+    fn whonix_bundle_refuses_missing_duplicate_and_unexpected_entries() {
+        let mut missing = whonix_entries();
+        missing.pop();
+        assert!(validate_whonix_bundle_entries(&missing).is_err());
+
+        let mut duplicate = whonix_entries();
+        duplicate[1] = duplicate[0].clone();
+        assert!(validate_whonix_bundle_entries(&duplicate).is_err());
+
+        let mut unexpected = whonix_entries();
+        unexpected[0].path = "extra.qcow2".to_owned();
+        assert!(validate_whonix_bundle_entries(&unexpected).is_err());
+    }
+
+    #[test]
+    fn whonix_bundle_refuses_unsafe_paths_and_links() {
+        for path in [
+            "../Whonix-Gateway.xml",
+            "/Whonix-Gateway.xml",
+            "nested/Whonix-Gateway.xml",
+            "C:\\Whonix-Gateway.xml",
+            ".\\Whonix-Gateway.xml",
+            "nested//Whonix-Gateway.xml",
+        ] {
+            let mut entries = whonix_entries();
+            entries[1].path = path.to_owned();
+            assert!(validate_whonix_bundle_entries(&entries).is_err());
+        }
+        for kind in [
+            ArchiveEntryKind::SymbolicLink,
+            ArchiveEntryKind::HardLink,
+            ArchiveEntryKind::Directory,
+            ArchiveEntryKind::Other,
+        ] {
+            let mut entries = whonix_entries();
+            entries[0].kind = kind;
+            assert!(validate_whonix_bundle_entries(&entries).is_err());
+        }
+    }
+
+    #[test]
+    fn whonix_signature_requires_pinned_signer_notation_and_monotonic_time() {
+        let valid = whonix_signature();
+        assert!(validate_whonix_signature_evidence(&valid, 1_800_000_000, None).is_ok());
+
+        let mut wrong_signer = valid.clone();
+        wrong_signer.primary_signer_fingerprint = "0".repeat(40);
+        assert!(validate_whonix_signature_evidence(&wrong_signer, 1_800_000_000, None).is_err());
+
+        let mut wrong_notation = valid.clone();
+        wrong_notation.notation = "file@name=other.libvirt.xz".to_owned();
+        assert!(validate_whonix_signature_evidence(&wrong_notation, 1_800_000_000, None).is_err());
+
+        let mut old = valid.clone();
+        old.signature_unix_seconds = WHONIX_RELEASE_SIGNATURE_NOT_BEFORE - 1;
+        assert!(validate_whonix_signature_evidence(&old, 1_800_000_000, None).is_err());
+        assert!(
+            validate_whonix_signature_evidence(&valid, 1_800_000_000, Some(1_790_000_000)).is_err()
+        );
+    }
+
+    #[test]
+    fn whonix_provenance_keeps_gateway_and_workstation_in_one_bundle() {
+        let hashes = whonix_bundle_layout()
+            .into_iter()
+            .map(|entry| (entry.role, "a".repeat(64)))
+            .collect();
+        let provenance =
+            whonix_bundle_provenance(&whonix_signature(), 1_800_000_000, "b".repeat(64), hashes)
+                .unwrap();
+        assert_eq!(provenance.release, WHONIX_RELEASE);
+        assert!(
+            provenance
+                .artifact_sha256
+                .iter()
+                .any(|(role, _)| *role == BundleArtifactRole::GatewayDisk)
+        );
+        assert!(
+            provenance
+                .artifact_sha256
+                .iter()
+                .any(|(role, _)| *role == BundleArtifactRole::WorkstationDisk)
+        );
+
+        let incomplete = vec![(BundleArtifactRole::GatewayDisk, "a".repeat(64))];
+        assert!(
+            whonix_bundle_provenance(
+                &whonix_signature(),
+                1_800_000_000,
+                "b".repeat(64),
+                incomplete
+            )
+            .is_err()
+        );
     }
 }

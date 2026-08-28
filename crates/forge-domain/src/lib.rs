@@ -879,6 +879,61 @@ mod tests {
     }
 
     #[test]
+    fn whonix_gateway_profile_renders_exact_upstream_critical_topology() {
+        let profile = forge_profiles::whonix_gateway();
+        let resources = forge_profiles::plan(
+            &forge_core::HardwareInfo {
+                cpu: forge_core::CpuInfo {
+                    model: "test".to_owned(),
+                    logical_cores: 8,
+                    virtualization: true,
+                },
+                memory_bytes: 16 * GIB,
+                gpus: vec![],
+                storage: vec![],
+                kvm: forge_core::KvmInfo {
+                    present: true,
+                    accessible: true,
+                },
+            },
+            &profile,
+        )
+        .unwrap();
+        let spec = profile_spec(
+            &profile,
+            &resources,
+            DomainMetadata {
+                name: "whonix-gateway".to_owned(),
+                disk_path: "/pool/whonix-gateway.qcow2".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(spec.firmware, FirmwareMode::Bios);
+        assert_eq!(spec.machine, MachineType::Q35);
+        assert_eq!(spec.disks[0].bus, DiskBus::Virtio);
+        assert_eq!(spec.network_interfaces.len(), 2);
+        assert_eq!(
+            spec.network_interfaces[0],
+            NetworkInterfaceSpec::PasstUplink
+        );
+        assert!(matches!(
+            &spec.network_interfaces[1],
+            NetworkInterfaceSpec::UdpPointToPoint(link)
+                if link.endpoint == PointToPointEndpoint::Gateway
+                    && link.local_port == 6688
+                    && link.remote_port == 5577
+        ));
+        assert!(!spec.guest_agent_required);
+        assert!(spec.channels.is_empty());
+        let xml = render_xml(&spec).unwrap();
+        assert!(xml.contains("<interface type='user'>"));
+        assert!(xml.contains("<backend type='passt'/>"));
+        assert!(xml.contains("<interface type='udp'>"));
+        assert!(!xml.contains("source network='default'"));
+        assert!(!xml.contains("org.qemu.guest_agent.0"));
+    }
+
+    #[test]
     fn manual_topology_change_is_typed_drift_not_absorbed() {
         let mut changed = spec();
         changed.network_interfaces[0] = NetworkInterfaceSpec::LibvirtNetwork {

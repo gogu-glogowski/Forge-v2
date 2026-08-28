@@ -2651,6 +2651,21 @@ fn print_create_plan(plan: &forge_profiles::GenericCreatePlan, domain: &forge_do
         plan.prepared_base.source_format,
         plan.prepared_base.base_volume_name
     );
+    if matches!(
+        plan.prepared_base.source,
+        forge_core::ImageSourcePolicy::WhonixLibvirtBundle { .. }
+    ) {
+        println!("Bundle: {}", forge_images::WHONIX_ARCHIVE_FILENAME);
+        println!("Bundle source: {}", forge_images::WHONIX_SOURCE_URL);
+        println!(
+            "Verification chain: detached OpenPGP, pinned signer {}, exact file@name notation, monotonic signature time",
+            forge_images::WHONIX_SIGNING_KEY_FINGERPRINT
+        );
+        println!("Expected bundle roles:");
+        for entry in forge_images::whonix_bundle_layout() {
+            println!("  - {:?}: {}", entry.role, entry.path);
+        }
+    }
     println!(
         "Storage plan: overlay {}, capacity {} GiB",
         plan.generation.overlay,
@@ -2666,6 +2681,9 @@ fn print_create_plan(plan: &forge_profiles::GenericCreatePlan, domain: &forge_do
     );
     println!("Provisioning plan: {:?}", plan.instance.provisioning);
     println!("Network plan: {:?}", plan.instance.network);
+    for interface in &domain.network_interfaces {
+        println!("Network attachment: {interface}");
+    }
     println!("Graphics plan: {:?}", plan.instance.graphics);
     println!("Persistence plan: {:?}", plan.instance.lifecycle);
     println!(
@@ -2686,19 +2704,102 @@ fn print_create_plan(plan: &forge_profiles::GenericCreatePlan, domain: &forge_do
     println!("Mutation: {}", plan.mutation);
 }
 
-struct KaliCreateBackend {
+struct PreparedBaseArtifact {
+    path: std::path::PathBuf,
+    file_bytes: u64,
+    capacity_bytes: u64,
+}
+
+fn validate_preparation_strategy(
+    plan: &forge_profiles::PreparedBaseImagePlan,
+) -> Result<forge_profiles::PrepareBaseStrategy, String> {
+    use forge_core::{ImageSourcePolicy, ImageVerificationPolicy};
+    use forge_profiles::{PrepareBaseStrategy, SourceImageFormat};
+    match (
+        &plan.source,
+        plan.verification,
+        plan.source_format,
+        plan.preparation,
+    ) {
+        (
+            ImageSourcePolicy::KaliQemuArchive { .. },
+            ImageVerificationPolicy::KaliDetachedSignedSha256Sums,
+            SourceImageFormat::SevenZipQcow2Archive,
+            PrepareBaseStrategy::SevenZipSingleQcow2,
+        )
+        | (
+            ImageSourcePolicy::WhonixLibvirtBundle { .. },
+            ImageVerificationPolicy::WhonixDetachedOpenPgp,
+            SourceImageFormat::TarXzMultiArtifactBundle,
+            PrepareBaseStrategy::WhonixBundleGateway,
+        ) => Ok(plan.preparation),
+        _ => Err("unsupported or incoherent image preparation strategy".to_owned()),
+    }
+}
+
+fn acquire_prepared_base(
+    plan: &forge_profiles::PreparedBaseImagePlan,
+) -> Result<PreparedBaseArtifact, String> {
+    let directories = forge_images::default_directories()
+        .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
+    let path = match validate_preparation_strategy(plan)? {
+        forge_profiles::PrepareBaseStrategy::SevenZipSingleQcow2 => {
+            forge_images::fetch_kali(&directories, &mut forge_images::SystemArtifactFetcher)
+                .map_err(|error| error.to_string())?
+                .prepared_qcow2_path
+        }
+        forge_profiles::PrepareBaseStrategy::WhonixBundleGateway => {
+            forge_images::fetch_whonix_gateway(
+                &directories,
+                &mut forge_images::SystemArtifactFetcher,
+            )
+            .map_err(|error| error.to_string())?
+            .prepared_qcow2_path
+        }
+        forge_profiles::PrepareBaseStrategy::VerifiedQcow2 => {
+            return Err("verified direct-qcow2 real create is not implemented".to_owned());
+        }
+    };
+    let file_bytes = std::fs::metadata(&path)
+        .map_err(|error| error.to_string())?
+        .len();
+    let capacity_bytes =
+        forge_images::qcow2_virtual_size(&path).map_err(|error| error.to_string())?;
+    Ok(PreparedBaseArtifact {
+        path,
+        file_bytes,
+        capacity_bytes,
+    })
+}
+
+fn prove_prepared_base(plan: &forge_profiles::PreparedBaseImagePlan) -> Result<(), String> {
+    let directories = forge_images::default_directories()
+        .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
+    match validate_preparation_strategy(plan)? {
+        forge_profiles::PrepareBaseStrategy::SevenZipSingleQcow2 => {
+            forge_images::verified_kali(&directories).map(|_| ())
+        }
+        forge_profiles::PrepareBaseStrategy::WhonixBundleGateway => {
+            forge_images::verified_whonix_gateway(&directories).map(|_| ())
+        }
+        forge_profiles::PrepareBaseStrategy::VerifiedQcow2 => {
+            return Err("verified direct-qcow2 real create is not implemented".to_owned());
+        }
+    }
+    .map_err(|error| error.to_string())
+}
+
+struct ManualGuestCreateBackend {
     storage: forge_libvirt::LibvirtDefineBackend,
     instance: InstanceName,
     domain_uuid: String,
-    source: forge_images::KaliImageMetadata,
-    source_file_bytes: u64,
-    source_capacity_bytes: u64,
+    source: PreparedBaseArtifact,
     layout: forge_state::StateLayout,
     base_created: bool,
     overlay_created: bool,
 }
 
-impl forge_storage::GenericCreateBackend for KaliCreateBackend {
+impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
     fn revalidate_absent(
         &mut self,
         plan: &forge_storage::GenericCreateExecutionPlan,
@@ -2738,11 +2839,7 @@ impl forge_storage::GenericCreateBackend for KaliCreateBackend {
                 return Err(format!("exact planned volume already exists: {name}"));
             }
         }
-        forge_images::verified_kali(
-            &forge_images::default_directories()
-                .ok_or_else(|| "Forge image directories are unavailable".to_owned())?,
-        )
-        .map_err(|error| error.to_string())?;
+        prove_prepared_base(&plan.factory.prepared_base)?;
         Ok(())
     }
 
@@ -2763,15 +2860,15 @@ impl forge_storage::GenericCreateBackend for KaliCreateBackend {
         let base = forge_storage::BaseImageVolume {
             name: plan.factory.prepared_base.base_volume_name.clone(),
             path: base_path.clone(),
-            imported_bytes: self.source_file_bytes,
-            capacity_bytes: self.source_capacity_bytes,
+            imported_bytes: self.source.file_bytes,
+            capacity_bytes: self.source.capacity_bytes,
             format: "qcow2".to_owned(),
         };
         ImagePrepareBackend::import_base(
             &mut self.storage,
             forge_storage::DEFAULT_POOL,
             &base,
-            self.source.prepared_qcow2_path.to_string_lossy().as_ref(),
+            self.source.path.to_string_lossy().as_ref(),
         )
         .map_err(|error| error.to_string())?;
         self.base_created = true;
@@ -2881,8 +2978,8 @@ impl forge_storage::GenericCreateBackend for KaliCreateBackend {
 }
 
 fn create_vm(profile_name: &str, instance_name: &str) -> ExitCode {
-    if profile_name != "kali-lab" {
-        eprintln!("real generic create is currently enabled only for the reviewed kali-lab policy");
+    if !matches!(profile_name, "kali-lab" | "whonix-gateway") {
+        eprintln!("real generic create is unavailable for this profile's image strategy");
         return ExitCode::from(2);
     }
     eprint!("Create persistent ManualGuest {instance_name} from {profile_name}? [y/N] ");
@@ -2893,20 +2990,22 @@ fn create_vm(profile_name: &str, instance_name: &str) -> ExitCode {
         eprintln!("Creation cancelled.");
         return ExitCode::SUCCESS;
     }
-    match execute_kali_create(profile_name, instance_name) {
+    match execute_manual_guest_create(profile_name, instance_name) {
         Ok(index) => {
             println!("Active generation: {}", index.active_generation_id);
-            println!("Kali ManualGuest created shut off; use Virt-Manager or forge vm start.");
+            println!(
+                "Persistent ManualGuest created shut off; use Virt-Manager or forge vm start."
+            );
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("Kali create failed: {error}");
+            eprintln!("ManualGuest create failed: {error}");
             ExitCode::from(1)
         }
     }
 }
 
-fn execute_kali_create(
+fn execute_manual_guest_create(
     profile_name: &str,
     instance_name: &str,
 ) -> Result<forge_state::GenerationIndex, String> {
@@ -2928,17 +3027,9 @@ fn execute_kali_create(
         .map_err(|error| error.to_string())?;
     let factory = forge_profiles::plan_create(instance_plan, generation)
         .map_err(|error| error.to_string())?;
-    let directories = forge_images::default_directories()
-        .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
-    let source = forge_images::fetch_kali(&directories, &mut forge_images::SystemArtifactFetcher)
-        .map_err(|error| error.to_string())?;
-    let source_file_bytes = std::fs::metadata(&source.prepared_qcow2_path)
-        .map_err(|error| error.to_string())?
-        .len();
-    let source_capacity_bytes = forge_images::qcow2_virtual_size(&source.prepared_qcow2_path)
-        .map_err(|error| error.to_string())?;
-    if source_capacity_bytes > factory.instance.resources.disk_bytes {
-        return Err("Kali source capacity exceeds the profile disk policy".to_owned());
+    let source = acquire_prepared_base(&factory.prepared_base)?;
+    if source.capacity_bytes > factory.instance.resources.disk_bytes {
+        return Err("prepared source capacity exceeds the profile disk policy".to_owned());
     }
     let domain_uuid = forge_state::new_generation_id()
         .strip_prefix("gen-")
@@ -2964,14 +3055,12 @@ fn execute_kali_create(
         &forge_state::state_directory(std::path::Path::new(&home)),
         &instance,
     );
-    let mut backend = KaliCreateBackend {
+    let mut backend = ManualGuestCreateBackend {
         storage: forge_libvirt::LibvirtDefineBackend::connect_local()
             .map_err(|error| error.to_string())?,
         instance,
         domain_uuid,
         source,
-        source_file_bytes,
-        source_capacity_bytes,
         layout,
         base_created: false,
         overlay_created: false,
@@ -3063,7 +3152,23 @@ const fn yes_no(value: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_core::{ProvisioningPolicy, VmState};
+    use forge_core::{ImageSourcePolicy, ImageVerificationPolicy, ProvisioningPolicy, VmState};
+    use forge_profiles::{PrepareBaseStrategy, PreparedBaseImagePlan, SourceImageFormat};
+
+    fn prepared_plan(
+        source: ImageSourcePolicy,
+        verification: ImageVerificationPolicy,
+        source_format: SourceImageFormat,
+        preparation: PrepareBaseStrategy,
+    ) -> PreparedBaseImagePlan {
+        PreparedBaseImagePlan {
+            source,
+            verification,
+            source_format,
+            preparation,
+            base_volume_name: "base.qcow2".to_owned(),
+        }
+    }
 
     fn seed() -> forge_state::ManagedResource {
         forge_state::ManagedResource {
@@ -3117,5 +3222,55 @@ mod tests {
         ));
         assert!(validate_provisioning_topology(&fedora.provisioning, &[seed()]).is_ok());
         assert!(validate_provisioning_topology(&fedora.provisioning, &[]).is_err());
+    }
+
+    #[test]
+    fn real_create_dispatch_is_policy_driven_for_kali_and_whonix() {
+        let kali = prepared_plan(
+            ImageSourcePolicy::KaliQemuArchive {
+                release: "2026.2".to_owned(),
+            },
+            ImageVerificationPolicy::KaliDetachedSignedSha256Sums,
+            SourceImageFormat::SevenZipQcow2Archive,
+            PrepareBaseStrategy::SevenZipSingleQcow2,
+        );
+        assert_eq!(
+            validate_preparation_strategy(&kali).unwrap(),
+            PrepareBaseStrategy::SevenZipSingleQcow2
+        );
+        let whonix = prepared_plan(
+            ImageSourcePolicy::WhonixLibvirtBundle {
+                release: "18.2.1.9".to_owned(),
+            },
+            ImageVerificationPolicy::WhonixDetachedOpenPgp,
+            SourceImageFormat::TarXzMultiArtifactBundle,
+            PrepareBaseStrategy::WhonixBundleGateway,
+        );
+        assert_eq!(
+            validate_preparation_strategy(&whonix).unwrap(),
+            PrepareBaseStrategy::WhonixBundleGateway
+        );
+    }
+
+    #[test]
+    fn incoherent_or_unsupported_real_create_strategy_is_refused() {
+        let mismatched = prepared_plan(
+            ImageSourcePolicy::WhonixLibvirtBundle {
+                release: "18.2.1.9".to_owned(),
+            },
+            ImageVerificationPolicy::WhonixDetachedOpenPgp,
+            SourceImageFormat::TarXzMultiArtifactBundle,
+            PrepareBaseStrategy::SevenZipSingleQcow2,
+        );
+        assert!(validate_preparation_strategy(&mismatched).is_err());
+        let unsupported = prepared_plan(
+            ImageSourcePolicy::VerifiedQcow2 {
+                source_id: "mock".to_owned(),
+            },
+            ImageVerificationPolicy::Sha256Digest,
+            SourceImageFormat::Qcow2,
+            PrepareBaseStrategy::VerifiedQcow2,
+        );
+        assert!(validate_preparation_strategy(&unsupported).is_err());
     }
 }

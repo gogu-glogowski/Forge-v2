@@ -4,8 +4,8 @@ use forge_core::{
     FirmwareMachinePolicy, FirstBootSuccessPolicy, GenerationResourceNames, GpuMode,
     GraphicsPolicy, GuestArchitecture, GuestFamily, GuestProfileKind, HardwareInfo,
     ImageSourcePolicy, ImageVerificationPolicy, InstanceKind, InstanceName, NetworkMode,
-    NetworkPolicy, PersistencePolicy, ProfileId, ProvisioningPolicy, ResourcePlanError, VmProfile,
-    VmResourcePlan, VmResources,
+    NetworkPolicy, PersistencePolicy, PointToPointEndpoint, ProfileId, ProvisioningPolicy,
+    ResourcePlanError, UdpPointToPointLink, VmProfile, VmResourcePlan, VmResources, WhonixPairId,
 };
 use std::fmt;
 
@@ -18,6 +18,7 @@ pub fn built_in_profiles() -> Vec<VmProfile> {
     vec![
         fedora_lab(),
         kali_lab(),
+        whonix_gateway(),
         luna_dev_fedora(),
         luna_lab_fedora(),
     ]
@@ -39,10 +40,57 @@ pub fn base_volume_name(profile: &VmProfile) -> String {
         ImageSourcePolicy::KaliQemuArchive { release } => {
             format!("forge-base-kali-{release}.qcow2")
         }
+        ImageSourcePolicy::WhonixLibvirtBundle { release } => {
+            format!("forge-base-whonix-gateway-{release}.qcow2")
+        }
         ImageSourcePolicy::VerifiedQcow2 { source_id } => {
             format!("forge-base-{source_id}.qcow2")
         }
     }
+}
+
+#[must_use]
+///
+/// # Panics
+///
+/// Panics only if Forge's built-in, compile-time Whonix pair identifier is invalid.
+pub fn whonix_gateway() -> VmProfile {
+    let mut profile = profile(
+        ProfileMetadata {
+            id: "whonix-gateway",
+            display_name: "Whonix Gateway",
+            kind: GuestProfileKind::WhonixGateway,
+            instance_kind: InstanceKind::NetworkProvider,
+            guest_family: GuestFamily::Whonix,
+        },
+        VmResources {
+            cpu_ratio_per_mille: 0,
+            min_vcpus: 1,
+            max_vcpus: 1,
+            memory_start_ratio_per_mille: 0,
+            memory_max_ratio_per_mille: 0,
+            min_memory_bytes: 2 * GIB,
+            host_memory_reserve_bytes: 2 * GIB,
+            disk_bytes: 100 * GIB,
+        },
+        ImagePolicy {
+            source: ImageSourcePolicy::WhonixLibvirtBundle {
+                release: "18.2.1.9".to_owned(),
+            },
+            verification: ImageVerificationPolicy::WhonixDetachedOpenPgp,
+        },
+        ProvisioningPolicy::None,
+        FirstBootSuccessPolicy::ManualGuest,
+    );
+    profile.firmware_machine = FirmwareMachinePolicy::BiosQ35;
+    profile.network_policy = NetworkPolicy::WhonixGateway(UdpPointToPointLink {
+        pair_id: WhonixPairId::new("whonix-main-pair")
+            .expect("built-in Whonix pair ID must be valid"),
+        endpoint: PointToPointEndpoint::Gateway,
+        local_port: 6688,
+        remote_port: 5577,
+    });
+    profile
 }
 
 #[must_use]
@@ -260,6 +308,14 @@ pub struct InstancePlan {
 pub enum SourceImageFormat {
     Qcow2,
     SevenZipQcow2Archive,
+    TarXzMultiArtifactBundle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareBaseStrategy {
+    VerifiedQcow2,
+    SevenZipSingleQcow2,
+    WhonixBundleGateway,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +323,7 @@ pub struct PreparedBaseImagePlan {
     pub source: ImageSourcePolicy,
     pub verification: ImageVerificationPolicy,
     pub source_format: SourceImageFormat,
+    pub preparation: PrepareBaseStrategy,
     pub base_volume_name: String,
 }
 
@@ -447,7 +504,19 @@ pub fn plan_create(
                 ImageSourcePolicy::KaliQemuArchive { .. } => {
                     SourceImageFormat::SevenZipQcow2Archive
                 }
+                ImageSourcePolicy::WhonixLibvirtBundle { .. } => {
+                    SourceImageFormat::TarXzMultiArtifactBundle
+                }
                 _ => SourceImageFormat::Qcow2,
+            },
+            preparation: match &instance.image.source {
+                ImageSourcePolicy::KaliQemuArchive { .. } => {
+                    PrepareBaseStrategy::SevenZipSingleQcow2
+                }
+                ImageSourcePolicy::WhonixLibvirtBundle { .. } => {
+                    PrepareBaseStrategy::WhonixBundleGateway
+                }
+                _ => PrepareBaseStrategy::VerifiedQcow2,
             },
             base_volume_name: instance.image.base_volume_name.clone(),
         },
@@ -631,6 +700,10 @@ mod tests {
             plan.prepared_base.source_format,
             SourceImageFormat::SevenZipQcow2Archive
         );
+        assert_eq!(
+            plan.prepared_base.preparation,
+            PrepareBaseStrategy::SevenZipSingleQcow2
+        );
         assert!(plan.generation.seed.is_none());
         assert!(!plan.auto_boot);
         assert!(plan.observations.is_empty());
@@ -649,6 +722,67 @@ mod tests {
         assert_ne!(kali.overlay, fedora.overlay);
         assert_ne!(kali.seed, fedora.seed);
         assert_ne!("kali-lab", "fedora-lab");
+    }
+
+    #[test]
+    fn whonix_gateway_is_registered_with_upstream_manual_policy() {
+        let profile = find("whonix-gateway").unwrap();
+        assert_eq!(profile.guest_family, GuestFamily::Whonix);
+        assert_eq!(profile.kind, GuestProfileKind::WhonixGateway);
+        assert_eq!(profile.instance_kind, InstanceKind::NetworkProvider);
+        assert_eq!(profile.firmware_machine, FirmwareMachinePolicy::BiosQ35);
+        assert_eq!(profile.provisioning, ProvisioningPolicy::None);
+        assert_eq!(
+            profile.first_boot_success,
+            FirstBootSuccessPolicy::ManualGuest
+        );
+        assert_eq!(profile.persistence, PersistencePolicy::Persistent);
+        let NetworkPolicy::WhonixGateway(link) = profile.network_policy else {
+            panic!("Whonix Gateway must use its typed upstream network policy");
+        };
+        assert_eq!(link.endpoint, PointToPointEndpoint::Gateway);
+        assert_eq!(link.pair_id.as_str(), "whonix-main-pair");
+        assert_eq!((link.local_port, link.remote_port), (6688, 5577));
+    }
+
+    #[test]
+    fn whonix_gateway_create_plan_has_bundle_no_seed_and_isolated_state() {
+        let profile = whonix_gateway();
+        let instance = plan_instance(
+            &hardware(16, 32),
+            &profile,
+            InstanceIdentity {
+                name: InstanceName::new("whonix-gateway").unwrap(),
+                profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap();
+        let plan = plan_create(instance, generation("whonix-gateway", false)).unwrap();
+        assert_eq!(
+            plan.prepared_base.source_format,
+            SourceImageFormat::TarXzMultiArtifactBundle
+        );
+        assert_eq!(
+            plan.prepared_base.preparation,
+            PrepareBaseStrategy::WhonixBundleGateway
+        );
+        assert_eq!(
+            plan.prepared_base.verification,
+            ImageVerificationPolicy::WhonixDetachedOpenPgp
+        );
+        assert!(plan.generation.seed.is_none());
+        assert!(!plan.auto_boot);
+        assert!(plan.observations.is_empty());
+        assert_ne!(
+            plan.generation.overlay,
+            generation("kali-lab", false).overlay
+        );
+        assert_eq!(
+            plan.instance.lifecycle,
+            LifecyclePlan::PersistentManaged {
+                state_directory_name: "whonix-gateway".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -672,6 +806,7 @@ mod tests {
             [
                 "fedora-lab",
                 "kali-lab",
+                "whonix-gateway",
                 "luna-dev-fedora",
                 "luna-lab-fedora"
             ]
