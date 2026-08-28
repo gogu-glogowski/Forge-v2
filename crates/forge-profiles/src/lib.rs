@@ -19,6 +19,7 @@ pub fn built_in_profiles() -> Vec<VmProfile> {
         fedora_lab(),
         kali_lab(),
         whonix_gateway(),
+        whonix_workstation(),
         luna_dev_fedora(),
         luna_lab_fedora(),
     ]
@@ -41,7 +42,11 @@ pub fn base_volume_name(profile: &VmProfile) -> String {
             format!("forge-base-kali-{release}.qcow2")
         }
         ImageSourcePolicy::WhonixLibvirtBundle { release } => {
-            format!("forge-base-whonix-gateway-{release}.qcow2")
+            let role = match profile.kind {
+                GuestProfileKind::WhonixWorkstation => "workstation",
+                _ => "gateway",
+            };
+            format!("forge-base-whonix-{role}-{release}.qcow2")
         }
         ImageSourcePolicy::VerifiedQcow2 { source_id } => {
             format!("forge-base-{source_id}.qcow2")
@@ -89,6 +94,51 @@ pub fn whonix_gateway() -> VmProfile {
         endpoint: PointToPointEndpoint::Gateway,
         local_port: 6688,
         remote_port: 5577,
+    });
+    profile
+}
+
+#[must_use]
+///
+/// # Panics
+///
+/// Panics only if the built-in pair identifier is invalid, which indicates a
+/// programming error in the static profile definition.
+pub fn whonix_workstation() -> VmProfile {
+    let mut profile = profile(
+        ProfileMetadata {
+            id: "whonix-workstation",
+            display_name: "Whonix Workstation",
+            kind: GuestProfileKind::WhonixWorkstation,
+            instance_kind: InstanceKind::NetworkConsumer,
+            guest_family: GuestFamily::Whonix,
+        },
+        VmResources {
+            cpu_ratio_per_mille: 0,
+            min_vcpus: 1,
+            max_vcpus: 1,
+            memory_start_ratio_per_mille: 0,
+            memory_max_ratio_per_mille: 0,
+            min_memory_bytes: 2 * GIB,
+            host_memory_reserve_bytes: 2 * GIB,
+            disk_bytes: 100 * GIB,
+        },
+        ImagePolicy {
+            source: ImageSourcePolicy::WhonixLibvirtBundle {
+                release: "18.2.1.9".to_owned(),
+            },
+            verification: ImageVerificationPolicy::WhonixDetachedOpenPgp,
+        },
+        ProvisioningPolicy::None,
+        FirstBootSuccessPolicy::ManualGuest,
+    );
+    profile.firmware_machine = FirmwareMachinePolicy::BiosQ35;
+    profile.network_policy = NetworkPolicy::WhonixWorkstation(UdpPointToPointLink {
+        pair_id: WhonixPairId::new("whonix-main-pair")
+            .expect("built-in Whonix pair ID must be valid"),
+        endpoint: PointToPointEndpoint::Workstation,
+        local_port: 5577,
+        remote_port: 6688,
     });
     profile
 }
@@ -316,6 +366,7 @@ pub enum PrepareBaseStrategy {
     VerifiedQcow2,
     SevenZipSingleQcow2,
     WhonixBundleGateway,
+    WhonixBundleWorkstation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +376,99 @@ pub struct PreparedBaseImagePlan {
     pub source_format: SourceImageFormat,
     pub preparation: PrepareBaseStrategy,
     pub base_volume_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhonixPairEvidence {
+    pub gateway_instance: InstanceName,
+    pub gateway_generation: String,
+    pub gateway_domain_uuid: String,
+    pub gateway_link: UdpPointToPointLink,
+    pub bundle_identity: String,
+}
+
+/// Immutable values captured during planning and required to match again
+/// immediately before an execute transaction may mutate storage or libvirt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhonixPairSnapshot {
+    pub gateway: WhonixPairEvidence,
+    pub workstation_overlay: String,
+    pub workstation_base_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WhonixPairPlanError {
+    GatewayNotConsistent,
+    GatewayIdentityMismatch,
+    EndpointMismatch,
+    BundleMismatch,
+    SnapshotDrift,
+}
+
+impl fmt::Display for WhonixPairPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::GatewayNotConsistent => "Whonix Gateway must be present and Consistent",
+            Self::GatewayIdentityMismatch => "Whonix Gateway identity does not match the pair",
+            Self::EndpointMismatch => "Whonix endpoints are not exact complements",
+            Self::BundleMismatch => {
+                "Whonix Gateway and Workstation use different bundle identities"
+            }
+            Self::SnapshotDrift => "Whonix pair snapshot changed before execute",
+        })
+    }
+}
+
+impl std::error::Error for WhonixPairPlanError {}
+
+/// Validates a Workstation plan against an already reconciled Gateway proof.
+///
+/// # Errors
+///
+/// Returns a typed refusal when the Gateway identity, endpoint complement, or
+/// verified bundle identity does not match the Workstation plan.
+pub fn validate_whonix_pair(
+    evidence: &WhonixPairEvidence,
+    workstation: &UdpPointToPointLink,
+    workstation_bundle_identity: &str,
+) -> Result<(), WhonixPairPlanError> {
+    if evidence.gateway_instance.as_str() != "whonix-gateway"
+        || evidence.gateway_generation.is_empty()
+        || evidence.gateway_domain_uuid.is_empty()
+    {
+        return Err(WhonixPairPlanError::GatewayNotConsistent);
+    }
+    let expected_gateway = whonix_gateway();
+    let NetworkPolicy::WhonixGateway(expected_link) = expected_gateway.network_policy else {
+        unreachable!()
+    };
+    if evidence.gateway_link != expected_link {
+        return Err(WhonixPairPlanError::GatewayIdentityMismatch);
+    }
+    if !evidence.gateway_link.is_complementary_to(workstation) {
+        return Err(WhonixPairPlanError::EndpointMismatch);
+    }
+    if evidence.bundle_identity != workstation_bundle_identity {
+        return Err(WhonixPairPlanError::BundleMismatch);
+    }
+    Ok(())
+}
+
+/// Refuses execution when any planning-bound Gateway or Workstation identity
+/// changed during the plan-to-execute interval.
+///
+/// # Errors
+///
+/// Returns `SnapshotDrift` if any captured identity differs.
+pub fn revalidate_whonix_snapshot(
+    planned: &WhonixPairSnapshot,
+    current: &WhonixPairSnapshot,
+) -> Result<(), WhonixPairPlanError> {
+    if planned == current {
+        Ok(())
+    } else {
+        Err(WhonixPairPlanError::SnapshotDrift)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -514,7 +658,10 @@ pub fn plan_create(
                     PrepareBaseStrategy::SevenZipSingleQcow2
                 }
                 ImageSourcePolicy::WhonixLibvirtBundle { .. } => {
-                    PrepareBaseStrategy::WhonixBundleGateway
+                    match instance.identity.profile_id.as_str() {
+                        "whonix-workstation" => PrepareBaseStrategy::WhonixBundleWorkstation,
+                        _ => PrepareBaseStrategy::WhonixBundleGateway,
+                    }
                 }
                 _ => PrepareBaseStrategy::VerifiedQcow2,
             },
@@ -786,6 +933,145 @@ mod tests {
     }
 
     #[test]
+    fn whonix_workstation_is_registered_with_complementary_manual_policy() {
+        let profile = find("whonix-workstation").unwrap();
+        assert_eq!(profile.guest_family, GuestFamily::Whonix);
+        assert_eq!(profile.kind, GuestProfileKind::WhonixWorkstation);
+        assert_eq!(profile.instance_kind, InstanceKind::NetworkConsumer);
+        assert_eq!(profile.architecture, GuestArchitecture::X86_64);
+        assert_eq!(profile.firmware_machine, FirmwareMachinePolicy::BiosQ35);
+        assert_eq!(profile.provisioning, ProvisioningPolicy::None);
+        assert_eq!(
+            profile.first_boot_success,
+            FirstBootSuccessPolicy::ManualGuest
+        );
+        assert_eq!(profile.persistence, PersistencePolicy::Persistent);
+        let NetworkPolicy::WhonixWorkstation(link) = profile.network_policy else {
+            panic!("Workstation must use its typed UDP policy");
+        };
+        assert_eq!(link.pair_id.as_str(), "whonix-main-pair");
+        assert_eq!((link.local_port, link.remote_port), (5577, 6688));
+    }
+
+    #[test]
+    fn whonix_workstation_plan_selects_same_bundle_workstation_role() {
+        let profile = whonix_workstation();
+        let instance = plan_instance(
+            &hardware(16, 32),
+            &profile,
+            InstanceIdentity {
+                name: InstanceName::new("whonix-workstation").unwrap(),
+                profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap();
+        let plan = plan_create(instance, generation("whonix-workstation", false)).unwrap();
+        assert_eq!(
+            plan.prepared_base.preparation,
+            PrepareBaseStrategy::WhonixBundleWorkstation
+        );
+        assert_eq!(
+            plan.prepared_base.base_volume_name,
+            "forge-base-whonix-workstation-18.2.1.9.qcow2"
+        );
+        assert!(plan.generation.seed.is_none());
+        assert!(!plan.auto_boot);
+        assert!(plan.observations.is_empty());
+    }
+
+    #[test]
+    fn whonix_pair_requires_exact_complement_and_shared_bundle() {
+        let NetworkPolicy::WhonixGateway(gateway) = whonix_gateway().network_policy else {
+            unreachable!()
+        };
+        let NetworkPolicy::WhonixWorkstation(workstation) = whonix_workstation().network_policy
+        else {
+            unreachable!()
+        };
+        let evidence = WhonixPairEvidence {
+            gateway_instance: InstanceName::new("whonix-gateway").unwrap(),
+            gateway_generation: "gen-123".to_owned(),
+            gateway_domain_uuid: "uuid-123".to_owned(),
+            gateway_link: gateway.clone(),
+            bundle_identity: "bundle-1".to_owned(),
+        };
+        assert!(validate_whonix_pair(&evidence, &workstation, "bundle-1").is_ok());
+        assert_eq!(
+            validate_whonix_pair(&evidence, &workstation, "bundle-2"),
+            Err(WhonixPairPlanError::BundleMismatch)
+        );
+        let mut wrong = workstation.clone();
+        wrong.local_port = 6688;
+        assert_eq!(
+            validate_whonix_pair(&evidence, &wrong, "bundle-1"),
+            Err(WhonixPairPlanError::EndpointMismatch)
+        );
+        let mut wrong_gateway = evidence.clone();
+        wrong_gateway.gateway_link.pair_id = WhonixPairId::new("other-pair").unwrap();
+        assert_eq!(
+            validate_whonix_pair(&wrong_gateway, &workstation, "bundle-1"),
+            Err(WhonixPairPlanError::GatewayIdentityMismatch)
+        );
+        let absent = WhonixPairEvidence {
+            gateway_generation: String::new(),
+            ..evidence.clone()
+        };
+        assert_eq!(
+            validate_whonix_pair(&absent, &workstation, "bundle-1"),
+            Err(WhonixPairPlanError::GatewayNotConsistent)
+        );
+
+        let planned = WhonixPairSnapshot {
+            gateway: evidence.clone(),
+            workstation_overlay: "whonix-workstation-gen.qcow2".to_owned(),
+            workstation_base_digest: "workstation-digest".to_owned(),
+        };
+        assert!(revalidate_whonix_snapshot(&planned, &planned).is_ok());
+        for changed in [
+            {
+                let mut value = planned.clone();
+                value.gateway.gateway_generation = "gen-456".to_owned();
+                value
+            },
+            {
+                let mut value = planned.clone();
+                value.gateway.gateway_link.local_port = 7000;
+                value
+            },
+            {
+                let mut value = planned.clone();
+                value.gateway.gateway_domain_uuid = "uuid-456".to_owned();
+                value
+            },
+            {
+                let mut value = planned.clone();
+                value.gateway.gateway_link.pair_id = WhonixPairId::new("other-pair").unwrap();
+                value
+            },
+            {
+                let mut value = planned.clone();
+                value.gateway.bundle_identity = "bundle-2".to_owned();
+                value
+            },
+            {
+                let mut value = planned.clone();
+                value.workstation_overlay = "other-overlay.qcow2".to_owned();
+                value
+            },
+            {
+                let mut value = planned.clone();
+                value.workstation_base_digest = "other-digest".to_owned();
+                value
+            },
+        ] {
+            assert_eq!(
+                revalidate_whonix_snapshot(&planned, &changed),
+                Err(WhonixPairPlanError::SnapshotDrift)
+            );
+        }
+    }
+
+    #[test]
     fn luna_lab_uses_its_own_policy() {
         let profile = luna_lab_fedora();
         let plan = plan(&hardware(16, 32), &profile).unwrap();
@@ -807,6 +1093,7 @@ mod tests {
                 "fedora-lab",
                 "kali-lab",
                 "whonix-gateway",
+                "whonix-workstation",
                 "luna-dev-fedora",
                 "luna-lab-fedora"
             ]

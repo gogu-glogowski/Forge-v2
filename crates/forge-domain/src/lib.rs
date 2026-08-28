@@ -934,6 +934,57 @@ mod tests {
     }
 
     #[test]
+    fn whonix_workstation_profile_renders_only_complementary_udp_topology() {
+        let profile = forge_profiles::whonix_workstation();
+        let resources = forge_profiles::plan(
+            &forge_core::HardwareInfo {
+                cpu: forge_core::CpuInfo {
+                    model: "test".to_owned(),
+                    logical_cores: 8,
+                    virtualization: true,
+                },
+                memory_bytes: 16 * GIB,
+                gpus: vec![],
+                storage: vec![],
+                kvm: forge_core::KvmInfo {
+                    present: true,
+                    accessible: true,
+                },
+            },
+            &profile,
+        )
+        .unwrap();
+        let spec = profile_spec(
+            &profile,
+            &resources,
+            DomainMetadata {
+                name: "whonix-workstation".to_owned(),
+                disk_path: "/pool/whonix-workstation.qcow2".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(spec.network_interfaces.len(), 1);
+        assert!(matches!(
+            &spec.network_interfaces[0],
+            NetworkInterfaceSpec::UdpPointToPoint(link)
+                if link.endpoint == PointToPointEndpoint::Workstation
+                    && link.pair_id.as_str() == "whonix-main-pair"
+                    && link.local_port == 5577
+                    && link.remote_port == 6688
+        ));
+        assert!(!spec.guest_agent_required);
+        assert!(spec.channels.is_empty());
+        let xml = render_xml(&spec).unwrap();
+        assert_eq!(xml.matches("<interface").count(), 1);
+        assert!(xml.contains("<interface type='udp'>"));
+        assert!(xml.contains("port='6688'>"));
+        assert!(xml.contains("<local address='127.0.0.1' port='5577'/>"));
+        assert!(!xml.contains("type='user'"));
+        assert!(!xml.contains("type='network'"));
+        assert!(!xml.contains("source network='default'"));
+    }
+
+    #[test]
     fn manual_topology_change_is_typed_drift_not_absorbed() {
         let mut changed = spec();
         changed.network_interfaces[0] = NetworkInterfaceSpec::LibvirtNetwork {

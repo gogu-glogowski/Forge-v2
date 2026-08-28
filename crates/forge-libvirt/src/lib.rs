@@ -841,6 +841,18 @@ pub struct LibvirtBootBackend {
 }
 
 impl LibvirtBootBackend {
+    /// Reads the exact persistent domain XML without changing libvirt state.
+    /// Return the current domain XML without changing libvirt state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the libvirt error when the domain cannot be queried.
+    pub fn inspect_domain_xml(&self) -> Result<String, forge_provisioning::ProvisioningError> {
+        self.domain()?
+            .get_xml_desc(0)
+            .map_err(provisioning_backend_error)
+    }
+
     /// # Errors
     /// Returns an error when system libvirt is unavailable.
     pub fn connect_local() -> Result<Self, LibvirtError> {

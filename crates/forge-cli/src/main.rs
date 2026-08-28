@@ -2560,6 +2560,7 @@ fn plan_instance(profile_name: &str, instance_name: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+#[allow(clippy::too_many_lines)]
 fn create_vm_dry_run(profile_name: &str, instance_name: &str) -> ExitCode {
     let Some(profile) = forge_profiles::find(profile_name) else {
         eprintln!("unknown VM profile: {profile_name}");
@@ -2632,8 +2633,165 @@ fn create_vm_dry_run(profile_name: &str, instance_name: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if profile.kind == forge_core::GuestProfileKind::WhonixWorkstation {
+        let evidence = match workstation_pair_evidence() {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                eprintln!("Whonix pair planning refused: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        let forge_core::NetworkPolicy::WhonixWorkstation(workstation_link) =
+            &profile.network_policy
+        else {
+            unreachable!()
+        };
+        if let Err(error) = forge_profiles::validate_whonix_pair(
+            &evidence,
+            workstation_link,
+            &evidence.bundle_identity,
+        ) {
+            eprintln!("Whonix pair planning refused: {error}");
+            return ExitCode::from(1);
+        }
+        println!(
+            "Pair: Gateway {} generation {}, domain UUID {}, pair ID {}, endpoint 127.0.0.1:{} -> 127.0.0.1:{}",
+            evidence.gateway_instance,
+            evidence.gateway_generation,
+            evidence.gateway_domain_uuid,
+            evidence.gateway_link.pair_id,
+            evidence.gateway_link.local_port,
+            evidence.gateway_link.remote_port
+        );
+        println!("Shared bundle identity: {}", evidence.bundle_identity);
+        println!("Prepared base role: WorkstationDisk (same verified bundle provenance)");
+        println!("Workstation endpoint: 127.0.0.1:5577 -> 127.0.0.1:6688");
+        println!("Pair validation: exact complementary endpoints");
+        println!("Workstation uplink: none (no passt, NAT, bridge, or libvirt network)");
+    }
     print_create_plan(&plan, &domain);
     ExitCode::SUCCESS
+}
+
+fn workstation_pair_evidence() -> Result<forge_profiles::WhonixPairEvidence, String> {
+    let gateway = forge_profiles::whonix_gateway();
+    let layout = managed_state_layout_for(&InstanceName::new("whonix-gateway").unwrap())?;
+    let forge_state::ManagedState::Current(index) =
+        forge_state::inspect_layout(&layout).map_err(|error| error.to_string())?
+    else {
+        return Err("matching Gateway durable state is absent".to_owned());
+    };
+    let manifests = load_index_manifests(&layout, &index)?;
+    let active = active_manifest(&index, &manifests)?;
+    let backend = forge_libvirt::LibvirtBootBackend::connect_instance(
+        InstanceName::new("whonix-gateway").unwrap(),
+    )
+    .map_err(|error| error.to_string())?;
+    let observed = backend
+        .inspect_managed_state(active)
+        .map_err(|error| error.to_string())?;
+    let reconciliation = forge_state::reconcile_managed(&index, &manifests, &observed);
+    if reconciliation.status != forge_state::ManagedReconciliationStatus::Consistent {
+        return Err(format!(
+            "Gateway reconciliation is {:?}",
+            reconciliation.status
+        ));
+    }
+    let xml = backend
+        .inspect_domain_xml()
+        .map_err(|error| error.to_string())?;
+    let gateway_domain_uuid = xml
+        .split_once("<uuid>")
+        .and_then(|(_, rest)| rest.split_once("</uuid>"))
+        .map(|(uuid, _)| uuid.trim().to_owned())
+        .filter(|uuid| !uuid.is_empty())
+        .ok_or_else(|| "Gateway domain XML has no UUID".to_owned())?;
+    if xml.matches("<interface ").count() != 2
+        || !xml.contains("<interface type='user'>")
+        || !xml.contains("<backend type='passt'/>")
+        || !xml.contains("<interface type='udp'>")
+        || !xml.contains("<source address='127.0.0.1' port='5577'>")
+        || !xml.contains("<local address='127.0.0.1' port='6688'/>")
+        || xml.contains("source network='default'")
+        || xml.contains("<interface type='bridge'>")
+    {
+        return Err("Gateway domain topology is not the exact expected pair endpoint".to_owned());
+    }
+    let forge_core::NetworkPolicy::WhonixGateway(gateway_link) = gateway.network_policy else {
+        unreachable!()
+    };
+    let directories = forge_images::default_directories()
+        .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
+    let metadata = forge_images::read_whonix_verified_metadata(&directories)
+        .map_err(|error| error.to_string())?;
+    Ok(forge_profiles::WhonixPairEvidence {
+        gateway_instance: InstanceName::new("whonix-gateway").unwrap(),
+        gateway_generation: index.active_generation_id,
+        gateway_domain_uuid,
+        gateway_link,
+        bundle_identity: metadata.provenance.bundle_identity_sha256,
+    })
+}
+
+fn workstation_pair_snapshot(
+    factory: &forge_profiles::GenericCreatePlan,
+) -> Result<forge_profiles::WhonixPairSnapshot, String> {
+    let evidence = workstation_pair_evidence()?;
+    let forge_core::NetworkPolicy::WhonixWorkstation(workstation_link) = &factory.instance.network
+    else {
+        return Err("Workstation plan lost its typed UDP-only network policy".to_owned());
+    };
+    forge_profiles::validate_whonix_pair(&evidence, workstation_link, &evidence.bundle_identity)
+        .map_err(|error| error.to_string())?;
+    let directories = forge_images::default_directories()
+        .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
+    let metadata = forge_images::read_whonix_verified_metadata(&directories)
+        .map_err(|error| error.to_string())?;
+    let workstation_base_digest = forge_images::whonix_artifact_digest(
+        &metadata.provenance,
+        forge_images::BundleArtifactRole::WorkstationDisk,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(forge_profiles::WhonixPairSnapshot {
+        gateway: evidence,
+        workstation_overlay: factory.generation.overlay.clone(),
+        workstation_base_digest,
+    })
+}
+
+fn require_workstation_targets_absent(
+    factory: &forge_profiles::GenericCreatePlan,
+) -> Result<(), String> {
+    use forge_storage::{DefineBackend, ImagePrepareBackend};
+    let instance = &factory.instance.identity.name;
+    let layout = managed_state_layout_for(instance)?;
+    if !matches!(
+        forge_state::inspect_layout(&layout).map_err(|error| error.to_string())?,
+        forge_state::ManagedState::Missing
+    ) {
+        return Err("Workstation durable target identity already exists".to_owned());
+    }
+    let mut backend =
+        forge_libvirt::LibvirtDefineBackend::connect_local().map_err(|error| error.to_string())?;
+    if DefineBackend::domain_exists(&mut backend, instance.as_str())
+        .map_err(|error| error.to_string())?
+    {
+        return Err("Workstation domain target identity already exists".to_owned());
+    }
+    for volume in [
+        factory.prepared_base.base_volume_name.as_str(),
+        factory.generation.overlay.as_str(),
+    ] {
+        if ImagePrepareBackend::inspect_volume(&mut backend, forge_storage::DEFAULT_POOL, volume)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err(format!(
+                "Workstation volume target identity already exists: {volume}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn print_create_plan(plan: &forge_profiles::GenericCreatePlan, domain: &forge_domain::DomainSpec) {
@@ -2726,13 +2884,28 @@ fn validate_preparation_strategy(
             ImageVerificationPolicy::KaliDetachedSignedSha256Sums,
             SourceImageFormat::SevenZipQcow2Archive,
             PrepareBaseStrategy::SevenZipSingleQcow2,
-        )
-        | (
-            ImageSourcePolicy::WhonixLibvirtBundle { .. },
+        ) => Ok(plan.preparation),
+        (
+            ImageSourcePolicy::WhonixLibvirtBundle { release },
             ImageVerificationPolicy::WhonixDetachedOpenPgp,
             SourceImageFormat::TarXzMultiArtifactBundle,
             PrepareBaseStrategy::WhonixBundleGateway,
-        ) => Ok(plan.preparation),
+        ) if release == forge_images::WHONIX_RELEASE
+            && plan.base_volume_name == format!("forge-base-whonix-gateway-{release}.qcow2") =>
+        {
+            Ok(plan.preparation)
+        }
+        (
+            ImageSourcePolicy::WhonixLibvirtBundle { release },
+            ImageVerificationPolicy::WhonixDetachedOpenPgp,
+            SourceImageFormat::TarXzMultiArtifactBundle,
+            PrepareBaseStrategy::WhonixBundleWorkstation,
+        ) if release == forge_images::WHONIX_RELEASE
+            && plan.base_volume_name
+                == format!("forge-base-whonix-workstation-{release}.qcow2") =>
+        {
+            Ok(plan.preparation)
+        }
         _ => Err("unsupported or incoherent image preparation strategy".to_owned()),
     }
 }
@@ -2750,6 +2923,14 @@ fn acquire_prepared_base(
         }
         forge_profiles::PrepareBaseStrategy::WhonixBundleGateway => {
             forge_images::fetch_whonix_gateway(
+                &directories,
+                &mut forge_images::SystemArtifactFetcher,
+            )
+            .map_err(|error| error.to_string())?
+            .prepared_qcow2_path
+        }
+        forge_profiles::PrepareBaseStrategy::WhonixBundleWorkstation => {
+            forge_images::prepare_whonix_workstation(
                 &directories,
                 &mut forge_images::SystemArtifactFetcher,
             )
@@ -2782,6 +2963,13 @@ fn prove_prepared_base(plan: &forge_profiles::PreparedBaseImagePlan) -> Result<(
         forge_profiles::PrepareBaseStrategy::WhonixBundleGateway => {
             forge_images::verified_whonix_gateway(&directories).map(|_| ())
         }
+        forge_profiles::PrepareBaseStrategy::WhonixBundleWorkstation => {
+            forge_images::revalidate_whonix_workstation(
+                &directories,
+                &mut forge_images::SystemArtifactFetcher,
+            )
+            .map(|_| ())
+        }
         forge_profiles::PrepareBaseStrategy::VerifiedQcow2 => {
             return Err("verified direct-qcow2 real create is not implemented".to_owned());
         }
@@ -2795,6 +2983,7 @@ struct ManualGuestCreateBackend {
     domain_uuid: String,
     source: PreparedBaseArtifact,
     layout: forge_state::StateLayout,
+    workstation_pair_snapshot: Option<forge_profiles::WhonixPairSnapshot>,
     base_created: bool,
     overlay_created: bool,
 }
@@ -2805,15 +2994,23 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
         plan: &forge_storage::GenericCreateExecutionPlan,
     ) -> Result<(), String> {
         use forge_storage::{DefineBackend, ImagePrepareBackend};
+        if let Some(planned) = &self.workstation_pair_snapshot {
+            let current = workstation_pair_snapshot(&plan.factory)?;
+            forge_profiles::revalidate_whonix_snapshot(planned, &current)
+                .map_err(|error| error.to_string())?;
+        }
         if !matches!(
             forge_state::inspect_layout(&self.layout).map_err(|error| error.to_string())?,
             forge_state::ManagedState::Missing
         ) || DefineBackend::domain_exists(&mut self.storage, self.instance.as_str())
             .map_err(|error| error.to_string())?
-            || !self
+            || (matches!(
+                plan.factory.instance.network,
+                forge_core::NetworkPolicy::DefaultNat
+            ) && !self
                 .storage
                 .default_network_active()
-                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?)
         {
             return Err("domain, state, or default network precondition changed".to_owned());
         }
@@ -2978,7 +3175,10 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
 }
 
 fn create_vm(profile_name: &str, instance_name: &str) -> ExitCode {
-    if !matches!(profile_name, "kali-lab" | "whonix-gateway") {
+    if !matches!(
+        profile_name,
+        "kali-lab" | "whonix-gateway" | "whonix-workstation"
+    ) {
         eprintln!("real generic create is unavailable for this profile's image strategy");
         return ExitCode::from(2);
     }
@@ -3027,6 +3227,18 @@ fn execute_manual_guest_create(
         .map_err(|error| error.to_string())?;
     let factory = forge_profiles::plan_create(instance_plan, generation)
         .map_err(|error| error.to_string())?;
+    let workstation_pair_snapshot =
+        if profile.kind == forge_core::GuestProfileKind::WhonixWorkstation {
+            let planned = workstation_pair_snapshot(&factory)?;
+            require_workstation_targets_absent(&factory)?;
+            let current = workstation_pair_snapshot(&factory)?;
+            forge_profiles::revalidate_whonix_snapshot(&planned, &current)
+                .map_err(|error| error.to_string())?;
+            require_workstation_targets_absent(&factory)?;
+            Some(planned)
+        } else {
+            None
+        };
     let source = acquire_prepared_base(&factory.prepared_base)?;
     if source.capacity_bytes > factory.instance.resources.disk_bytes {
         return Err("prepared source capacity exceeds the profile disk policy".to_owned());
@@ -3062,6 +3274,7 @@ fn execute_manual_guest_create(
         domain_uuid,
         source,
         layout,
+        workstation_pair_snapshot,
         base_created: false,
         overlay_created: false,
     };
@@ -3238,7 +3451,7 @@ mod tests {
             validate_preparation_strategy(&kali).unwrap(),
             PrepareBaseStrategy::SevenZipSingleQcow2
         );
-        let whonix = prepared_plan(
+        let mut whonix = prepared_plan(
             ImageSourcePolicy::WhonixLibvirtBundle {
                 release: "18.2.1.9".to_owned(),
             },
@@ -3246,10 +3459,20 @@ mod tests {
             SourceImageFormat::TarXzMultiArtifactBundle,
             PrepareBaseStrategy::WhonixBundleGateway,
         );
+        whonix.base_volume_name = "forge-base-whonix-gateway-18.2.1.9.qcow2".to_owned();
         assert_eq!(
             validate_preparation_strategy(&whonix).unwrap(),
             PrepareBaseStrategy::WhonixBundleGateway
         );
+        let mut workstation = whonix.clone();
+        workstation.preparation = PrepareBaseStrategy::WhonixBundleWorkstation;
+        workstation.base_volume_name = "forge-base-whonix-workstation-18.2.1.9.qcow2".to_owned();
+        assert_eq!(
+            validate_preparation_strategy(&workstation).unwrap(),
+            PrepareBaseStrategy::WhonixBundleWorkstation
+        );
+        workstation.preparation = PrepareBaseStrategy::WhonixBundleGateway;
+        assert!(validate_preparation_strategy(&workstation).is_err());
     }
 
     #[test]

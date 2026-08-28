@@ -224,6 +224,7 @@ pub enum InstanceKind {
     Lab,
     Development,
     NetworkProvider,
+    NetworkConsumer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
