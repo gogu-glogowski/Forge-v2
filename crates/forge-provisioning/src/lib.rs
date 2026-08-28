@@ -239,7 +239,7 @@ pub fn plan_instance_lifecycle(
             persistence: profile.persistence,
             disk_bytes: profile.resources.disk_bytes,
             provisioning: profile.provisioning.clone(),
-            network: profile.network_policy,
+            network: profile.network_policy.clone(),
             expected_base_capacity: None,
             reconciliation: if reconciled {
                 ReconciliationEvidence::Consistent

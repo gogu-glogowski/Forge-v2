@@ -376,7 +376,7 @@ pub fn plan_instance(
         },
         provisioning: profile.provisioning.clone(),
         first_boot_success: profile.first_boot_success.clone(),
-        network: profile.network_policy,
+        network: profile.network_policy.clone(),
         graphics: profile.graphics_policy,
         lifecycle,
     })
@@ -510,6 +510,8 @@ pub fn plan(
         network: match profile.network_policy {
             NetworkPolicy::DefaultNat => NetworkMode::Nat,
             NetworkPolicy::Isolated => NetworkMode::Isolated,
+            NetworkPolicy::WhonixGateway(_) => NetworkMode::WhonixGateway,
+            NetworkPolicy::WhonixWorkstation(_) => NetworkMode::WhonixWorkstation,
         },
         gpu: match profile.graphics_policy {
             GraphicsPolicy::Virtual => GpuMode::Virtual,

@@ -2326,7 +2326,7 @@ fn print_define_plan(plan: &forge_storage::DefinePlan) {
     );
     println!("Disk: {} GiB", plan.capacity_bytes / 1024 / 1024 / 1024);
     println!("Storage pool: {}", plan.pool.name);
-    println!("Network: {}", plan.spec.network_interfaces[0].mode);
+    println!("Network: {}", plan.spec.network_interfaces[0]);
     println!("GPU: virtual");
 }
 

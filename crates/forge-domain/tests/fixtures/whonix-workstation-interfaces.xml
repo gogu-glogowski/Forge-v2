@@ -1,0 +1,8 @@
+<devices>
+  <interface type='udp'>
+    <source address='127.0.0.1' port='6688'>
+      <local address='127.0.0.1' port='5577'/>
+    </source>
+    <model type='virtio'/>
+  </interface>
+</devices>

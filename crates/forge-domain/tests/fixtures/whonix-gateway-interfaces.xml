@@ -1,0 +1,12 @@
+<devices>
+  <interface type='user'>
+    <backend type='passt'/>
+    <model type='virtio'/>
+  </interface>
+  <interface type='udp'>
+    <source address='127.0.0.1' port='5577'>
+      <local address='127.0.0.1' port='6688'/>
+    </source>
+    <model type='virtio'/>
+  </interface>
+</devices>

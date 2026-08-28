@@ -60,6 +60,15 @@ macro_rules! identity_type {
 identity_type!(ProfileId);
 identity_type!(InstanceName);
 
+/// Stable identity of one upstream-style Gateway/Workstation pair.
+///
+/// It is deliberately independent from either domain name so topology checks
+/// do not infer trust from mutable libvirt names.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WhonixPairId(String);
+
+identity_type!(WhonixPairId);
+
 impl fmt::Display for IdentityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -170,7 +179,8 @@ pub enum NetworkMode {
     Nat,
     Isolated,
     NoNetwork,
-    WhonixInternal,
+    WhonixGateway,
+    WhonixWorkstation,
 }
 
 impl fmt::Display for NetworkMode {
@@ -179,7 +189,8 @@ impl fmt::Display for NetworkMode {
             Self::Nat => "nat",
             Self::Isolated => "isolated",
             Self::NoNetwork => "none",
-            Self::WhonixInternal => "whonix-internal",
+            Self::WhonixGateway => "whonix-gateway",
+            Self::WhonixWorkstation => "whonix-workstation",
         };
         formatter.write_str(value)
     }
@@ -286,9 +297,60 @@ pub enum FirstBootSuccessPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointToPointEndpoint {
+    Gateway,
+    Workstation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpPointToPointLink {
+    pub pair_id: WhonixPairId,
+    pub endpoint: PointToPointEndpoint,
+    pub local_port: u16,
+    pub remote_port: u16,
+}
+
+impl UdpPointToPointLink {
+    /// Returns the exact complementary endpoint without deriving identity from
+    /// a domain name.
+    #[must_use]
+    pub fn complement(&self) -> Self {
+        Self {
+            pair_id: self.pair_id.clone(),
+            endpoint: match self.endpoint {
+                PointToPointEndpoint::Gateway => PointToPointEndpoint::Workstation,
+                PointToPointEndpoint::Workstation => PointToPointEndpoint::Gateway,
+            },
+            local_port: self.remote_port,
+            remote_port: self.local_port,
+        }
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.local_port != 0 && self.remote_port != 0 && self.local_port != self.remote_port
+    }
+
+    #[must_use]
+    pub fn is_complementary_to(&self, other: &Self) -> bool {
+        self.is_valid()
+            && other.is_valid()
+            && self.pair_id == other.pair_id
+            && self.endpoint != other.endpoint
+            && self.local_port == other.remote_port
+            && self.remote_port == other.local_port
+    }
+}
+
+/// Profile-owned topology. Whonix variants encode the exact upstream
+/// attachment set: Gateway has a passt uplink plus one UDP link; Workstation
+/// has only the complementary UDP link.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkPolicy {
     DefaultNat,
     Isolated,
+    WhonixGateway(UdpPointToPointLink),
+    WhonixWorkstation(UdpPointToPointLink),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,6 +461,42 @@ mod identity_tests {
             InstanceName::new("Fedora Lab"),
             Err(IdentityError::InvalidCharacter)
         );
+    }
+
+    #[test]
+    fn whonix_pair_endpoints_are_typed_and_exactly_complementary() {
+        let gateway = UdpPointToPointLink {
+            pair_id: WhonixPairId::new("privacy-pair-one").unwrap(),
+            endpoint: PointToPointEndpoint::Gateway,
+            local_port: 6688,
+            remote_port: 5577,
+        };
+        let workstation = gateway.complement();
+        assert!(gateway.is_complementary_to(&workstation));
+
+        let mut wrong_pair = workstation.clone();
+        wrong_pair.pair_id = WhonixPairId::new("privacy-pair-two").unwrap();
+        assert!(!gateway.is_complementary_to(&wrong_pair));
+
+        let mut wrong_ports = workstation;
+        wrong_ports.remote_port = 7788;
+        assert!(!gateway.is_complementary_to(&wrong_ports));
+    }
+
+    #[test]
+    fn point_to_point_ports_must_be_distinct_and_nonzero() {
+        let pair_id = WhonixPairId::new("privacy-pair").unwrap();
+        for (local_port, remote_port) in [(0, 5577), (6688, 0), (6688, 6688)] {
+            assert!(
+                !UdpPointToPointLink {
+                    pair_id: pair_id.clone(),
+                    endpoint: PointToPointEndpoint::Gateway,
+                    local_port,
+                    remote_port,
+                }
+                .is_valid()
+            );
+        }
     }
 }
 

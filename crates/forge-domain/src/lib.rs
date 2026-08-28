@@ -2,7 +2,7 @@
 
 use forge_core::{
     FirmwareMachinePolicy, GpuMode, GraphicsPolicy, GuestProfileKind, NetworkMode, NetworkPolicy,
-    ProvisioningPolicy, VmProfile, VmResourcePlan,
+    PointToPointEndpoint, ProvisioningPolicy, UdpPointToPointLink, VmProfile, VmResourcePlan,
 };
 use std::fmt;
 
@@ -55,9 +55,30 @@ pub struct DiskSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetworkInterfaceSpec {
-    pub mode: NetworkMode,
-    pub source_network: String,
+pub enum NetworkInterfaceSpec {
+    LibvirtNetwork {
+        mode: NetworkMode,
+        source_network: String,
+    },
+    PasstUplink,
+    UdpPointToPoint(UdpPointToPointLink),
+}
+
+impl fmt::Display for NetworkInterfaceSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LibvirtNetwork {
+                mode,
+                source_network,
+            } => write!(formatter, "{mode}:{source_network}"),
+            Self::PasstUplink => formatter.write_str("passt-uplink"),
+            Self::UdpPointToPoint(link) => write!(
+                formatter,
+                "udp-p2p:{}:{}->{}",
+                link.pair_id, link.local_port, link.remote_port
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,15 +199,32 @@ pub fn profile_spec(
     plan: &VmResourcePlan,
     metadata: DomainMetadata,
 ) -> Result<DomainSpec, DomainSpecError> {
+    let topology_role_valid = match profile.kind {
+        GuestProfileKind::WhonixGateway => {
+            matches!(profile.network_policy, NetworkPolicy::WhonixGateway(_))
+        }
+        GuestProfileKind::WhonixWorkstation => {
+            matches!(profile.network_policy, NetworkPolicy::WhonixWorkstation(_))
+        }
+        _ => !matches!(
+            profile.network_policy,
+            NetworkPolicy::WhonixGateway(_) | NetworkPolicy::WhonixWorkstation(_)
+        ),
+    };
+    if !topology_role_valid {
+        return Err(DomainSpecError::NetworkPolicyMismatch);
+    }
     let expected_gpu = match profile.graphics_policy {
         GraphicsPolicy::Virtual => GpuMode::Virtual,
     };
     if plan.gpu != expected_gpu {
         return Err(DomainSpecError::GpuPolicyMismatch);
     }
-    let expected_network = match profile.network_policy {
+    let expected_network = match &profile.network_policy {
         NetworkPolicy::DefaultNat => NetworkMode::Nat,
         NetworkPolicy::Isolated => NetworkMode::Isolated,
+        NetworkPolicy::WhonixGateway(_) => NetworkMode::WhonixGateway,
+        NetworkPolicy::WhonixWorkstation(_) => NetworkMode::WhonixWorkstation,
     };
     if plan.network != expected_network {
         return Err(DomainSpecError::NetworkPolicyMismatch);
@@ -198,12 +236,19 @@ pub fn profile_spec(
         return Err(DomainSpecError::InvalidDiskPath);
     }
 
-    let network_interfaces = match profile.network_policy {
-        NetworkPolicy::DefaultNat => vec![NetworkInterfaceSpec {
+    let network_interfaces = match &profile.network_policy {
+        NetworkPolicy::DefaultNat => vec![NetworkInterfaceSpec::LibvirtNetwork {
             mode: NetworkMode::Nat,
             source_network: "default".to_owned(),
         }],
         NetworkPolicy::Isolated => vec![],
+        NetworkPolicy::WhonixGateway(link) => vec![
+            NetworkInterfaceSpec::PasstUplink,
+            NetworkInterfaceSpec::UdpPointToPoint(link.clone()),
+        ],
+        NetworkPolicy::WhonixWorkstation(link) => {
+            vec![NetworkInterfaceSpec::UdpPointToPoint(link.clone())]
+        }
     };
     let guest_agent_required = matches!(
         profile.provisioning,
@@ -241,7 +286,7 @@ pub fn profile_spec(
             capacity_bytes: plan.disk_bytes,
         }],
         network_interfaces,
-        network_policy: profile.network_policy,
+        network_policy: profile.network_policy.clone(),
         channels,
         guest_agent_required,
         graphics: GraphicsMode::Virtual,
@@ -300,13 +345,31 @@ pub fn validate(spec: &DomainSpec) -> Result<(), DomainSpecError> {
     {
         return Err(DomainSpecError::InvalidDisk);
     }
-    let network_valid = match spec.network_policy {
+    let network_valid = match &spec.network_policy {
         NetworkPolicy::DefaultNat => {
             spec.network_interfaces.len() == 1
-                && spec.network_interfaces[0].mode == NetworkMode::Nat
-                && spec.network_interfaces[0].source_network == "default"
+                && matches!(
+                    &spec.network_interfaces[0],
+                    NetworkInterfaceSpec::LibvirtNetwork { mode: NetworkMode::Nat, source_network }
+                        if source_network == "default"
+                )
         }
         NetworkPolicy::Isolated => spec.network_interfaces.is_empty(),
+        NetworkPolicy::WhonixGateway(expected) => {
+            expected.endpoint == PointToPointEndpoint::Gateway
+                && expected.is_valid()
+                && spec.network_interfaces
+                    == [
+                        NetworkInterfaceSpec::PasstUplink,
+                        NetworkInterfaceSpec::UdpPointToPoint(expected.clone()),
+                    ]
+        }
+        NetworkPolicy::WhonixWorkstation(expected) => {
+            expected.endpoint == PointToPointEndpoint::Workstation
+                && expected.is_valid()
+                && spec.network_interfaces
+                    == [NetworkInterfaceSpec::UdpPointToPoint(expected.clone())]
+        }
     };
     if !network_valid {
         return Err(DomainSpecError::NetworkPolicyMismatch);
@@ -386,10 +449,34 @@ pub fn render_xml(spec: &DomainSpec) -> Result<String, DomainSpecError> {
     xml.line(3, "<target dev='vda' bus='virtio'/>");
     xml.line(2, "</disk>");
     for network in &spec.network_interfaces {
-        xml.line(2, "<interface type='network'>");
-        xml.empty_element_with_attr(3, "source", "network", &network.source_network);
-        xml.line(3, "<model type='virtio'/>");
-        xml.line(2, "</interface>");
+        match network {
+            NetworkInterfaceSpec::LibvirtNetwork { source_network, .. } => {
+                xml.line(2, "<interface type='network'>");
+                xml.empty_element_with_attr(3, "source", "network", source_network);
+                xml.line(3, "<model type='virtio'/>");
+                xml.line(2, "</interface>");
+            }
+            NetworkInterfaceSpec::PasstUplink => {
+                xml.line(2, "<interface type='user'>");
+                xml.line(3, "<backend type='passt'/>");
+                xml.line(3, "<model type='virtio'/>");
+                xml.line(2, "</interface>");
+            }
+            NetworkInterfaceSpec::UdpPointToPoint(link) => {
+                xml.line(2, "<interface type='udp'>");
+                xml.line(
+                    3,
+                    &format!("<source address='127.0.0.1' port='{}'>", link.remote_port),
+                );
+                xml.line(
+                    4,
+                    &format!("<local address='127.0.0.1' port='{}'/>", link.local_port),
+                );
+                xml.line(3, "</source>");
+                xml.line(3, "<model type='virtio'/>");
+                xml.line(2, "</interface>");
+            }
+        }
     }
     for channel in &spec.channels {
         xml.line(2, "<channel type='unix'>");
@@ -463,11 +550,15 @@ mod tests {
     use super::*;
     use forge_core::{
         FirmwareMachinePolicy, GraphicsPolicy, GuestArchitecture, GuestFamily, ImageSourcePolicy,
-        ImageVerificationPolicy, NetworkPolicy, PersistencePolicy, ProfileId, ProvisioningPolicy,
-        VmResources,
+        ImageVerificationPolicy, NetworkPolicy, PersistencePolicy, PointToPointEndpoint, ProfileId,
+        ProvisioningPolicy, UdpPointToPointLink, VmResources, WhonixPairId,
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
+    const UPSTREAM_GATEWAY_INTERFACES: &str =
+        include_str!("../tests/fixtures/whonix-gateway-interfaces.xml");
+    const UPSTREAM_WORKSTATION_INTERFACES: &str =
+        include_str!("../tests/fixtures/whonix-workstation-interfaces.xml");
 
     fn profile() -> VmProfile {
         VmProfile {
@@ -515,6 +606,52 @@ mod tests {
             network: NetworkMode::Nat,
             gpu: GpuMode::Virtual,
         }
+    }
+
+    fn whonix_link(endpoint: PointToPointEndpoint) -> UdpPointToPointLink {
+        let gateway = UdpPointToPointLink {
+            pair_id: WhonixPairId::new("whonix-pair-one").unwrap(),
+            endpoint: PointToPointEndpoint::Gateway,
+            local_port: 6688,
+            remote_port: 5577,
+        };
+        match endpoint {
+            PointToPointEndpoint::Gateway => gateway,
+            PointToPointEndpoint::Workstation => gateway.complement(),
+        }
+    }
+
+    fn whonix_spec(endpoint: PointToPointEndpoint) -> DomainSpec {
+        let mut profile = profile();
+        profile.provisioning = ProvisioningPolicy::None;
+        profile.kind = match endpoint {
+            PointToPointEndpoint::Gateway => GuestProfileKind::WhonixGateway,
+            PointToPointEndpoint::Workstation => GuestProfileKind::WhonixWorkstation,
+        };
+        profile.network_policy = match endpoint {
+            PointToPointEndpoint::Gateway => NetworkPolicy::WhonixGateway(whonix_link(endpoint)),
+            PointToPointEndpoint::Workstation => {
+                NetworkPolicy::WhonixWorkstation(whonix_link(endpoint))
+            }
+        };
+        let mut resources = plan();
+        resources.network = match endpoint {
+            PointToPointEndpoint::Gateway => NetworkMode::WhonixGateway,
+            PointToPointEndpoint::Workstation => NetworkMode::WhonixWorkstation,
+        };
+        profile_spec(
+            &profile,
+            &resources,
+            DomainMetadata {
+                name: match endpoint {
+                    PointToPointEndpoint::Gateway => "gateway-test",
+                    PointToPointEndpoint::Workstation => "workstation-test",
+                }
+                .to_owned(),
+                disk_path: "/pool/whonix.qcow2".to_owned(),
+            },
+        )
+        .unwrap()
     }
 
     fn spec() -> DomainSpec {
@@ -744,9 +881,107 @@ mod tests {
     #[test]
     fn manual_topology_change_is_typed_drift_not_absorbed() {
         let mut changed = spec();
-        changed.network_interfaces[0].source_network = "manually-edited".to_owned();
+        changed.network_interfaces[0] = NetworkInterfaceSpec::LibvirtNetwork {
+            mode: NetworkMode::Nat,
+            source_network: "manually-edited".to_owned(),
+        };
         assert_eq!(
             validate(&changed),
+            Err(DomainSpecError::NetworkPolicyMismatch)
+        );
+    }
+
+    #[test]
+    fn upstream_gateway_fixture_has_passt_then_exact_udp_link() {
+        let spec = whonix_spec(PointToPointEndpoint::Gateway);
+        assert_eq!(
+            spec.network_interfaces,
+            [
+                NetworkInterfaceSpec::PasstUplink,
+                NetworkInterfaceSpec::UdpPointToPoint(whonix_link(PointToPointEndpoint::Gateway)),
+            ]
+        );
+        let xml = render_xml(&spec).unwrap();
+        assert!(UPSTREAM_GATEWAY_INTERFACES.contains("<interface type='user'>"));
+        assert!(UPSTREAM_GATEWAY_INTERFACES.contains("port='5577'>"));
+        assert!(UPSTREAM_GATEWAY_INTERFACES.contains("port='6688'/>"));
+        assert!(xml.contains("<interface type='user'>\n      <backend type='passt'/>"));
+        assert!(xml.contains(
+            "<interface type='udp'>\n      <source address='127.0.0.1' port='5577'>\n        <local address='127.0.0.1' port='6688'/>"
+        ));
+        assert!(!xml.contains("source network='default'"));
+    }
+
+    #[test]
+    fn upstream_workstation_fixture_is_complementary_and_has_no_uplink() {
+        let gateway = whonix_link(PointToPointEndpoint::Gateway);
+        let workstation = whonix_spec(PointToPointEndpoint::Workstation);
+        let NetworkInterfaceSpec::UdpPointToPoint(workstation_link) =
+            &workstation.network_interfaces[0]
+        else {
+            panic!("workstation must have exactly one UDP point-to-point link");
+        };
+        assert!(gateway.is_complementary_to(workstation_link));
+        let xml = render_xml(&workstation).unwrap();
+        assert!(!UPSTREAM_WORKSTATION_INTERFACES.contains("type='user'"));
+        assert!(UPSTREAM_WORKSTATION_INTERFACES.contains("port='6688'>"));
+        assert!(UPSTREAM_WORKSTATION_INTERFACES.contains("port='5577'/>"));
+        assert_eq!(xml.matches("<interface").count(), 1);
+        assert!(xml.contains("port='6688'>\n        <local address='127.0.0.1' port='5577'/"));
+        assert!(!xml.contains("type='user'"));
+        assert!(!xml.contains("type='network'"));
+    }
+
+    #[test]
+    fn whonix_topology_drift_and_extra_interfaces_are_refused() {
+        let mut changed_ports = whonix_spec(PointToPointEndpoint::Gateway);
+        changed_ports.network_interfaces[1] =
+            NetworkInterfaceSpec::UdpPointToPoint(UdpPointToPointLink {
+                remote_port: 7788,
+                ..whonix_link(PointToPointEndpoint::Gateway)
+            });
+        assert_eq!(
+            validate(&changed_ports),
+            Err(DomainSpecError::NetworkPolicyMismatch)
+        );
+
+        let mut wrong_transport = whonix_spec(PointToPointEndpoint::Gateway);
+        wrong_transport.network_interfaces[1] = NetworkInterfaceSpec::LibvirtNetwork {
+            mode: NetworkMode::Nat,
+            source_network: "default".to_owned(),
+        };
+        assert_eq!(
+            validate(&wrong_transport),
+            Err(DomainSpecError::NetworkPolicyMismatch)
+        );
+
+        let mut extra = whonix_spec(PointToPointEndpoint::Workstation);
+        extra
+            .network_interfaces
+            .push(NetworkInterfaceSpec::PasstUplink);
+        assert_eq!(
+            validate(&extra),
+            Err(DomainSpecError::NetworkPolicyMismatch)
+        );
+
+        let mut nat_fallback = whonix_spec(PointToPointEndpoint::Workstation);
+        nat_fallback.network_policy = NetworkPolicy::DefaultNat;
+        assert_eq!(
+            validate(&nat_fallback),
+            Err(DomainSpecError::NetworkPolicyMismatch)
+        );
+
+        let mut workstation_profile = profile();
+        workstation_profile.kind = GuestProfileKind::WhonixWorkstation;
+        assert_eq!(
+            profile_spec(
+                &workstation_profile,
+                &plan(),
+                DomainMetadata {
+                    name: "workstation-with-nat".to_owned(),
+                    disk_path: "/pool/whonix.qcow2".to_owned(),
+                }
+            ),
             Err(DomainSpecError::NetworkPolicyMismatch)
         );
     }
