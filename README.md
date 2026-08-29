@@ -1,5 +1,8 @@
 # Forge-v2
 
+> 🎧 **If you're reading my code, press play.**  
+> [Open the code soundtrack](https://gogu-glogowski.github.io/Forge-v2/)
+
 Minimalny fundament narzędzia do oceny gotowości Fedory Workstation jako hosta
 izolowanych maszyn KVM/QEMU/libvirt.
 
