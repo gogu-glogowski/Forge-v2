@@ -4,8 +4,9 @@ use forge_core::{
 use forge_provisioning::{BootBackend, RebuildBackend};
 use std::env;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() -> ExitCode {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
@@ -71,6 +72,8 @@ fn main() -> ExitCode {
         ["image", "list"] => image_list(),
         ["image", "inspect", "fedora"] => image_inspect(),
         ["image", "fetch", "fedora"] => image_fetch(),
+        ["image", "recover", "whonix-workstation", "--dry-run"] => recover_whonix_workstation(true),
+        ["image", "recover", "whonix-workstation"] => recover_whonix_workstation(false),
         _ => {
             print_usage();
             ExitCode::from(2)
@@ -2229,6 +2232,56 @@ fn image_fetch() -> ExitCode {
     }
 }
 
+fn recover_whonix_workstation(dry_run: bool) -> ExitCode {
+    let Ok(directories) = image_directories() else {
+        return ExitCode::from(2);
+    };
+    let plan = match forge_images::plan_whonix_workstation_recovery(&directories) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("Workstation preparation recovery refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    println!("State: Preparing (pre-publication)");
+    println!("Intent: {}", plan.intent_path.display());
+    println!(
+        "Controlled extraction root: {}",
+        plan.extraction_root.display()
+    );
+    println!(
+        "Extracted Workstation artifact: {}",
+        plan.extracted_workstation_path.display()
+    );
+    println!("Prepared destination: absent");
+    println!("Published metadata: absent");
+    println!(
+        "Recovery mutation: remove exact controlled root, sync downloads, remove intent, sync images"
+    );
+    if dry_run {
+        println!("Mode: recovery dry-run (zero mutation)");
+        return ExitCode::SUCCESS;
+    }
+    eprint!("Execute exact Workstation preparation cleanup? [y/N] ");
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err()
+        || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    {
+        eprintln!("Recovery cancelled.");
+        return ExitCode::SUCCESS;
+    }
+    match forge_images::execute_whonix_workstation_recovery(&directories, &plan) {
+        Ok(()) => {
+            println!("Workstation preparation state: Missing");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Workstation preparation recovery failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn print_image_metadata(metadata: &forge_images::ImageMetadata) {
     println!("Distro: {}", metadata.distro);
     println!("Release: {}", metadata.release);
@@ -2866,6 +2919,7 @@ struct PreparedBaseArtifact {
     path: std::path::PathBuf,
     file_bytes: u64,
     capacity_bytes: u64,
+    whonix_workstation_proof: Option<forge_images::WhonixWorkstationExecuteProof>,
 }
 
 fn validate_preparation_strategy(
@@ -2913,29 +2967,34 @@ fn validate_preparation_strategy(
 fn acquire_prepared_base(
     plan: &forge_profiles::PreparedBaseImagePlan,
 ) -> Result<PreparedBaseArtifact, String> {
+    let started = Instant::now();
+    eprintln!("[forge] phase start: prepared-base cryptographic validation");
     let directories = forge_images::default_directories()
         .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
-    let path = match validate_preparation_strategy(plan)? {
+    let (path, whonix_workstation_proof) = match validate_preparation_strategy(plan)? {
         forge_profiles::PrepareBaseStrategy::SevenZipSingleQcow2 => {
-            forge_images::fetch_kali(&directories, &mut forge_images::SystemArtifactFetcher)
-                .map_err(|error| error.to_string())?
-                .prepared_qcow2_path
+            let path =
+                forge_images::fetch_kali(&directories, &mut forge_images::SystemArtifactFetcher)
+                    .map_err(|error| error.to_string())?
+                    .prepared_qcow2_path;
+            (path, None)
         }
         forge_profiles::PrepareBaseStrategy::WhonixBundleGateway => {
-            forge_images::fetch_whonix_gateway(
+            let path = forge_images::fetch_whonix_gateway(
                 &directories,
                 &mut forge_images::SystemArtifactFetcher,
             )
             .map_err(|error| error.to_string())?
-            .prepared_qcow2_path
+            .prepared_qcow2_path;
+            (path, None)
         }
         forge_profiles::PrepareBaseStrategy::WhonixBundleWorkstation => {
-            forge_images::prepare_whonix_workstation(
+            let (metadata, proof) = forge_images::prepare_whonix_workstation_for_execute(
                 &directories,
                 &mut forge_images::SystemArtifactFetcher,
             )
-            .map_err(|error| error.to_string())?
-            .prepared_qcow2_path
+            .map_err(|error| error.to_string())?;
+            (metadata.prepared_qcow2_path, Some(proof))
         }
         forge_profiles::PrepareBaseStrategy::VerifiedQcow2 => {
             return Err("verified direct-qcow2 real create is not implemented".to_owned());
@@ -2946,14 +3005,23 @@ fn acquire_prepared_base(
         .len();
     let capacity_bytes =
         forge_images::qcow2_virtual_size(&path).map_err(|error| error.to_string())?;
-    Ok(PreparedBaseArtifact {
+    let artifact = PreparedBaseArtifact {
         path,
         file_bytes,
         capacity_bytes,
-    })
+        whonix_workstation_proof,
+    };
+    eprintln!(
+        "[forge] phase done: prepared-base cryptographic validation elapsed={:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(artifact)
 }
 
-fn prove_prepared_base(plan: &forge_profiles::PreparedBaseImagePlan) -> Result<(), String> {
+fn prove_prepared_base(
+    plan: &forge_profiles::PreparedBaseImagePlan,
+    source: &PreparedBaseArtifact,
+) -> Result<(), String> {
     let directories = forge_images::default_directories()
         .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
     match validate_preparation_strategy(plan)? {
@@ -2964,11 +3032,11 @@ fn prove_prepared_base(plan: &forge_profiles::PreparedBaseImagePlan) -> Result<(
             forge_images::verified_whonix_gateway(&directories).map(|_| ())
         }
         forge_profiles::PrepareBaseStrategy::WhonixBundleWorkstation => {
-            forge_images::revalidate_whonix_workstation(
-                &directories,
-                &mut forge_images::SystemArtifactFetcher,
-            )
-            .map(|_| ())
+            let proof = source.whonix_workstation_proof.as_ref().ok_or_else(|| {
+                "Workstation execute proof is absent after full validation".to_owned()
+            })?;
+            forge_images::revalidate_whonix_workstation_execute_proof(&directories, proof)
+                .map(|_| ())
         }
         forge_profiles::PrepareBaseStrategy::VerifiedQcow2 => {
             return Err("verified direct-qcow2 real create is not implemented".to_owned());
@@ -2994,6 +3062,8 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
         plan: &forge_storage::GenericCreateExecutionPlan,
     ) -> Result<(), String> {
         use forge_storage::{DefineBackend, ImagePrepareBackend};
+        let started = Instant::now();
+        eprintln!("[forge] phase start: execute boundary revalidation");
         if let Some(planned) = &self.workstation_pair_snapshot {
             let current = workstation_pair_snapshot(&plan.factory)?;
             forge_profiles::revalidate_whonix_snapshot(planned, &current)
@@ -3036,7 +3106,11 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
                 return Err(format!("exact planned volume already exists: {name}"));
             }
         }
-        prove_prepared_base(&plan.factory.prepared_base)?;
+        prove_prepared_base(&plan.factory.prepared_base, &self.source)?;
+        eprintln!(
+            "[forge] phase done: execute boundary revalidation elapsed={:.1}s",
+            started.elapsed().as_secs_f64()
+        );
         Ok(())
     }
 
@@ -3045,6 +3119,8 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
         plan: &forge_storage::GenericCreateExecutionPlan,
     ) -> Result<(), String> {
         use forge_storage::ImagePrepareBackend;
+        let started = Instant::now();
+        eprintln!("[forge] phase start: storage import and overlay creation");
         let pool =
             ImagePrepareBackend::inspect_pool(&mut self.storage, forge_storage::DEFAULT_POOL)
                 .map_err(|error| error.to_string())?
@@ -3061,11 +3137,26 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
             capacity_bytes: self.source.capacity_bytes,
             format: "qcow2".to_owned(),
         };
+        let pinned_source = self
+            .source
+            .whonix_workstation_proof
+            .as_ref()
+            .map(|proof| {
+                let directories = forge_images::default_directories()
+                    .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
+                forge_images::open_whonix_workstation_execute_source(&directories, proof)
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        let source_path = pinned_source.as_ref().map_or_else(
+            || self.source.path.to_string_lossy().into_owned(),
+            |file| format!("/proc/self/fd/{}", file.as_raw_fd()),
+        );
         ImagePrepareBackend::import_base(
             &mut self.storage,
             forge_storage::DEFAULT_POOL,
             &base,
-            self.source.path.to_string_lossy().as_ref(),
+            &source_path,
         )
         .map_err(|error| error.to_string())?;
         self.base_created = true;
@@ -3088,6 +3179,10 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
         )
         .map_err(|error| error.to_string())?;
         self.overlay_created = true;
+        eprintln!(
+            "[forge] phase done: storage import and overlay creation elapsed={:.1}s",
+            started.elapsed().as_secs_f64()
+        );
         Ok(())
     }
 
@@ -3209,6 +3304,8 @@ fn execute_manual_guest_create(
     profile_name: &str,
     instance_name: &str,
 ) -> Result<forge_state::GenerationIndex, String> {
+    let create_started = Instant::now();
+    eprintln!("[forge] phase start: total create");
     let profile = forge_profiles::find(profile_name)
         .ok_or_else(|| format!("unknown VM profile: {profile_name}"))?;
     let instance = InstanceName::new(instance_name).map_err(|error| error.to_string())?;
@@ -3278,7 +3375,7 @@ fn execute_manual_guest_create(
         base_created: false,
         overlay_created: false,
     };
-    forge_storage::execute_generic_create(
+    let result = forge_storage::execute_generic_create(
         &mut backend,
         &forge_storage::GenericCreateExecutionPlan {
             factory,
@@ -3287,7 +3384,13 @@ fn execute_manual_guest_create(
         },
     )
     .map(|result| result.index)
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string());
+    eprintln!(
+        "[forge] phase done: total create outcome={} elapsed={:.1}s",
+        if result.is_ok() { "success" } else { "refused" },
+        create_started.elapsed().as_secs_f64()
+    );
+    result
 }
 
 fn print_plan(profile_name: &str, plan: VmResourcePlan) {
@@ -3329,6 +3432,7 @@ fn print_usage() {
     eprintln!("  forge image list");
     eprintln!("  forge image inspect fedora");
     eprintln!("  forge image fetch fedora");
+    eprintln!("  forge image recover whonix-workstation [--dry-run]");
 }
 
 fn print_report(report: &DoctorReport) {

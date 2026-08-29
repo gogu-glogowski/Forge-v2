@@ -2,14 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::env;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const FEDORA_RELEASE: &str = "44";
 pub const FEDORA_ARCH: &str = "x86_64";
@@ -77,6 +79,61 @@ pub enum ArchiveEntryKind {
     SymbolicLink,
     HardLink,
     Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullReadOperation {
+    ArchiveHash,
+    GatewayHash,
+    WorkstationHash,
+    WorkstationImport,
+    OtherHash,
+}
+
+thread_local! {
+    static FULL_READ_AUDIT: RefCell<Option<Vec<FullReadOperation>>> = const { RefCell::new(None) };
+}
+
+/// Runs one operation with a thread-local logical full-read audit.
+/// Intended for performance-contract tests; it does not measure wall time.
+pub fn audit_full_reads<T>(operation: impl FnOnce() -> T) -> (T, Vec<FullReadOperation>) {
+    FULL_READ_AUDIT.with(|audit| *audit.borrow_mut() = Some(Vec::new()));
+    let result = operation();
+    let reads = FULL_READ_AUDIT.with(|audit| audit.borrow_mut().take().unwrap_or_default());
+    (result, reads)
+}
+
+#[doc(hidden)]
+pub fn record_full_read(operation: FullReadOperation) {
+    FULL_READ_AUDIT.with(|audit| {
+        if let Some(reads) = audit.borrow_mut().as_mut() {
+            reads.push(operation);
+        }
+    });
+}
+
+/// Exact local filesystem identity captured around a byte-backed verification.
+/// It is deliberately process-local evidence, not a metadata-only trust grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedFileIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    mode: u32,
+    links: u64,
+}
+
+/// Byte-backed Workstation proof that may only be reused while every input
+/// retains the exact filesystem identity observed during verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhonixWorkstationExecuteProof {
+    metadata: WhonixGatewayImageMetadata,
+    files: Vec<VerifiedFileIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +398,20 @@ struct WhonixPreparationIntent {
     status: String,
     archive_path: PathBuf,
     prepared_qcow2_path: PathBuf,
+    #[serde(default)]
+    extraction_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhonixWorkstationRecoveryPlan {
+    pub intent_path: PathBuf,
+    pub extraction_root: PathBuf,
+    pub extracted_workstation_path: PathBuf,
+    intent: WhonixPreparationIntent,
+    intent_identity: VerifiedFileIdentity,
+    downloads_identity: VerifiedFileIdentity,
+    root_identity: VerifiedFileIdentity,
+    entry_identities: Vec<VerifiedFileIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -502,6 +573,22 @@ pub trait ArtifactFetcher {
             "Whonix bundle extraction is unsupported".to_owned(),
         ))
     }
+}
+
+fn verify_whonix_signature_timed<F: ArtifactFetcher>(
+    fetcher: &mut F,
+    archive: &Path,
+    signature: &Path,
+    key: &Path,
+) -> Result<WhonixSignatureEvidence, ImageError> {
+    let started = Instant::now();
+    eprintln!("[forge] phase start: Whonix OpenPGP verification");
+    let evidence = fetcher.verify_whonix_signature(archive, signature, key)?;
+    eprintln!(
+        "[forge] phase done: Whonix OpenPGP verification elapsed={:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(evidence)
 }
 
 pub struct SystemArtifactFetcher;
@@ -1182,7 +1269,7 @@ pub fn fetch_whonix_gateway<F: ArtifactFetcher>(
     fetcher.download(WHONIX_SOURCE_URL, &archive)?;
     fetcher.download(WHONIX_SIGNATURE_URL, &signature)?;
     fetcher.download(WHONIX_SIGNING_KEY_URL, &key)?;
-    let signature_evidence = fetcher.verify_whonix_signature(&archive, &signature, &key)?;
+    let signature_evidence = verify_whonix_signature_timed(fetcher, &archive, &signature, &key)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| ImageError::Metadata(error.to_string()))?
@@ -1202,6 +1289,7 @@ pub fn fetch_whonix_gateway<F: ArtifactFetcher>(
             status: "Preparing".to_owned(),
             archive_path: archive.clone(),
             prepared_qcow2_path: prepared.clone(),
+            extraction_root: None,
         },
     )?;
     let (prepared_qcow2_checksum, provenance) = prepare_whonix_bundle(
@@ -1245,7 +1333,13 @@ fn prepare_whonix_bundle<F: ArtifactFetcher>(
 ) -> Result<(String, WhonixBundleProvenance), ImageError> {
     let extraction_root = create_extraction_root_for(&directories.downloads, ".whonix-extract-")?;
     let extraction = (|| {
+        let extraction_started = Instant::now();
+        eprintln!("[forge] phase start: Whonix extraction");
         let entries = fetcher.extract_whonix_bundle(archive, &extraction_root)?;
+        eprintln!(
+            "[forge] phase done: Whonix extraction elapsed={:.1}s",
+            extraction_started.elapsed().as_secs_f64()
+        );
         let identified = validate_whonix_bundle_entries(&entries)?;
         let canonical_root = fs::canonicalize(&extraction_root)?;
         let mut hashes = Vec::with_capacity(identified.len());
@@ -1270,11 +1364,17 @@ fn prepare_whonix_bundle<F: ArtifactFetcher>(
                 (*role == BundleArtifactRole::GatewayDisk).then(|| hash.clone())
             })
             .ok_or(ImageError::IncompleteVerificationData)?;
+        let publication_started = Instant::now();
+        eprintln!("[forge] phase start: Gateway publication");
         promote_without_overwrite(
             &extraction_root.join(WHONIX_GATEWAY_DISK_FILENAME),
             prepared,
             &gateway_checksum,
         )?;
+        eprintln!(
+            "[forge] phase done: Gateway publication elapsed={:.1}s",
+            publication_started.elapsed().as_secs_f64()
+        );
         Ok((gateway_checksum, provenance))
     })();
     let cleanup =
@@ -1334,7 +1434,7 @@ pub fn prepare_whonix_workstation<F: ArtifactFetcher>(
         .downloads
         .join(format!("{WHONIX_ARCHIVE_FILENAME}.asc"));
     let key = directories.downloads.join("whonix-derivative.asc");
-    let signature_evidence = fetcher.verify_whonix_signature(&archive, &signature, &key)?;
+    let signature_evidence = verify_whonix_signature_timed(fetcher, &archive, &signature, &key)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| ImageError::Metadata(error.to_string()))?
@@ -1359,6 +1459,7 @@ pub fn prepare_whonix_workstation<F: ArtifactFetcher>(
     }
 
     let prepared = directories.images.join(WHONIX_WORKSTATION_DISK_FILENAME);
+    let extraction_root = extraction_root_path_for(&directories.downloads, ".whonix-extract-")?;
     write_json_atomic(
         &directories.images,
         "whonix-workstation.intent.json.tmp",
@@ -1367,11 +1468,21 @@ pub fn prepare_whonix_workstation<F: ArtifactFetcher>(
             status: "Preparing".to_owned(),
             archive_path: archive.clone(),
             prepared_qcow2_path: prepared.clone(),
+            extraction_root: Some(extraction_root.clone()),
         },
     )?;
-    let extraction_root = create_extraction_root_for(&directories.downloads, ".whonix-extract-")?;
+    if let Err(error) = create_extraction_root_at(&directories.downloads, &extraction_root) {
+        clear_whonix_workstation_intent(directories)?;
+        return Err(error);
+    }
     let preparation = (|| {
+        let extraction_started = Instant::now();
+        eprintln!("[forge] phase start: Whonix extraction");
         let entries = fetcher.extract_whonix_bundle(&archive, &extraction_root)?;
+        eprintln!(
+            "[forge] phase done: Whonix extraction elapsed={:.1}s",
+            extraction_started.elapsed().as_secs_f64()
+        );
         let identified = validate_whonix_bundle_entries(&entries)?;
         let canonical_root = fs::canonicalize(&extraction_root)?;
         let mut hashes = Vec::with_capacity(identified.len());
@@ -1401,7 +1512,13 @@ pub fn prepare_whonix_workstation<F: ArtifactFetcher>(
             ));
         }
         fs::set_permissions(&extracted, fs::Permissions::from_mode(0o600))?;
+        let publication_started = Instant::now();
+        eprintln!("[forge] phase start: Workstation publication");
         promote_without_overwrite(&extracted, &prepared, &workstation_checksum)?;
+        eprintln!(
+            "[forge] phase done: Workstation publication elapsed={:.1}s",
+            publication_started.elapsed().as_secs_f64()
+        );
         let file_metadata = fs::metadata(&prepared)?;
         Ok(WhonixGatewayImageMetadata {
             prepared_qcow2_path: prepared.clone(),
@@ -1452,7 +1569,7 @@ pub fn revalidate_whonix_workstation<F: ArtifactFetcher>(
         .downloads
         .join(format!("{WHONIX_ARCHIVE_FILENAME}.asc"));
     let key = directories.downloads.join("whonix-derivative.asc");
-    let evidence = fetcher.verify_whonix_signature(&archive, &signature, &key)?;
+    let evidence = verify_whonix_signature_timed(fetcher, &archive, &signature, &key)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| ImageError::Metadata(error.to_string()))?
@@ -1469,6 +1586,176 @@ pub fn revalidate_whonix_workstation<F: ArtifactFetcher>(
         return Err(ImageError::SourceNotVerified);
     }
     Ok(metadata)
+}
+
+fn whonix_execute_input_paths(directories: &ImageDirectories) -> [PathBuf; 7] {
+    [
+        directories.downloads.join(WHONIX_ARCHIVE_FILENAME),
+        directories
+            .downloads
+            .join(format!("{WHONIX_ARCHIVE_FILENAME}.asc")),
+        directories.downloads.join("whonix-derivative.asc"),
+        directories.images.join(WHONIX_GATEWAY_DISK_FILENAME),
+        directories.images.join("whonix.metadata.json"),
+        directories.images.join(WHONIX_WORKSTATION_DISK_FILENAME),
+        directories.images.join("whonix-workstation.metadata.json"),
+    ]
+}
+
+fn verified_file_identity(path: &Path) -> Result<VerifiedFileIdentity, ImageError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(VerifiedFileIdentity {
+        path: path.to_owned(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        bytes: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+        mode: metadata.mode(),
+        links: metadata.nlink(),
+    })
+}
+
+fn opened_file_identity(path: &Path, file: &File) -> Result<VerifiedFileIdentity, ImageError> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(VerifiedFileIdentity {
+        path: path.to_owned(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        bytes: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+        mode: metadata.mode(),
+        links: metadata.nlink(),
+    })
+}
+
+fn capture_whonix_execute_inputs(
+    directories: &ImageDirectories,
+) -> Result<Vec<VerifiedFileIdentity>, ImageError> {
+    whonix_execute_input_paths(directories)
+        .iter()
+        .map(|path| verified_file_identity(path))
+        .collect()
+}
+
+/// Performs full cryptographic and byte validation and binds its result to the
+/// exact local files seen both before and after that validation.
+///
+/// # Errors
+/// Refuses concurrent input drift and every condition refused by the normal
+/// execute-time Workstation validation.
+pub fn prove_whonix_workstation_for_execute<F: ArtifactFetcher>(
+    directories: &ImageDirectories,
+    fetcher: &mut F,
+) -> Result<WhonixWorkstationExecuteProof, ImageError> {
+    let before = capture_whonix_execute_inputs(directories)?;
+    let metadata = revalidate_whonix_workstation(directories, fetcher)?;
+    let after = capture_whonix_execute_inputs(directories)?;
+    if before != after {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(WhonixWorkstationExecuteProof {
+        metadata,
+        files: after,
+    })
+}
+
+/// Prepares or fully revalidates Workstation once and returns the proof needed
+/// for the immediately following mutation boundary.
+///
+/// # Errors
+/// Refuses preparation/verification failure or concurrent drift of any input.
+pub fn prepare_whonix_workstation_for_execute<F: ArtifactFetcher>(
+    directories: &ImageDirectories,
+    fetcher: &mut F,
+) -> Result<(WhonixGatewayImageMetadata, WhonixWorkstationExecuteProof), ImageError> {
+    let preparation_started = Instant::now();
+    eprintln!("[forge] phase start: total Workstation preparation");
+    // A missing member is expected on first preparation. Existing complete
+    // state is captured before the byte-backed validation performed below.
+    let before = capture_whonix_execute_inputs(directories).ok();
+    let metadata = if before.is_some() {
+        // Complete existing state: go straight to the one full execute proof.
+        // The revalidator still classifies and refuses every inconsistent bit.
+        revalidate_whonix_workstation(directories, fetcher)?
+    } else {
+        prepare_whonix_workstation(directories, fetcher)?
+    };
+    let after = capture_whonix_execute_inputs(directories)?;
+    if before.as_ref().is_some_and(|identity| identity != &after) {
+        return Err(ImageError::SourceNotVerified);
+    }
+    let proof = WhonixWorkstationExecuteProof {
+        metadata: metadata.clone(),
+        files: after,
+    };
+    eprintln!(
+        "[forge] phase done: total Workstation preparation elapsed={:.1}s",
+        preparation_started.elapsed().as_secs_f64()
+    );
+    Ok((metadata, proof))
+}
+
+/// Reuses a byte-backed proof only across an unchanged local filesystem
+/// identity. This closes the plan-to-mutation TOCTOU boundary without a second
+/// read of the same 100 GiB sparse files.
+///
+/// # Errors
+/// Refuses any file replacement, write, chmod, link-count, size, timestamp, or
+/// durable metadata change since the full proof was produced.
+pub fn revalidate_whonix_workstation_execute_proof(
+    directories: &ImageDirectories,
+    proof: &WhonixWorkstationExecuteProof,
+) -> Result<WhonixGatewayImageMetadata, ImageError> {
+    let current = capture_whonix_execute_inputs(directories)?;
+    if current != proof.files {
+        return Err(ImageError::SourceNotVerified);
+    }
+    let metadata_path = directories.images.join("whonix-workstation.metadata.json");
+    let current_metadata: WhonixGatewayImageMetadata =
+        serde_json::from_slice(&fs::read(metadata_path)?)
+            .map_err(|error| ImageError::Metadata(error.to_string()))?;
+    if current_metadata != proof.metadata {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(current_metadata)
+}
+
+/// Opens the exact verified Workstation inode at the consumption boundary.
+/// The returned descriptor remains bound to that inode even if the pathname is
+/// replaced after this function returns.
+///
+/// # Errors
+/// Refuses proof drift or an opened descriptor whose identity differs from the
+/// byte-backed snapshot.
+pub fn open_whonix_workstation_execute_source(
+    directories: &ImageDirectories,
+    proof: &WhonixWorkstationExecuteProof,
+) -> Result<File, ImageError> {
+    revalidate_whonix_workstation_execute_proof(directories, proof)?;
+    let path = directories.images.join(WHONIX_WORKSTATION_DISK_FILENAME);
+    let file = File::open(&path)?;
+    let opened = opened_file_identity(&path, &file)?;
+    let expected = proof
+        .files
+        .iter()
+        .find(|identity| identity.path == path)
+        .ok_or(ImageError::SourceNotVerified)?;
+    if &opened != expected {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(file)
 }
 
 /// Classifies the independently published Workstation base without granting
@@ -1561,6 +1848,293 @@ fn clear_whonix_workstation_intent(directories: &ImageDirectories) -> Result<(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn whonix_extraction_roots(downloads: &Path) -> Result<Vec<PathBuf>, ImageError> {
+    let mut roots = Vec::new();
+    for entry in fs::read_dir(downloads)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(".whonix-extract-"))
+        {
+            roots.push(entry.path());
+        }
+    }
+    roots.sort();
+    Ok(roots)
+}
+
+fn verified_directory_identity(path: &Path) -> Result<VerifiedFileIdentity, ImageError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(VerifiedFileIdentity {
+        path: path.to_owned(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        bytes: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+        mode: metadata.mode(),
+        links: metadata.nlink(),
+    })
+}
+
+fn opened_directory_identity(
+    logical_path: &Path,
+    directory: &File,
+) -> Result<VerifiedFileIdentity, ImageError> {
+    let metadata = directory.metadata()?;
+    if !metadata.file_type().is_dir() {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(VerifiedFileIdentity {
+        path: logical_path.to_owned(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        bytes: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+        mode: metadata.mode(),
+        links: metadata.nlink(),
+    })
+}
+
+fn verified_file_identity_at(
+    descriptor_path: &Path,
+    logical_path: &Path,
+) -> Result<VerifiedFileIdentity, ImageError> {
+    let mut identity = verified_file_identity(descriptor_path)?;
+    logical_path.clone_into(&mut identity.path);
+    Ok(identity)
+}
+
+fn verified_directory_identity_at(
+    descriptor_path: &Path,
+    logical_path: &Path,
+) -> Result<VerifiedFileIdentity, ImageError> {
+    let mut identity = verified_directory_identity(descriptor_path)?;
+    logical_path.clone_into(&mut identity.path);
+    Ok(identity)
+}
+
+fn descriptor_path(directory: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+}
+
+fn same_directory_object(left: &VerifiedFileIdentity, right: &VerifiedFileIdentity) -> bool {
+    left.device == right.device
+        && left.inode == right.inode
+        && left.mode == right.mode
+        && left.links == right.links
+}
+
+/// Builds an immutable confirmation plan for the exact pre-publication
+/// Workstation preparation currently owned by Forge.
+///
+/// Legacy intents did not record the extraction root. They are recoverable
+/// only when exactly one controlled root exists and it contains the complete,
+/// flat official allowlist as single-link regular files. The returned plan
+/// binds every inode and timestamp; no ownership is inferred from a qcow2 name.
+///
+/// # Errors
+/// Refuses published output, ambiguous roots, unexpected entries, links,
+/// malformed intent, or any state other than pre-publication `Preparing`.
+pub fn plan_whonix_workstation_recovery(
+    directories: &ImageDirectories,
+) -> Result<WhonixWorkstationRecoveryPlan, ImageError> {
+    let intent_path = directories.images.join("whonix-workstation.intent.json");
+    let intent_temp = directories
+        .images
+        .join("whonix-workstation.intent.json.tmp");
+    let metadata = directories.images.join("whonix-workstation.metadata.json");
+    let metadata_temp = directories
+        .images
+        .join("whonix-workstation.metadata.json.tmp");
+    let prepared = directories.images.join(WHONIX_WORKSTATION_DISK_FILENAME);
+    if intent_temp.exists() || metadata.exists() || metadata_temp.exists() || prepared.exists() {
+        return Err(ImageError::Metadata(
+            "recovery requires exact pre-publication Workstation Preparing state".to_owned(),
+        ));
+    }
+    let intent: WhonixPreparationIntent = serde_json::from_slice(&fs::read(&intent_path)?)
+        .map_err(|error| ImageError::Metadata(error.to_string()))?;
+    if intent.status != "Preparing"
+        || intent.archive_path != directories.downloads.join(WHONIX_ARCHIVE_FILENAME)
+        || intent.prepared_qcow2_path != prepared
+    {
+        return Err(ImageError::Metadata(
+            "Workstation recovery intent identity is incoherent".to_owned(),
+        ));
+    }
+    let roots = whonix_extraction_roots(&directories.downloads)?;
+    let extraction_root = match (intent.extraction_root.as_ref(), roots.as_slice()) {
+        (Some(expected), [only]) if expected == only => only.clone(),
+        (None, [only]) => only.clone(),
+        _ => {
+            return Err(ImageError::Metadata(
+                "Workstation recovery extraction-root ownership is ambiguous".to_owned(),
+            ));
+        }
+    };
+    if extraction_root.parent() != Some(directories.downloads.as_path()) {
+        return Err(ImageError::Metadata(
+            "Workstation recovery root escaped the controlled downloads directory".to_owned(),
+        ));
+    }
+    let mut actual_names = Vec::new();
+    let intent_identity = verified_file_identity(&intent_path)?;
+    let downloads_identity = verified_directory_identity(&directories.downloads)?;
+    let root_identity = verified_directory_identity(&extraction_root)?;
+    let mut entry_identities = Vec::new();
+    for entry in fs::read_dir(&extraction_root)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| ImageError::SourceNotVerified)?;
+        entry_identities.push(verified_file_identity(&entry.path())?);
+        actual_names.push(name);
+    }
+    actual_names.sort();
+    let mut expected_names = whonix_bundle_layout()
+        .into_iter()
+        .map(|entry| entry.path.to_owned())
+        .collect::<Vec<_>>();
+    expected_names.sort();
+    if actual_names != expected_names {
+        return Err(ImageError::Metadata(
+            "Workstation recovery root differs from the exact bundle allowlist".to_owned(),
+        ));
+    }
+    entry_identities.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(WhonixWorkstationRecoveryPlan {
+        intent_path,
+        extracted_workstation_path: extraction_root.join(WHONIX_WORKSTATION_DISK_FILENAME),
+        extraction_root,
+        intent,
+        intent_identity,
+        downloads_identity,
+        root_identity,
+        entry_identities,
+    })
+}
+
+/// Executes only an unchanged, explicitly confirmed pre-publication recovery
+/// plan. No archive, prepared image, metadata, durable VM state, or libvirt
+/// resource is touched.
+///
+/// # Errors
+/// Refuses plan drift and incomplete cleanup. The intent is removed only after
+/// the controlled root is absent and its parent directory has been synced.
+pub fn execute_whonix_workstation_recovery(
+    directories: &ImageDirectories,
+    plan: &WhonixWorkstationRecoveryPlan,
+) -> Result<(), ImageError> {
+    if &plan_whonix_workstation_recovery(directories)? != plan {
+        return Err(ImageError::SourceNotVerified);
+    }
+    cleanup_whonix_recovery_tree_with_hook(directories, plan, || Ok(()))?;
+    if plan.extraction_root.exists() {
+        return Err(ImageError::Metadata(
+            "controlled Workstation extraction root remains after cleanup".to_owned(),
+        ));
+    }
+    clear_whonix_workstation_intent(directories)?;
+    if !matches!(
+        inspect_whonix_workstation_preparation(directories)?,
+        WhonixPreparationState::Missing
+    ) {
+        return Err(ImageError::Metadata(
+            "Workstation preparation did not return to Missing".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_whonix_recovery_tree_with_hook(
+    directories: &ImageDirectories,
+    plan: &WhonixWorkstationRecoveryPlan,
+    after_bind: impl FnOnce() -> Result<(), ImageError>,
+) -> Result<(), ImageError> {
+    let root_name = plan
+        .extraction_root
+        .file_name()
+        .ok_or(ImageError::SourceNotVerified)?;
+    let downloads = File::open(&directories.downloads)?;
+    if opened_directory_identity(&directories.downloads, &downloads)? != plan.downloads_identity {
+        return Err(ImageError::SourceNotVerified);
+    }
+    let downloads_fd_path = descriptor_path(&downloads);
+    let root_entry = downloads_fd_path.join(root_name);
+    if verified_directory_identity_at(&root_entry, &plan.extraction_root)? != plan.root_identity {
+        return Err(ImageError::SourceNotVerified);
+    }
+    let root = File::open(&root_entry)?;
+    if opened_directory_identity(&plan.extraction_root, &root)? != plan.root_identity {
+        return Err(ImageError::SourceNotVerified);
+    }
+
+    after_bind()?;
+
+    // Refuse parent/root pathname replacement after the descriptors were
+    // bound. All deletion below is rooted at those already-open descriptors.
+    if verified_directory_identity(&directories.downloads)? != plan.downloads_identity
+        || opened_directory_identity(&directories.downloads, &downloads)? != plan.downloads_identity
+        || verified_directory_identity_at(&root_entry, &plan.extraction_root)? != plan.root_identity
+        || opened_directory_identity(&plan.extraction_root, &root)? != plan.root_identity
+    {
+        return Err(ImageError::SourceNotVerified);
+    }
+
+    let root_fd_path = descriptor_path(&root);
+    let mut actual = Vec::new();
+    for entry in fs::read_dir(&root_fd_path)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| ImageError::SourceNotVerified)?;
+        let logical_path = plan.extraction_root.join(&name);
+        actual.push(verified_file_identity_at(&entry.path(), &logical_path)?);
+    }
+    actual.sort_by(|left, right| left.path.cmp(&right.path));
+    if actual != plan.entry_identities {
+        return Err(ImageError::SourceNotVerified);
+    }
+
+    for expected in &plan.entry_identities {
+        let name = expected
+            .path
+            .file_name()
+            .ok_or(ImageError::SourceNotVerified)?;
+        let entry = root_fd_path.join(name);
+        if verified_file_identity_at(&entry, &expected.path)? != *expected {
+            return Err(ImageError::SourceNotVerified);
+        }
+        fs::remove_file(entry)?;
+    }
+    root.sync_all()?;
+
+    if !same_directory_object(
+        &verified_directory_identity_at(&root_entry, &plan.extraction_root)?,
+        &plan.root_identity,
+    ) {
+        return Err(ImageError::SourceNotVerified);
+    }
+    fs::remove_dir(&root_entry)?;
+    downloads.sync_all()?;
+    if fs::symlink_metadata(&root_entry).is_ok() {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(())
 }
 
 /// Reads the immutable Whonix provenance for planning without rehashing the
@@ -1822,16 +2396,25 @@ fn create_extraction_root(downloads: &Path) -> Result<PathBuf, ImageError> {
 }
 
 fn create_extraction_root_for(downloads: &Path, prefix: &str) -> Result<PathBuf, ImageError> {
+    let root = extraction_root_path_for(downloads, prefix)?;
+    create_extraction_root_at(downloads, &root)?;
+    Ok(root)
+}
+
+fn extraction_root_path_for(downloads: &Path, prefix: &str) -> Result<PathBuf, ImageError> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| ImageError::Metadata(error.to_string()))?
         .as_nanos();
-    let root = downloads.join(format!("{prefix}{}-{nonce}", std::process::id()));
-    fs::create_dir(&root)?;
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
-    sync_directory(&root)?;
+    Ok(downloads.join(format!("{prefix}{}-{nonce}", std::process::id())))
+}
+
+fn create_extraction_root_at(downloads: &Path, root: &Path) -> Result<(), ImageError> {
+    fs::create_dir(root)?;
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+    sync_directory(root)?;
     sync_directory(downloads)?;
-    Ok(root)
+    Ok(())
 }
 
 fn kali_extraction_roots(downloads: &Path) -> Result<Vec<PathBuf>, ImageError> {
@@ -2086,17 +2669,63 @@ pub fn checksum_for(contents: &str, filename: &str) -> Option<String> {
 /// # Errors
 /// Returns an error when the file cannot be read.
 pub fn sha256_file(path: &Path) -> Result<String, ImageError> {
+    const PROGRESS_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    let operation = match path.file_name().and_then(|name| name.to_str()) {
+        Some(WHONIX_ARCHIVE_FILENAME) => FullReadOperation::ArchiveHash,
+        Some(WHONIX_GATEWAY_DISK_FILENAME) => FullReadOperation::GatewayHash,
+        Some(WHONIX_WORKSTATION_DISK_FILENAME) => FullReadOperation::WorkstationHash,
+        _ => FullReadOperation::OtherHash,
+    };
+    record_full_read(operation);
+    let label = match operation {
+        FullReadOperation::ArchiveHash => "archive hashing",
+        FullReadOperation::GatewayHash => "Gateway hash",
+        FullReadOperation::WorkstationHash => "Workstation hash",
+        FullReadOperation::WorkstationImport => "Workstation import",
+        FullReadOperation::OtherHash => "file hashing",
+    };
     let mut file = File::open(path)?;
+    let expected_bytes = file.metadata()?.len();
+    let started = Instant::now();
+    eprintln!(
+        "[forge] phase start: {label} path={} logical-bytes={expected_bytes}",
+        path.display()
+    );
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    let mut next_progress = PROGRESS_BYTES;
+    let mut last_progress = Instant::now();
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
+        total = total.saturating_add(read as u64);
+        if total >= next_progress || last_progress.elapsed() >= Duration::from_secs(10) {
+            let percent_tenths = total
+                .saturating_mul(1_000)
+                .checked_div(expected_bytes)
+                .unwrap_or(1_000);
+            eprintln!(
+                "[forge] progress: {label} path={} read-bytes={total}/{expected_bytes} ({}.{:01}%) elapsed={:.1}s",
+                path.display(),
+                percent_tenths / 10,
+                percent_tenths % 10,
+                started.elapsed().as_secs_f64()
+            );
+            next_progress = total.saturating_add(PROGRESS_BYTES);
+            last_progress = Instant::now();
+        }
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    let digest = format!("{:x}", hasher.finalize());
+    eprintln!(
+        "[forge] phase done: {label} path={} read-bytes={total} elapsed={:.1}s",
+        path.display(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(digest)
 }
 
 /// Reads the virtual capacity from a qcow2 v1+ header without invoking QEMU.
@@ -2794,6 +3423,239 @@ mod tests {
             revalidate_whonix_workstation(&test.directories, &mut fetcher),
             Err(ImageError::SignatureVerification(_))
         ));
+    }
+
+    #[test]
+    fn workstation_execute_proof_reuses_only_unchanged_byte_backed_identity() {
+        let test = TestDirectories::new();
+        let image = qcow2_header(WHONIX_WORKSTATION_VIRTUAL_BYTES);
+        let mut fetcher = FixtureFetcher::valid(&image);
+        fetch_whonix_gateway(&test.directories, &mut fetcher).unwrap();
+        prepare_whonix_workstation(&test.directories, &mut fetcher).unwrap();
+
+        let (_, proof) =
+            prepare_whonix_workstation_for_execute(&test.directories, &mut fetcher).unwrap();
+        assert!(revalidate_whonix_workstation_execute_proof(&test.directories, &proof).is_ok());
+
+        let workstation = test
+            .directories
+            .images
+            .join(WHONIX_WORKSTATION_DISK_FILENAME);
+        let mut changed = fs::read(&workstation).unwrap();
+        changed.push(0x42);
+        fs::write(workstation, changed).unwrap();
+        assert!(matches!(
+            revalidate_whonix_workstation_execute_proof(&test.directories, &proof),
+            Err(ImageError::SourceNotVerified)
+        ));
+    }
+
+    #[test]
+    fn verified_workstation_execute_has_one_hash_per_large_artifact() {
+        let test = TestDirectories::new();
+        let image = qcow2_header(WHONIX_WORKSTATION_VIRTUAL_BYTES);
+        let mut fetcher = FixtureFetcher::valid(&image);
+        fetch_whonix_gateway(&test.directories, &mut fetcher).unwrap();
+        prepare_whonix_workstation(&test.directories, &mut fetcher).unwrap();
+
+        let (result, reads) = audit_full_reads(|| {
+            prepare_whonix_workstation_for_execute(&test.directories, &mut fetcher)
+        });
+        result.unwrap();
+        assert_eq!(
+            reads,
+            vec![
+                FullReadOperation::GatewayHash,
+                FullReadOperation::ArchiveHash,
+                FullReadOperation::WorkstationHash,
+            ]
+        );
+    }
+
+    #[test]
+    fn workstation_execute_proof_refuses_inode_replacement() {
+        let test = TestDirectories::new();
+        let image = qcow2_header(WHONIX_WORKSTATION_VIRTUAL_BYTES);
+        let mut fetcher = FixtureFetcher::valid(&image);
+        fetch_whonix_gateway(&test.directories, &mut fetcher).unwrap();
+        prepare_whonix_workstation(&test.directories, &mut fetcher).unwrap();
+        let (_, proof) =
+            prepare_whonix_workstation_for_execute(&test.directories, &mut fetcher).unwrap();
+        let workstation = test
+            .directories
+            .images
+            .join(WHONIX_WORKSTATION_DISK_FILENAME);
+        let replacement = test.directories.images.join("replacement.qcow2");
+        fs::write(&replacement, fs::read(&workstation).unwrap()).unwrap();
+        fs::rename(replacement, workstation).unwrap();
+        assert!(matches!(
+            open_whonix_workstation_execute_source(&test.directories, &proof),
+            Err(ImageError::SourceNotVerified)
+        ));
+    }
+
+    fn interrupted_workstation_fixture(test: &TestDirectories) -> WhonixWorkstationRecoveryPlan {
+        fs::create_dir_all(&test.directories.downloads).unwrap();
+        fs::create_dir_all(&test.directories.images).unwrap();
+        fs::write(
+            test.directories.downloads.join(WHONIX_ARCHIVE_FILENAME),
+            b"verified archive remains out of recovery scope",
+        )
+        .unwrap();
+        fs::write(
+            test.directories.images.join(WHONIX_GATEWAY_DISK_FILENAME),
+            b"verified Gateway cache remains out of recovery scope",
+        )
+        .unwrap();
+        let root = test.directories.downloads.join(".whonix-extract-test");
+        fs::create_dir(&root).unwrap();
+        for entry in whonix_bundle_layout() {
+            fs::write(root.join(entry.path), b"controlled temporary artifact").unwrap();
+        }
+        write_json_atomic(
+            &test.directories.images,
+            "whonix-workstation.intent.json.tmp",
+            "whonix-workstation.intent.json",
+            &WhonixPreparationIntent {
+                status: "Preparing".to_owned(),
+                archive_path: test.directories.downloads.join(WHONIX_ARCHIVE_FILENAME),
+                prepared_qcow2_path: test
+                    .directories
+                    .images
+                    .join(WHONIX_WORKSTATION_DISK_FILENAME),
+                extraction_root: Some(root),
+            },
+        )
+        .unwrap();
+        plan_whonix_workstation_recovery(&test.directories).unwrap()
+    }
+
+    #[test]
+    fn explicit_workstation_recovery_returns_prepublication_state_to_missing() {
+        let test = TestDirectories::new();
+        let plan = interrupted_workstation_fixture(&test);
+        assert!(plan.extracted_workstation_path.exists());
+        execute_whonix_workstation_recovery(&test.directories, &plan).unwrap();
+        assert!(!plan.extraction_root.exists());
+        assert!(!plan.intent_path.exists());
+        assert!(
+            test.directories
+                .downloads
+                .join(WHONIX_ARCHIVE_FILENAME)
+                .exists()
+        );
+        assert!(
+            test.directories
+                .images
+                .join(WHONIX_GATEWAY_DISK_FILENAME)
+                .exists()
+        );
+        assert!(matches!(
+            inspect_whonix_workstation_preparation(&test.directories).unwrap(),
+            WhonixPreparationState::Missing
+        ));
+    }
+
+    #[test]
+    fn explicit_workstation_recovery_refuses_plan_drift() {
+        let test = TestDirectories::new();
+        let plan = interrupted_workstation_fixture(&test);
+        fs::write(plan.extraction_root.join("unexpected"), b"drift").unwrap();
+        assert!(execute_whonix_workstation_recovery(&test.directories, &plan).is_err());
+        assert!(plan.extraction_root.exists());
+        assert!(plan.intent_path.exists());
+    }
+
+    #[test]
+    fn recovery_refuses_root_replacement_in_consumption_window() {
+        let test = TestDirectories::new();
+        let plan = interrupted_workstation_fixture(&test);
+        let displaced = test.directories.downloads.join("approved-root-displaced");
+        let replacement = plan.extraction_root.clone();
+        let result = cleanup_whonix_recovery_tree_with_hook(&test.directories, &plan, || {
+            fs::rename(&replacement, &displaced)?;
+            fs::create_dir(&replacement)?;
+            fs::write(replacement.join("replacement-sentinel"), b"do not delete")?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(ImageError::SourceNotVerified)));
+        assert!(displaced.join(WHONIX_WORKSTATION_DISK_FILENAME).exists());
+        assert!(replacement.join("replacement-sentinel").exists());
+    }
+
+    #[test]
+    fn recovery_refuses_parent_replacement_in_consumption_window() {
+        let test = TestDirectories::new();
+        let plan = interrupted_workstation_fixture(&test);
+        let downloads = test.directories.downloads.clone();
+        let displaced = test.root.join("downloads-displaced");
+        let result = cleanup_whonix_recovery_tree_with_hook(&test.directories, &plan, || {
+            fs::rename(&downloads, &displaced)?;
+            fs::create_dir(&downloads)?;
+            fs::write(
+                downloads.join("replacement-parent-sentinel"),
+                b"do not delete",
+            )?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(ImageError::SourceNotVerified)));
+        assert!(
+            displaced
+                .join(plan.extraction_root.file_name().unwrap())
+                .join(WHONIX_WORKSTATION_DISK_FILENAME)
+                .exists()
+        );
+        assert!(downloads.join("replacement-parent-sentinel").exists());
+    }
+
+    #[test]
+    fn recovery_refuses_expected_file_replacement_in_consumption_window() {
+        let test = TestDirectories::new();
+        let plan = interrupted_workstation_fixture(&test);
+        let workstation = plan.extracted_workstation_path.clone();
+        let result = cleanup_whonix_recovery_tree_with_hook(&test.directories, &plan, || {
+            let replacement = plan.extraction_root.join("replacement");
+            fs::write(&replacement, b"different inode")?;
+            fs::rename(replacement, &workstation)?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(ImageError::SourceNotVerified)));
+        assert!(workstation.exists());
+    }
+
+    #[test]
+    fn recovery_refuses_unexpected_or_symlink_entry_in_consumption_window() {
+        for symlink in [false, true] {
+            let test = TestDirectories::new();
+            let plan = interrupted_workstation_fixture(&test);
+            let result = cleanup_whonix_recovery_tree_with_hook(&test.directories, &plan, || {
+                let unexpected = plan.extraction_root.join("unexpected");
+                if symlink {
+                    std::os::unix::fs::symlink(
+                        test.directories.downloads.join(WHONIX_ARCHIVE_FILENAME),
+                        unexpected,
+                    )?;
+                } else {
+                    fs::write(unexpected, b"unexpected")?;
+                }
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert!(plan.extracted_workstation_path.exists());
+        }
+    }
+
+    #[test]
+    fn recovery_fd_cleanup_removes_only_the_approved_tree() {
+        let test = TestDirectories::new();
+        fs::create_dir_all(&test.directories.downloads).unwrap();
+        let unrelated = test.directories.downloads.join("unrelated-tree");
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(unrelated.join("sentinel"), b"preserve").unwrap();
+        let plan = interrupted_workstation_fixture(&test);
+        cleanup_whonix_recovery_tree_with_hook(&test.directories, &plan, || Ok(())).unwrap();
+        assert!(!plan.extraction_root.exists());
+        assert_eq!(fs::read(unrelated.join("sentinel")).unwrap(), b"preserve");
     }
 
     #[test]

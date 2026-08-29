@@ -6,6 +6,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::process::Command;
+use std::time::{Duration, Instant};
 use virt::connect::Connect;
 use virt::domain::Domain;
 use virt::error::{Error as VirtError, ErrorNumber};
@@ -544,6 +545,7 @@ impl forge_storage::ImagePrepareBackend for LibvirtDefineBackend {
         base: &forge_storage::BaseImageVolume,
         source_path: &str,
     ) -> Result<forge_storage::VolumeInfo, forge_storage::ImagePrepareError> {
+        record_base_import_read(&base.name);
         let pool_handle = self
             .pool(pool)
             .map_err(forge_storage::ImagePrepareError::from)?;
@@ -604,6 +606,12 @@ impl forge_storage::ImagePrepareBackend for LibvirtDefineBackend {
     }
 }
 
+fn record_base_import_read(base_name: &str) {
+    if base_name.starts_with("forge-base-whonix-workstation-") {
+        forge_images::record_full_read(forge_images::FullReadOperation::WorkstationImport);
+    }
+}
+
 #[derive(Deserialize)]
 struct QemuImgInfo {
     format: String,
@@ -619,6 +627,11 @@ fn upload_file(
     source_path: &str,
     length: u64,
 ) -> Result<(), forge_storage::ImagePrepareError> {
+    const PROGRESS_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    let started = Instant::now();
+    let mut last_progress = Instant::now();
+    let mut next_progress = PROGRESS_BYTES;
+    eprintln!("[forge] base import start source={source_path} logical-bytes={length}");
     let mut file = File::open(source_path)
         .map_err(|error| forge_storage::ImagePrepareError::Backend(error.to_string()))?;
     let stream = Stream::new(connection, 0).map_err(image_backend_error)?;
@@ -649,6 +662,20 @@ fn upload_file(
         total = total.checked_add(read as u64).ok_or_else(|| {
             forge_storage::ImagePrepareError::Backend("upload byte count overflowed".to_owned())
         })?;
+        if total >= next_progress || last_progress.elapsed() >= Duration::from_secs(10) {
+            let percent_tenths = total
+                .saturating_mul(1_000)
+                .checked_div(length)
+                .unwrap_or(1_000);
+            eprintln!(
+                "[forge] base import progress sent-bytes={total}/{length} ({}.{:01}%) elapsed={:.1}s",
+                percent_tenths / 10,
+                percent_tenths % 10,
+                started.elapsed().as_secs_f64()
+            );
+            next_progress = total.saturating_add(PROGRESS_BYTES);
+            last_progress = Instant::now();
+        }
     }
     if total != length {
         stream.abort().map_err(image_backend_error)?;
@@ -656,7 +683,12 @@ fn upload_file(
             "source size changed during upload: expected {length}, sent {total}"
         )));
     }
-    stream.finish().map_err(image_backend_error)
+    stream.finish().map_err(image_backend_error)?;
+    eprintln!(
+        "[forge] base import done sent-bytes={total} elapsed={:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 fn volume_info(
@@ -2175,6 +2207,17 @@ mod tests {
         assert!(
             validate_managed_seed_topology(Some("/pool/expected.iso"), Some("/pool/other.iso"))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn workstation_import_contract_records_one_necessary_full_read() {
+        let ((), reads) = forge_images::audit_full_reads(|| {
+            record_base_import_read("forge-base-whonix-workstation-18.2.1.9.qcow2");
+        });
+        assert_eq!(
+            reads,
+            vec![forge_images::FullReadOperation::WorkstationImport]
         );
     }
 
