@@ -1,7 +1,7 @@
 # Forge-v2
 
-> 🎧 **If you're reading my code, press play.**  
-> [Open the code soundtrack on YouTube](https://www.youtube.com/watch?v=S0Zv4IJviUs&list=RDS0Zv4IJviUs&index=1)
+> 🎧 **If you're reading my code and want some background music, press play.**  
+> [Listen to the YouTube playlist](https://www.youtube.com/embed/S0Zv4IJviUs?list=RDS0Zv4IJviUs&autoplay=1&rel=0)
 
 Minimalny fundament narzędzia do oceny gotowości Fedory Workstation jako hosta
 izolowanych maszyn KVM/QEMU/libvirt.
