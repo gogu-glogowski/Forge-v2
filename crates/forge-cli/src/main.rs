@@ -3043,6 +3043,7 @@ struct PreparedBaseArtifact {
     path: std::path::PathBuf,
     file_bytes: u64,
     capacity_bytes: u64,
+    kali_proof: Option<forge_images::KaliPreparedBaseExecuteProof>,
     whonix_workstation_proof: Option<forge_images::WhonixWorkstationExecuteProof>,
 }
 
@@ -3115,13 +3116,14 @@ fn acquire_prepared_base(
     eprintln!("[forge] phase start: prepared-base cryptographic validation");
     let directories = forge_images::default_directories()
         .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
-    let (path, whonix_workstation_proof) = match validate_preparation_strategy(plan)? {
+    let (path, kali_proof, whonix_workstation_proof) = match validate_preparation_strategy(plan)? {
         forge_profiles::PrepareBaseStrategy::SevenZipSingleQcow2 => {
-            let path =
-                forge_images::fetch_kali(&directories, &mut forge_images::SystemArtifactFetcher)
-                    .map_err(|error| error.to_string())?
-                    .prepared_qcow2_path;
-            (path, None)
+            let (metadata, proof) = forge_images::prepare_kali_for_execute(
+                &directories,
+                &mut forge_images::SystemArtifactFetcher,
+            )
+            .map_err(|error| error.to_string())?;
+            (metadata.prepared_qcow2_path, Some(proof), None)
         }
         forge_profiles::PrepareBaseStrategy::WhonixBundleGateway => {
             let path = forge_images::fetch_whonix_gateway(
@@ -3130,7 +3132,7 @@ fn acquire_prepared_base(
             )
             .map_err(|error| error.to_string())?
             .prepared_qcow2_path;
-            (path, None)
+            (path, None, None)
         }
         forge_profiles::PrepareBaseStrategy::WhonixBundleWorkstation => {
             let (metadata, proof) = forge_images::prepare_whonix_workstation_for_execute(
@@ -3138,7 +3140,7 @@ fn acquire_prepared_base(
                 &mut forge_images::SystemArtifactFetcher,
             )
             .map_err(|error| error.to_string())?;
-            (metadata.prepared_qcow2_path, Some(proof))
+            (metadata.prepared_qcow2_path, None, Some(proof))
         }
         forge_profiles::PrepareBaseStrategy::VerifiedQcow2 => {
             return Err("verified direct-qcow2 real create is not implemented".to_owned());
@@ -3153,6 +3155,7 @@ fn acquire_prepared_base(
         path,
         file_bytes,
         capacity_bytes,
+        kali_proof,
         whonix_workstation_proof,
     };
     eprintln!(
@@ -3196,6 +3199,7 @@ fn verified_prepared_base_read_only(
         path,
         file_bytes,
         capacity_bytes,
+        kali_proof: None,
         whonix_workstation_proof: None,
     })
 }
@@ -3208,7 +3212,12 @@ fn prove_prepared_base(
         .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
     match validate_preparation_strategy(plan)? {
         forge_profiles::PrepareBaseStrategy::SevenZipSingleQcow2 => {
-            forge_images::verified_kali(&directories).map(|_| ())
+            let proof = source
+                .kali_proof
+                .as_ref()
+                .ok_or_else(|| "Kali execute proof is absent after full validation".to_owned())?;
+            forge_images::revalidate_kali_prepared_base_execute_proof(&directories, proof)
+                .map(|_| ())
         }
         forge_profiles::PrepareBaseStrategy::WhonixBundleGateway => {
             forge_images::verified_whonix_gateway(&directories).map(|_| ())
@@ -3486,17 +3495,26 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
         };
         match disposition {
             forge_storage::SharedBaseDisposition::Prepare => {
-                let pinned_source = self
-                    .source
-                    .whonix_workstation_proof
-                    .as_ref()
-                    .map(|proof| {
-                        let directories = forge_images::default_directories()
-                            .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
-                        forge_images::open_whonix_workstation_execute_source(&directories, proof)
+                let directories = forge_images::default_directories()
+                    .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
+                let pinned_source = if let Some(proof) = self.source.kali_proof.as_ref() {
+                    Some(
+                        forge_images::open_kali_prepared_base_execute_source(&directories, proof)
+                            .map_err(|error| error.to_string())?,
+                    )
+                } else {
+                    self.source
+                        .whonix_workstation_proof
+                        .as_ref()
+                        .map(|proof| {
+                            forge_images::open_whonix_workstation_execute_source(
+                                &directories,
+                                proof,
+                            )
                             .map_err(|error| error.to_string())
-                    })
-                    .transpose()?;
+                        })
+                        .transpose()?
+                };
                 let source_path = pinned_source.as_ref().map_or_else(
                     || self.source.path.to_string_lossy().into_owned(),
                     |file| format!("/proc/self/fd/{}", file.as_raw_fd()),

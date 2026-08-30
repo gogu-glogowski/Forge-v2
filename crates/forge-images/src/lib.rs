@@ -91,6 +91,7 @@ pub enum FullReadOperation {
     WorkstationHash,
     ExtractedBundleArtifactHash(BundleArtifactRole),
     WorkstationImport,
+    KaliPreparedHash,
     OtherHash,
 }
 
@@ -137,6 +138,14 @@ pub struct VerifiedFileIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhonixWorkstationExecuteProof {
     metadata: WhonixGatewayImageMetadata,
+    files: Vec<VerifiedFileIdentity>,
+}
+
+/// Byte-backed Kali proof that may only be reused while the authenticated
+/// archive, prepared qcow2, and durable metadata retain their exact identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KaliPreparedBaseExecuteProof {
+    metadata: KaliImageMetadata,
     files: Vec<VerifiedFileIdentity>,
 }
 
@@ -1162,7 +1171,7 @@ pub fn fetch_kali<F: ArtifactFetcher>(
     fs::create_dir_all(&directories.downloads)?;
     match inspect_kali_preparation(directories)? {
         KaliPreparationState::Missing => {}
-        KaliPreparationState::Verified(_) => return verified_kali(directories),
+        KaliPreparationState::Verified(metadata) => return Ok(*metadata),
         state => {
             return Err(ImageError::Metadata(format!(
                 "Kali image preparation requires explicit recovery: {state:?}"
@@ -2605,6 +2614,130 @@ pub fn verified_kali(directories: &ImageDirectories) -> Result<KaliImageMetadata
     Ok(metadata)
 }
 
+fn kali_execute_input_paths(directories: &ImageDirectories) -> [PathBuf; 3] {
+    [
+        directories.downloads.join(KALI_ARCHIVE_FILENAME),
+        directories.images.join(KALI_QCOW2_FILENAME),
+        directories.images.join("kali.metadata.json"),
+    ]
+}
+
+fn capture_kali_execute_inputs(
+    directories: &ImageDirectories,
+) -> Result<Vec<VerifiedFileIdentity>, ImageError> {
+    kali_execute_input_paths(directories)
+        .iter()
+        .map(|path| verified_file_identity(path))
+        .collect()
+}
+
+/// Fully validates Kali provenance once and binds that validation to the exact
+/// archive, prepared qcow2, and metadata files observed throughout the reads.
+///
+/// # Errors
+/// Refuses invalid metadata, cryptographic mismatch, or concurrent identity drift.
+pub fn prove_kali_prepared_base_for_execute(
+    directories: &ImageDirectories,
+) -> Result<(KaliImageMetadata, KaliPreparedBaseExecuteProof), ImageError> {
+    let before = capture_kali_execute_inputs(directories)?;
+    let metadata = inspect_kali(directories)?.ok_or(ImageError::SourceNotVerified)?;
+    let expected_archive_path = directories.downloads.join(KALI_ARCHIVE_FILENAME);
+    let expected_prepared_path = directories.images.join(KALI_QCOW2_FILENAME);
+    let archive = metadata
+        .authenticated_archive_checksum
+        .as_deref()
+        .ok_or(ImageError::SourceNotVerified)?;
+    let prepared = metadata
+        .prepared_qcow2_checksum
+        .as_deref()
+        .ok_or(ImageError::SourceNotVerified)?;
+    if metadata.status != ImageStatus::Verified
+        || metadata.signing_key_fingerprint != KALI_SIGNING_KEY_FINGERPRINT
+        || metadata.archive_path != expected_archive_path
+        || metadata.prepared_qcow2_path != expected_prepared_path
+        || metadata.actual_archive_checksum.as_deref() != Some(archive)
+    {
+        return Err(ImageError::SourceNotVerified);
+    }
+    verify_file_bytes(
+        &metadata.archive_path,
+        archive,
+        FullReadOperation::ArchiveHash,
+    )?;
+    verify_file_bytes(
+        &metadata.prepared_qcow2_path,
+        prepared,
+        FullReadOperation::KaliPreparedHash,
+    )?;
+    let after = capture_kali_execute_inputs(directories)?;
+    if before != after {
+        return Err(ImageError::SourceNotVerified);
+    }
+    let proof = KaliPreparedBaseExecuteProof {
+        metadata: metadata.clone(),
+        files: after,
+    };
+    Ok((metadata, proof))
+}
+
+/// Acquires Kali if absent, or directly creates one byte-backed execute proof
+/// for already prepared state without first performing classification hashes.
+///
+/// # Errors
+/// Refuses every acquisition, provenance, byte-validation, or identity failure.
+pub fn prepare_kali_for_execute<F: ArtifactFetcher>(
+    directories: &ImageDirectories,
+    fetcher: &mut F,
+) -> Result<(KaliImageMetadata, KaliPreparedBaseExecuteProof), ImageError> {
+    if inspect_kali(directories)?.is_none() {
+        fetch_kali(directories, fetcher)?;
+    }
+    prove_kali_prepared_base_for_execute(directories)
+}
+
+/// Revalidates an established byte-backed proof using exact filesystem identity
+/// and durable metadata, without granting trust from metadata alone.
+///
+/// # Errors
+/// Refuses replacement or any identity/metadata drift since full validation.
+pub fn revalidate_kali_prepared_base_execute_proof(
+    directories: &ImageDirectories,
+    proof: &KaliPreparedBaseExecuteProof,
+) -> Result<KaliImageMetadata, ImageError> {
+    if capture_kali_execute_inputs(directories)? != proof.files {
+        return Err(ImageError::SourceNotVerified);
+    }
+    let metadata = inspect_kali(directories)?.ok_or(ImageError::SourceNotVerified)?;
+    if metadata != proof.metadata {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(metadata)
+}
+
+/// Opens the exact prepared Kali inode represented by an execute proof. The
+/// descriptor remains bound to that inode through a subsequent storage import.
+///
+/// # Errors
+/// Refuses proof drift or a descriptor whose identity differs from the proof.
+pub fn open_kali_prepared_base_execute_source(
+    directories: &ImageDirectories,
+    proof: &KaliPreparedBaseExecuteProof,
+) -> Result<File, ImageError> {
+    revalidate_kali_prepared_base_execute_proof(directories, proof)?;
+    let path = directories.images.join(KALI_QCOW2_FILENAME);
+    let file = File::open(&path)?;
+    let opened = opened_file_identity(&path, &file)?;
+    let expected = proof
+        .files
+        .iter()
+        .find(|identity| identity.path == path)
+        .ok_or(ImageError::SourceNotVerified)?;
+    if &opened != expected {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(file)
+}
+
 fn create_extraction_root(downloads: &Path) -> Result<PathBuf, ImageError> {
     create_extraction_root_for(downloads, ".kali-extract-")
 }
@@ -2972,6 +3105,7 @@ fn sha256_open_file(
         FullReadOperation::WorkstationHash => "Workstation hash",
         FullReadOperation::ExtractedBundleArtifactHash(_) => "extracted bundle artifact hash",
         FullReadOperation::WorkstationImport => "Workstation import",
+        FullReadOperation::KaliPreparedHash => "Kali prepared qcow2 hashing",
         FullReadOperation::OtherHash => "file hashing",
     };
     let expected_bytes = file.metadata()?.len();
@@ -3399,6 +3533,105 @@ mod tests {
             verified_at_unix_seconds: Some(1),
             status: ImageStatus::Verified,
         }
+    }
+
+    fn proven_kali_fixture(
+        test: &TestDirectories,
+    ) -> (KaliImageMetadata, KaliPreparedBaseExecuteProof) {
+        let metadata = crash_fixture(test);
+        write_kali_metadata_atomic(&test.directories, &metadata).unwrap();
+        prove_kali_prepared_base_for_execute(&test.directories).unwrap()
+    }
+
+    #[test]
+    fn kali_execute_transaction_hashes_each_large_input_once() {
+        let test = TestDirectories::new();
+        let metadata = crash_fixture(&test);
+        write_kali_metadata_atomic(&test.directories, &metadata).unwrap();
+        let mut fetcher = FixtureFetcher::valid(b"unused existing-state fetcher");
+        let (result, reads) = audit_full_reads(|| {
+            let (metadata, proof) = prepare_kali_for_execute(&test.directories, &mut fetcher)?;
+            revalidate_kali_prepared_base_execute_proof(&test.directories, &proof)?;
+            Ok::<_, ImageError>((metadata, proof))
+        });
+        let (result, proof) = result.unwrap();
+        assert_eq!(result, metadata);
+        assert_eq!(
+            reads,
+            vec![
+                FullReadOperation::ArchiveHash,
+                FullReadOperation::KaliPreparedHash
+            ]
+        );
+        assert_eq!(fetcher.downloads, 0);
+        assert!(revalidate_kali_prepared_base_execute_proof(&test.directories, &proof).is_ok());
+    }
+
+    #[test]
+    fn kali_execute_proof_refuses_same_path_inode_replacement() {
+        let test = TestDirectories::new();
+        let (_, proof) = proven_kali_fixture(&test);
+        let prepared = test.directories.images.join(KALI_QCOW2_FILENAME);
+        let replacement = test.directories.images.join("replacement.qcow2");
+        fs::write(&replacement, fs::read(&prepared).unwrap()).unwrap();
+        fs::rename(replacement, prepared).unwrap();
+        assert!(matches!(
+            revalidate_kali_prepared_base_execute_proof(&test.directories, &proof),
+            Err(ImageError::SourceNotVerified)
+        ));
+    }
+
+    #[test]
+    fn kali_execute_proof_refuses_size_and_timestamp_drift() {
+        let test = TestDirectories::new();
+        let (_, proof) = proven_kali_fixture(&test);
+        let prepared = test.directories.images.join(KALI_QCOW2_FILENAME);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&prepared)
+            .unwrap()
+            .write_all(b"drift")
+            .unwrap();
+        assert!(matches!(
+            revalidate_kali_prepared_base_execute_proof(&test.directories, &proof),
+            Err(ImageError::SourceNotVerified)
+        ));
+
+        let test = TestDirectories::new();
+        let (_, proof) = proven_kali_fixture(&test);
+        let prepared = test.directories.images.join(KALI_QCOW2_FILENAME);
+        let changed = fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(5));
+        File::options()
+            .write(true)
+            .open(prepared)
+            .unwrap()
+            .set_times(changed)
+            .unwrap();
+        assert!(matches!(
+            revalidate_kali_prepared_base_execute_proof(&test.directories, &proof),
+            Err(ImageError::SourceNotVerified)
+        ));
+    }
+
+    #[test]
+    fn kali_execute_proof_refuses_mode_and_link_count_drift() {
+        let test = TestDirectories::new();
+        let (_, proof) = proven_kali_fixture(&test);
+        let prepared = test.directories.images.join(KALI_QCOW2_FILENAME);
+        fs::set_permissions(&prepared, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(matches!(
+            revalidate_kali_prepared_base_execute_proof(&test.directories, &proof),
+            Err(ImageError::SourceNotVerified)
+        ));
+
+        let test = TestDirectories::new();
+        let (_, proof) = proven_kali_fixture(&test);
+        let prepared = test.directories.images.join(KALI_QCOW2_FILENAME);
+        fs::hard_link(&prepared, test.directories.images.join("extra-link.qcow2")).unwrap();
+        assert!(matches!(
+            revalidate_kali_prepared_base_execute_proof(&test.directories, &proof),
+            Err(ImageError::SourceNotVerified)
+        ));
     }
 
     #[test]
