@@ -690,8 +690,28 @@ fn validate_profile_binding(
     index: &forge_state::GenerationIndex,
     active: &forge_state::GenerationManifest,
 ) -> Result<forge_core::VmProfile, String> {
-    let profile = forge_profiles::find(instance_name)
-        .ok_or_else(|| format!("no profile binding exists for instance {instance_name}"))?;
+    let durable_base = active
+        .resources
+        .iter()
+        .find(|resource| resource.role == forge_state::ResourceRole::SharedBase)
+        .ok_or_else(|| "active generation lacks SharedBase".to_owned())?;
+    let profile = if let Some(profile) = forge_profiles::find(instance_name) {
+        profile
+    } else {
+        let mut matching = forge_profiles::built_in_profiles()
+            .into_iter()
+            .filter(|profile| {
+                profile.persistence == forge_core::PersistencePolicy::Persistent
+                    && forge_profiles::base_volume_name(profile) == durable_base.volume_name
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(format!(
+                "durable shared-base identity does not select exactly one profile for instance {instance_name}"
+            ));
+        }
+        matching.remove(0)
+    };
     if profile.persistence != forge_core::PersistencePolicy::Persistent {
         return Err("operational lifecycle requires Persistent profile policy".to_owned());
     }
@@ -2813,7 +2833,14 @@ fn create_vm_dry_run(profile_name: &str, instance_name: &str) -> ExitCode {
         println!("Pair validation: exact complementary endpoints");
         println!("Workstation uplink: none (no passt, NAT, bridge, or libvirt network)");
     }
-    print_create_plan(&plan, &domain);
+    let shared_base = match resolve_shared_base_dry_run(&plan) {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            eprintln!("shared-base dry-run classification refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    print_create_plan(&plan, &domain, &shared_base);
     ExitCode::SUCCESS
 }
 
@@ -2922,10 +2949,7 @@ fn require_workstation_targets_absent(
     {
         return Err("Workstation domain target identity already exists".to_owned());
     }
-    for volume in [
-        factory.prepared_base.base_volume_name.as_str(),
-        factory.generation.overlay.as_str(),
-    ] {
+    for volume in [factory.generation.overlay.as_str()] {
         if ImagePrepareBackend::inspect_volume(&mut backend, forge_storage::DEFAULT_POOL, volume)
             .map_err(|error| error.to_string())?
             .is_some()
@@ -2938,7 +2962,11 @@ fn require_workstation_targets_absent(
     Ok(())
 }
 
-fn print_create_plan(plan: &forge_profiles::GenericCreatePlan, domain: &forge_domain::DomainSpec) {
+fn print_create_plan(
+    plan: &forge_profiles::GenericCreatePlan,
+    domain: &forge_domain::DomainSpec,
+    shared_base: &SharedBaseDryRunResolution,
+) {
     println!("Mode: create dry-run (zero mutation)");
     println!("Profile: {}", plan.instance.identity.profile_id);
     println!("Instance identity: {}", plan.instance.identity.name);
@@ -2953,6 +2981,11 @@ fn print_create_plan(plan: &forge_profiles::GenericCreatePlan, domain: &forge_do
         plan.prepared_base.source_format,
         plan.prepared_base.base_volume_name
     );
+    println!(
+        "Prepared base semantics: prove and reuse an exact existing trusted base; otherwise prepare it when absent"
+    );
+    println!("Prepared base ownership: shared, protected, reusable");
+    print!("{}", format_shared_base_resolution(shared_base));
     if matches!(
         plan.prepared_base.source,
         forge_core::ImageSourcePolicy::WhonixLibvirtBundle { .. }
@@ -2969,7 +3002,7 @@ fn print_create_plan(plan: &forge_profiles::GenericCreatePlan, domain: &forge_do
         }
     }
     println!(
-        "Storage plan: overlay {}, capacity {} GiB",
+        "Storage plan: new generation-owned overlay {}, capacity {} GiB",
         plan.generation.overlay,
         plan.instance.resources.disk_bytes / 1024 / 1024 / 1024
     );
@@ -3011,6 +3044,26 @@ struct PreparedBaseArtifact {
     file_bytes: u64,
     capacity_bytes: u64,
     whonix_workstation_proof: Option<forge_images::WhonixWorkstationExecuteProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedBaseConsumerProof {
+    consumer: String,
+    resource: forge_state::ManagedResource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedBaseDryRunResolution {
+    disposition: forge_storage::SharedBaseDisposition,
+    path: String,
+    proof_source: String,
+}
+
+fn format_shared_base_resolution(resolution: &SharedBaseDryRunResolution) -> String {
+    format!(
+        "Shared base disposition: {:?}\nExisting shared base: {}\nReuse proof source: {}\n",
+        resolution.disposition, resolution.path, resolution.proof_source
+    )
 }
 
 fn validate_preparation_strategy(
@@ -3109,6 +3162,44 @@ fn acquire_prepared_base(
     Ok(artifact)
 }
 
+fn verified_prepared_base_read_only(
+    plan: &forge_profiles::PreparedBaseImagePlan,
+) -> Result<PreparedBaseArtifact, String> {
+    let directories = forge_images::default_directories()
+        .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
+    let path = match validate_preparation_strategy(plan)? {
+        forge_profiles::PrepareBaseStrategy::SevenZipSingleQcow2 => {
+            forge_images::verified_kali(&directories)
+                .map_err(|error| error.to_string())?
+                .prepared_qcow2_path
+        }
+        forge_profiles::PrepareBaseStrategy::WhonixBundleGateway => {
+            forge_images::verified_whonix_gateway(&directories)
+                .map_err(|error| error.to_string())?
+                .prepared_qcow2_path
+        }
+        forge_profiles::PrepareBaseStrategy::WhonixBundleWorkstation => {
+            forge_images::verified_whonix_workstation(&directories)
+                .map_err(|error| error.to_string())?
+                .prepared_qcow2_path
+        }
+        forge_profiles::PrepareBaseStrategy::VerifiedQcow2 => {
+            return Err("verified direct-qcow2 real create is not implemented".to_owned());
+        }
+    };
+    let file_bytes = std::fs::metadata(&path)
+        .map_err(|error| error.to_string())?
+        .len();
+    let capacity_bytes =
+        forge_images::qcow2_virtual_size(&path).map_err(|error| error.to_string())?;
+    Ok(PreparedBaseArtifact {
+        path,
+        file_bytes,
+        capacity_bytes,
+        whonix_workstation_proof: None,
+    })
+}
+
 fn prove_prepared_base(
     plan: &forge_profiles::PreparedBaseImagePlan,
     source: &PreparedBaseArtifact,
@@ -3147,11 +3238,145 @@ struct ManualGuestCreateBackend {
     overlay_created: bool,
 }
 
+fn existing_shared_base_proof(
+    target_layout: &forge_state::StateLayout,
+    expected_name: &str,
+    expected: &forge_storage::OverlayVolume,
+) -> Result<SharedBaseConsumerProof, String> {
+    let state_root = target_layout
+        .domain_directory
+        .parent()
+        .ok_or_else(|| "managed state root is unavailable".to_owned())?;
+    let entries = std::fs::read_dir(state_root).map_err(|error| error.to_string())?;
+    let mut proof: Option<SharedBaseConsumerProof> = None;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(instance) = InstanceName::new(&name) else {
+            continue;
+        };
+        let layout = forge_state::StateLayout::for_instance(state_root, &instance);
+        let forge_state::ManagedState::Current(index) =
+            forge_state::inspect_layout(&layout).map_err(|error| error.to_string())?
+        else {
+            continue;
+        };
+        let manifests = load_index_manifests(&layout, &index)?;
+        let active = active_manifest(&index, &manifests)?;
+        let Some(base) = active.resources.iter().find(|resource| {
+            resource.role == forge_state::ResourceRole::SharedBase
+                && resource.volume_name == expected_name
+        }) else {
+            continue;
+        };
+        let backend = forge_libvirt::LibvirtBootBackend::connect_instance(instance)
+            .map_err(|error| error.to_string())?;
+        let observed = backend
+            .inspect_managed_state(active)
+            .map_err(|error| error.to_string())?;
+        let reconciliation = forge_state::reconcile_managed(&index, &manifests, &observed);
+        if reconciliation.status != forge_state::ManagedReconciliationStatus::Consistent {
+            return Err(format!(
+                "shared base consumer {name} is not consistently reconciled: {}",
+                reconciliation.detail
+            ));
+        }
+        if base.path != expected.path
+            || base.format != expected.format
+            || base.capacity_bytes != expected.capacity_bytes
+            || base.backing_path != expected.backing_path
+        {
+            return Err(format!(
+                "existing shared base identity differs from durable consumer {name}"
+            ));
+        }
+        if let Some(previous) = &proof
+            && previous.resource != *base
+        {
+            return Err("managed consumers disagree about shared base identity".to_owned());
+        }
+        proof = Some(SharedBaseConsumerProof {
+            consumer: name,
+            resource: base.clone(),
+        });
+    }
+    proof.ok_or_else(|| {
+        "existing shared base has no exact Consistent durable managed-consumer proof".to_owned()
+    })
+}
+
+fn resolve_shared_base_dry_run(
+    plan: &forge_profiles::GenericCreatePlan,
+) -> Result<SharedBaseDryRunResolution, String> {
+    use forge_storage::ImagePrepareBackend;
+    let mut storage =
+        forge_libvirt::LibvirtDefineBackend::connect_local().map_err(|error| error.to_string())?;
+    let pool = ImagePrepareBackend::inspect_pool(&mut storage, forge_storage::DEFAULT_POOL)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "default pool is absent".to_owned())?;
+    if !pool.active {
+        return Err("default pool is inactive".to_owned());
+    }
+    let path = format!(
+        "{}/{}",
+        pool.target_path.trim_end_matches('/'),
+        plan.prepared_base.base_volume_name
+    );
+    let existing = ImagePrepareBackend::inspect_volume(
+        &mut storage,
+        forge_storage::DEFAULT_POOL,
+        &plan.prepared_base.base_volume_name,
+    )
+    .map_err(|error| error.to_string())?;
+    let Some(existing) = existing else {
+        let expected = forge_storage::BaseImageVolume {
+            name: plan.prepared_base.base_volume_name.clone(),
+            path: path.clone(),
+            imported_bytes: 0,
+            capacity_bytes: 0,
+            format: "qcow2".to_owned(),
+        };
+        let disposition = forge_storage::classify_shared_base(&expected, None, None)?;
+        return Ok(SharedBaseDryRunResolution {
+            disposition,
+            path: format!("{path} (absent)"),
+            proof_source: "not required; shared base is absent".to_owned(),
+        });
+    };
+    let source = verified_prepared_base_read_only(&plan.prepared_base)?;
+    let expected = forge_storage::BaseImageVolume {
+        name: plan.prepared_base.base_volume_name.clone(),
+        path: path.clone(),
+        imported_bytes: source.file_bytes,
+        capacity_bytes: source.capacity_bytes,
+        format: "qcow2".to_owned(),
+    };
+    let layout = managed_state_layout_for(&plan.instance.identity.name)?;
+    let proof =
+        existing_shared_base_proof(&layout, &plan.prepared_base.base_volume_name, &existing)?;
+    let disposition =
+        forge_storage::classify_shared_base(&expected, Some(&existing), Some(&proof.resource))?;
+    Ok(SharedBaseDryRunResolution {
+        disposition,
+        path,
+        proof_source: format!("durable Consistent Active generation of {}", proof.consumer),
+    })
+}
+
 impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
-    fn revalidate_absent(
+    fn revalidate_targets(
         &mut self,
         plan: &forge_storage::GenericCreateExecutionPlan,
-    ) -> Result<(), String> {
+    ) -> Result<forge_storage::SharedBaseDisposition, String> {
         use forge_storage::{DefineBackend, ImagePrepareBackend};
         let started = Instant::now();
         eprintln!("[forge] phase start: execute boundary revalidation");
@@ -3182,32 +3407,63 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
         if !pool.active || pool.available_bytes < plan.factory.instance.resources.disk_bytes {
             return Err("default pool is inactive or lacks required capacity".to_owned());
         }
-        for name in [
-            plan.factory.prepared_base.base_volume_name.as_str(),
-            plan.factory.generation.overlay.as_str(),
-        ] {
-            if ImagePrepareBackend::inspect_volume(
-                &mut self.storage,
-                forge_storage::DEFAULT_POOL,
-                name,
-            )
-            .map_err(|error| error.to_string())?
-            .is_some()
-            {
-                return Err(format!("exact planned volume already exists: {name}"));
-            }
+        if ImagePrepareBackend::inspect_volume(
+            &mut self.storage,
+            forge_storage::DEFAULT_POOL,
+            &plan.factory.generation.overlay,
+        )
+        .map_err(|error| error.to_string())?
+        .is_some()
+        {
+            return Err(format!(
+                "generation-owned overlay already exists: {}",
+                plan.factory.generation.overlay
+            ));
         }
         prove_prepared_base(&plan.factory.prepared_base, &self.source)?;
+        let base = ImagePrepareBackend::inspect_volume(
+            &mut self.storage,
+            forge_storage::DEFAULT_POOL,
+            &plan.factory.prepared_base.base_volume_name,
+        )
+        .map_err(|error| error.to_string())?;
+        let expected = forge_storage::BaseImageVolume {
+            name: plan.factory.prepared_base.base_volume_name.clone(),
+            path: format!(
+                "{}/{}",
+                pool.target_path.trim_end_matches('/'),
+                plan.factory.prepared_base.base_volume_name
+            ),
+            imported_bytes: self.source.file_bytes,
+            capacity_bytes: self.source.capacity_bytes,
+            format: "qcow2".to_owned(),
+        };
+        let durable = base
+            .as_ref()
+            .map(|existing| {
+                existing_shared_base_proof(
+                    &self.layout,
+                    &plan.factory.prepared_base.base_volume_name,
+                    existing,
+                )
+            })
+            .transpose()?;
+        let disposition = forge_storage::classify_shared_base(
+            &expected,
+            base.as_ref(),
+            durable.as_ref().map(|proof| &proof.resource),
+        )?;
         eprintln!(
-            "[forge] phase done: execute boundary revalidation elapsed={:.1}s",
+            "[forge] phase done: execute boundary revalidation shared-base={disposition:?} elapsed={:.1}s",
             started.elapsed().as_secs_f64()
         );
-        Ok(())
+        Ok(disposition)
     }
 
     fn prepare_storage(
         &mut self,
         plan: &forge_storage::GenericCreateExecutionPlan,
+        disposition: forge_storage::SharedBaseDisposition,
     ) -> Result<(), String> {
         use forge_storage::ImagePrepareBackend;
         let started = Instant::now();
@@ -3228,29 +3484,48 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
             capacity_bytes: self.source.capacity_bytes,
             format: "qcow2".to_owned(),
         };
-        let pinned_source = self
-            .source
-            .whonix_workstation_proof
-            .as_ref()
-            .map(|proof| {
-                let directories = forge_images::default_directories()
-                    .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
-                forge_images::open_whonix_workstation_execute_source(&directories, proof)
-                    .map_err(|error| error.to_string())
-            })
-            .transpose()?;
-        let source_path = pinned_source.as_ref().map_or_else(
-            || self.source.path.to_string_lossy().into_owned(),
-            |file| format!("/proc/self/fd/{}", file.as_raw_fd()),
-        );
-        ImagePrepareBackend::import_base(
-            &mut self.storage,
-            forge_storage::DEFAULT_POOL,
-            &base,
-            &source_path,
-        )
-        .map_err(|error| error.to_string())?;
-        self.base_created = true;
+        match disposition {
+            forge_storage::SharedBaseDisposition::Prepare => {
+                let pinned_source = self
+                    .source
+                    .whonix_workstation_proof
+                    .as_ref()
+                    .map(|proof| {
+                        let directories = forge_images::default_directories()
+                            .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
+                        forge_images::open_whonix_workstation_execute_source(&directories, proof)
+                            .map_err(|error| error.to_string())
+                    })
+                    .transpose()?;
+                let source_path = pinned_source.as_ref().map_or_else(
+                    || self.source.path.to_string_lossy().into_owned(),
+                    |file| format!("/proc/self/fd/{}", file.as_raw_fd()),
+                );
+                ImagePrepareBackend::import_base(
+                    &mut self.storage,
+                    forge_storage::DEFAULT_POOL,
+                    &base,
+                    &source_path,
+                )
+                .map_err(|error| error.to_string())?;
+                self.base_created = true;
+            }
+            forge_storage::SharedBaseDisposition::ReuseProven => {
+                let existing = ImagePrepareBackend::inspect_volume(
+                    &mut self.storage,
+                    forge_storage::DEFAULT_POOL,
+                    &base.name,
+                )
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "proven shared base disappeared before reuse".to_owned())?;
+                let durable = existing_shared_base_proof(&self.layout, &base.name, &existing)?;
+                forge_storage::classify_shared_base(
+                    &base,
+                    Some(&existing),
+                    Some(&durable.resource),
+                )?;
+            }
+        }
         let overlay = forge_storage::OverlayVolume {
             name: plan.factory.generation.overlay.clone(),
             path: format!(
@@ -3699,5 +3974,69 @@ mod tests {
         assert!(!confirmation_accepted("no"));
         assert!(!confirmation_accepted("force"));
         assert!(confirmation_accepted("yes\n"));
+    }
+
+    #[test]
+    fn dry_run_shared_base_output_exposes_typed_disposition_and_proof() {
+        let resolution = SharedBaseDryRunResolution {
+            disposition: forge_storage::SharedBaseDisposition::ReuseProven,
+            path: "/pool/base.qcow2".to_owned(),
+            proof_source: "durable Consistent Active generation of existing-vm".to_owned(),
+        };
+        assert_eq!(
+            format_shared_base_resolution(&resolution),
+            "Shared base disposition: ReuseProven\nExisting shared base: /pool/base.qcow2\nReuse proof source: durable Consistent Active generation of existing-vm\n"
+        );
+        assert!(format_shared_base_resolution(&resolution).contains("ReuseProven"));
+    }
+
+    #[test]
+    fn independent_instance_resolves_profile_from_unique_durable_shared_base() {
+        let generation_id = "gen-test".to_owned();
+        let index = forge_state::GenerationIndex {
+            schema_version: forge_state::INDEX_SCHEMA_VERSION,
+            domain_name: "kali-2".to_owned(),
+            domain_uuid: "domain-uuid".to_owned(),
+            active_generation_id: generation_id.clone(),
+            generations: vec![forge_state::GenerationEntry {
+                generation_id: generation_id.clone(),
+                status: forge_state::GenerationStatus::Active,
+                manifest_file: "generations/gen-test.json".to_owned(),
+            }],
+            cleanup_progress: vec![],
+        };
+        let active = forge_state::GenerationManifest {
+            schema_version: forge_state::SCHEMA_VERSION,
+            domain_name: "kali-2".to_owned(),
+            domain_uuid: "domain-uuid".to_owned(),
+            generation_id,
+            created_unix_seconds: 1,
+            libvirt_uri: "qemu:///system".to_owned(),
+            storage_pool_name: "default".to_owned(),
+            storage_pool_uuid: "pool-uuid".to_owned(),
+            status: forge_state::GenerationStatus::Preparing,
+            resources: vec![
+                forge_state::ManagedResource {
+                    role: forge_state::ResourceRole::SharedBase,
+                    volume_name: "forge-base-kali-2026.2.qcow2".to_owned(),
+                    volume_key: "/pool/base".to_owned(),
+                    path: "/pool/base".to_owned(),
+                    format: "qcow2".to_owned(),
+                    capacity_bytes: 86_000_000_000,
+                    backing_path: None,
+                },
+                forge_state::ManagedResource {
+                    role: forge_state::ResourceRole::WritableOverlay,
+                    volume_name: "kali-2-gen-test.qcow2".to_owned(),
+                    volume_key: "/pool/overlay".to_owned(),
+                    path: "/pool/overlay".to_owned(),
+                    format: "qcow2".to_owned(),
+                    capacity_bytes: 86 * 1024 * 1024 * 1024,
+                    backing_path: Some("/pool/base".to_owned()),
+                },
+            ],
+        };
+        let profile = validate_profile_binding("kali-2", &index, &active).unwrap();
+        assert_eq!(profile.id.as_str(), "kali-lab");
     }
 }

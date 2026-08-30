@@ -2026,6 +2026,20 @@ pub fn inspect_whonix_workstation_preparation(
     Ok(WhonixPreparationState::Verified(Box::new(metadata)))
 }
 
+/// Returns the Workstation base only when its prepared bytes and authenticated
+/// bundle provenance still pass the existing read-only verification path.
+///
+/// # Errors
+/// Returns an error when no fully verified prepared Workstation base is available.
+pub fn verified_whonix_workstation(
+    directories: &ImageDirectories,
+) -> Result<WhonixGatewayImageMetadata, ImageError> {
+    match inspect_whonix_workstation_preparation(directories)? {
+        WhonixPreparationState::Verified(metadata) => Ok(*metadata),
+        _ => Err(ImageError::SourceNotVerified),
+    }
+}
+
 /// Returns the exact digest bound to one typed Whonix bundle role.
 ///
 /// # Errors

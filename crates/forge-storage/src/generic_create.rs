@@ -1,7 +1,11 @@
 use forge_core::FirstBootSuccessPolicy;
 use forge_profiles::GenericCreatePlan;
-use forge_state::{GenerationIndex, GenerationManifest, ObservedGeneration};
+use forge_state::{
+    GenerationIndex, GenerationManifest, ManagedResource, ObservedGeneration, ResourceRole,
+};
 use std::fmt;
+
+use crate::{BaseImageVolume, OverlayVolume};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenericCreateExecutionPlan {
@@ -14,6 +18,52 @@ pub struct GenericCreateExecutionPlan {
 pub struct GenericCreateResult {
     pub index: GenerationIndex,
     pub observed: ObservedGeneration,
+}
+
+/// The only two safe states for the protected image-store asset at create time.
+/// Generation-owned resources never use this disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedBaseDisposition {
+    Prepare,
+    ReuseProven,
+}
+
+/// Classifies only the shared image-store asset. An existing object is reusable
+/// solely when current storage shape and a freshly reconciled durable consumer
+/// identify the same protected base.
+///
+/// # Errors
+/// Refuses existing objects without proof or with any identity/shape mismatch.
+pub fn classify_shared_base(
+    expected: &BaseImageVolume,
+    existing: Option<&OverlayVolume>,
+    durable_proof: Option<&ManagedResource>,
+) -> Result<SharedBaseDisposition, String> {
+    let Some(existing) = existing else {
+        return Ok(SharedBaseDisposition::Prepare);
+    };
+    if existing.name != expected.name
+        || existing.path != expected.path
+        || existing.format != expected.format
+        || existing.capacity_bytes != expected.capacity_bytes
+        || existing.backing_path.is_some()
+    {
+        return Err("existing shared base has wrong format, capacity, path, or backing".to_owned());
+    }
+    let proof = durable_proof.ok_or_else(|| {
+        "existing shared base has no exact Consistent durable managed-consumer proof".to_owned()
+    })?;
+    if proof.role != ResourceRole::SharedBase
+        || proof.volume_name != existing.name
+        || proof.path != existing.path
+        || proof.format != existing.format
+        || proof.capacity_bytes != existing.capacity_bytes
+        || proof.backing_path != existing.backing_path
+        || proof.volume_key.is_empty()
+    {
+        return Err("existing shared base differs from durable managed-consumer proof".to_owned());
+    }
+    Ok(SharedBaseDisposition::ReuseProven)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,10 +95,18 @@ impl std::error::Error for GenericCreateError {}
 
 #[allow(clippy::missing_errors_doc)]
 pub trait GenericCreateBackend {
-    /// Revalidates domain, pool, storage, network, and state absence immediately before mutation.
-    fn revalidate_absent(&mut self, plan: &GenericCreateExecutionPlan) -> Result<(), String>;
-    /// Acquires/verifies/imports the protected base and creates the exact owned overlay.
-    fn prepare_storage(&mut self, plan: &GenericCreateExecutionPlan) -> Result<(), String>;
+    /// Revalidates domain, generation-owned storage, network, and state absence immediately
+    /// before mutation, and returns the proven disposition of the shared base.
+    fn revalidate_targets(
+        &mut self,
+        plan: &GenericCreateExecutionPlan,
+    ) -> Result<SharedBaseDisposition, String>;
+    /// Prepares or re-proves the protected base and creates the exact owned overlay.
+    fn prepare_storage(
+        &mut self,
+        plan: &GenericCreateExecutionPlan,
+        base: SharedBaseDisposition,
+    ) -> Result<(), String>;
     /// Returns exact pool/key/path/format/capacity/backing identities before domain definition.
     fn inspect_preparing(
         &mut self,
@@ -98,10 +156,10 @@ pub fn execute_generic_create<B: GenericCreateBackend>(
             "only a zero-boot persistent ManualGuest plan is supported".to_owned(),
         ));
     }
-    backend
-        .revalidate_absent(plan)
+    let base = backend
+        .revalidate_targets(plan)
         .map_err(GenericCreateError::BeforeOwnership)?;
-    if let Err(error) = backend.prepare_storage(plan) {
+    if let Err(error) = backend.prepare_storage(plan, base) {
         let rollback = backend.rollback_before_ownership(plan).err();
         return Err(GenericCreateError::BeforeOwnership(match rollback {
             Some(rollback) => format!("{error}; rollback also failed: {rollback}"),
@@ -223,17 +281,96 @@ mod tests {
         }
     }
 
+    fn base_plan() -> BaseImageVolume {
+        BaseImageVolume {
+            name: "forge-base-example.qcow2".to_owned(),
+            path: "/pool/forge-base-example.qcow2".to_owned(),
+            imported_bytes: 10,
+            capacity_bytes: 20,
+            format: "qcow2".to_owned(),
+        }
+    }
+
+    fn existing_base() -> OverlayVolume {
+        OverlayVolume {
+            name: "forge-base-example.qcow2".to_owned(),
+            path: "/pool/forge-base-example.qcow2".to_owned(),
+            capacity_bytes: 20,
+            allocation_bytes: 10,
+            format: "qcow2".to_owned(),
+            backing_path: None,
+        }
+    }
+
+    fn durable_base() -> ManagedResource {
+        ManagedResource {
+            role: ResourceRole::SharedBase,
+            volume_name: "forge-base-example.qcow2".to_owned(),
+            volume_key: "/pool/forge-base-example.qcow2".to_owned(),
+            path: "/pool/forge-base-example.qcow2".to_owned(),
+            format: "qcow2".to_owned(),
+            capacity_bytes: 20,
+            backing_path: None,
+        }
+    }
+
+    #[test]
+    fn absent_shared_base_uses_normal_preparation() {
+        assert_eq!(
+            classify_shared_base(&base_plan(), None, None).unwrap(),
+            SharedBaseDisposition::Prepare
+        );
+    }
+
+    #[test]
+    fn proven_shared_base_is_reusable_for_multiple_consumers() {
+        for _consumer in ["second", "third"] {
+            assert_eq!(
+                classify_shared_base(&base_plan(), Some(&existing_base()), Some(&durable_base()))
+                    .unwrap(),
+                SharedBaseDisposition::ReuseProven
+            );
+        }
+    }
+
+    #[test]
+    fn existing_path_without_durable_proof_is_refused() {
+        assert!(classify_shared_base(&base_plan(), Some(&existing_base()), None).is_err());
+    }
+
+    #[test]
+    fn wrong_or_generation_owned_existing_base_is_refused() {
+        let mut wrong = existing_base();
+        wrong.backing_path = Some("/pool/unexpected.qcow2".to_owned());
+        assert!(classify_shared_base(&base_plan(), Some(&wrong), Some(&durable_base())).is_err());
+        let mut wrong_role = durable_base();
+        wrong_role.role = ResourceRole::WritableOverlay;
+        assert!(
+            classify_shared_base(&base_plan(), Some(&existing_base()), Some(&wrong_role)).is_err()
+        );
+    }
+
     struct Mock {
         persisted: bool,
         fail_define: bool,
         rollback_calls: usize,
+        base: SharedBaseDisposition,
+        prepared_with: Option<SharedBaseDisposition>,
     }
 
     impl GenericCreateBackend for Mock {
-        fn revalidate_absent(&mut self, _: &GenericCreateExecutionPlan) -> Result<(), String> {
-            Ok(())
+        fn revalidate_targets(
+            &mut self,
+            _: &GenericCreateExecutionPlan,
+        ) -> Result<SharedBaseDisposition, String> {
+            Ok(self.base)
         }
-        fn prepare_storage(&mut self, _: &GenericCreateExecutionPlan) -> Result<(), String> {
+        fn prepare_storage(
+            &mut self,
+            _: &GenericCreateExecutionPlan,
+            base: SharedBaseDisposition,
+        ) -> Result<(), String> {
+            self.prepared_with = Some(base);
             Ok(())
         }
         fn inspect_preparing(
@@ -294,10 +431,13 @@ mod tests {
             persisted: false,
             fail_define: false,
             rollback_calls: 0,
+            base: SharedBaseDisposition::Prepare,
+            prepared_with: None,
         };
         let result = execute_generic_create(&mut backend, &execution_plan()).unwrap();
         assert!(backend.persisted);
         assert_eq!(backend.rollback_calls, 0);
+        assert_eq!(backend.prepared_with, Some(SharedBaseDisposition::Prepare));
         assert_eq!(result.index.generations[0].status, GenerationStatus::Active);
     }
 
@@ -307,6 +447,8 @@ mod tests {
             persisted: false,
             fail_define: true,
             rollback_calls: 0,
+            base: SharedBaseDisposition::ReuseProven,
+            prepared_with: None,
         };
         assert!(matches!(
             execute_generic_create(&mut backend, &execution_plan()),
@@ -314,5 +456,34 @@ mod tests {
         ));
         assert!(backend.persisted);
         assert_eq!(backend.rollback_calls, 0);
+        assert_eq!(
+            backend.prepared_with,
+            Some(SharedBaseDisposition::ReuseProven)
+        );
+    }
+
+    #[test]
+    fn proven_shared_base_disposition_is_carried_into_storage_without_becoming_owned() {
+        let mut backend = Mock {
+            persisted: false,
+            fail_define: false,
+            rollback_calls: 0,
+            base: SharedBaseDisposition::ReuseProven,
+            prepared_with: None,
+        };
+        let result = execute_generic_create(&mut backend, &execution_plan()).unwrap();
+        assert_eq!(
+            backend.prepared_with,
+            Some(SharedBaseDisposition::ReuseProven)
+        );
+        assert_eq!(
+            result
+                .observed
+                .resources
+                .iter()
+                .filter(|resource| resource.role == ResourceRole::WritableOverlay)
+                .count(),
+            1
+        );
     }
 }
