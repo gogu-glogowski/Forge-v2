@@ -1,6 +1,9 @@
 //! Minimal, secret-free Fedora-Lab cloud-init and first-boot planning.
 
-use forge_core::{NetworkPolicy, PersistencePolicy, ProvisioningPolicy, VmProfile, VmState};
+use forge_core::{
+    FirstBootSuccessPolicy, NetworkPolicy, PersistencePolicy, ProvisioningPolicy, VmProfile,
+    VmState,
+};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::time::Duration;
@@ -178,6 +181,7 @@ pub fn plan_generation_cleanup(
 pub enum LifecycleAction {
     Start,
     Shutdown,
+    ForceStop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +198,21 @@ pub struct LifecycleActionPlan {
 pub enum LifecycleNoop {
     AlreadyRunning,
     AlreadyShutoff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownTimeoutPolicy {
+    pub graceful_seconds: u64,
+    pub force_seconds: u64,
+}
+
+impl Default for ShutdownTimeoutPolicy {
+    fn default() -> Self {
+        Self {
+            graceful_seconds: 120,
+            force_seconds: 30,
+        }
+    }
 }
 
 /// Plans start or graceful shutdown after validating the managed Fedora-Lab topology.
@@ -214,6 +233,10 @@ pub fn plan_lifecycle_action(
             provisioning: ProvisioningPolicy::NoCloud {
                 default_user: "forge".to_owned(),
                 guest_agent: true,
+            },
+            first_boot_success: FirstBootSuccessPolicy::CloudInitManaged {
+                expected_user: "forge".to_owned(),
+                require_guest_agent: true,
             },
             network: NetworkPolicy::DefaultNat,
             expected_base_capacity: Some(5 * 1024 * 1024 * 1024),
@@ -239,6 +262,7 @@ pub fn plan_instance_lifecycle(
             persistence: profile.persistence,
             disk_bytes: profile.resources.disk_bytes,
             provisioning: profile.provisioning.clone(),
+            first_boot_success: profile.first_boot_success.clone(),
             network: profile.network_policy.clone(),
             expected_base_capacity: None,
             reconciliation: if reconciled {
@@ -255,6 +279,7 @@ struct LifecyclePolicyEvidence {
     persistence: PersistencePolicy,
     disk_bytes: u64,
     provisioning: ProvisioningPolicy,
+    first_boot_success: FirstBootSuccessPolicy,
     network: NetworkPolicy,
     expected_base_capacity: Option<u64>,
     reconciliation: ReconciliationEvidence,
@@ -266,6 +291,7 @@ enum ReconciliationEvidence {
     Incomplete,
 }
 
+#[allow(clippy::too_many_lines)]
 fn plan_lifecycle_with_policy(
     status: &FedoraLabLifecycleStatus,
     action: LifecycleAction,
@@ -319,9 +345,11 @@ fn plan_lifecycle_with_policy(
             60,
             vec!["return typed AlreadyRunning without calling libvirt create".to_owned()],
         ),
-        LifecycleAction::Start if status.domain_state == VmState::Shutoff => {
-            (None, 180, start_steps(&policy.provisioning))
-        }
+        LifecycleAction::Start if status.domain_state == VmState::Shutoff => (
+            None,
+            BootTimeouts::default().domain_running_seconds,
+            start_steps(&policy.first_boot_success),
+        ),
         LifecycleAction::Start => {
             return Err(ProvisioningError::LifecycleUnsafe(format!(
                 "domain cannot be started from state {}",
@@ -330,21 +358,41 @@ fn plan_lifecycle_with_policy(
         }
         LifecycleAction::Shutdown if status.domain_state == VmState::Shutoff => (
             Some(LifecycleNoop::AlreadyShutoff),
-            120,
+            ShutdownTimeoutPolicy::default().graceful_seconds,
             vec!["return typed AlreadyShutoff without calling libvirt shutdown".to_owned()],
         ),
         LifecycleAction::Shutdown if status.domain_state == VmState::Running => (
             None,
-            120,
+            ShutdownTimeoutPolicy::default().graceful_seconds,
             vec![
                 "request graceful libvirt shutdown exactly once".to_owned(),
-                "wait at most 120s for unambiguous shut off".to_owned(),
+                format!(
+                    "wait at most {}s for unambiguous shut off",
+                    ShutdownTimeoutPolicy::default().graceful_seconds
+                ),
                 "never fall back to destroy or force-off".to_owned(),
             ],
         ),
         LifecycleAction::Shutdown => {
             return Err(ProvisioningError::LifecycleUnsafe(format!(
                 "domain cannot be gracefully shut down from state {}",
+                status.domain_state
+            )));
+        }
+        LifecycleAction::ForceStop if status.domain_state == VmState::Running => (
+            None,
+            ShutdownTimeoutPolicy::default().force_seconds,
+            vec![
+                "destroy the exact UUID-bound running domain (equivalent to cutting VM power)"
+                    .to_owned(),
+                "do not undefine the domain or mutate storage, state, or generation ownership"
+                    .to_owned(),
+                "require fresh shutoff state and Consistent reconciliation".to_owned(),
+            ],
+        ),
+        LifecycleAction::ForceStop => {
+            return Err(ProvisioningError::LifecycleUnsafe(format!(
+                "domain cannot be force-stopped from state {}",
                 status.domain_state
             )));
         }
@@ -357,7 +405,7 @@ fn plan_lifecycle_with_policy(
         checks.push("active NoCloud seed is present".to_owned());
         checks.push("declarative QGA channel follows profile policy".to_owned());
     }
-    if action == LifecycleAction::Start {
+    if action == LifecycleAction::Start && policy.network == NetworkPolicy::DefaultNat {
         checks.push("libvirt default network is active".to_owned());
     }
     Ok(LifecycleActionPlan {
@@ -370,16 +418,16 @@ fn plan_lifecycle_with_policy(
     })
 }
 
-fn start_steps(provisioning: &ProvisioningPolicy) -> Vec<String> {
+fn start_steps(policy: &FirstBootSuccessPolicy) -> Vec<String> {
     let mut steps = vec![
         "call libvirt create exactly once".to_owned(),
         "wait at most 60s for running".to_owned(),
     ];
-    match provisioning {
-        ProvisioningPolicy::NoCloud { .. } => steps.push(
+    match policy {
+        FirstBootSuccessPolicy::CloudInitManaged { .. } => steps.push(
             "run typed DHCP, QGA, and SSH/cloud-init observability with finite timeouts".to_owned(),
         ),
-        ProvisioningPolicy::None => steps.push(
+        FirstBootSuccessPolicy::ManualGuest | FirstBootSuccessPolicy::BootOnly => steps.push(
             "return after domain running; profile requires no guest observability".to_owned(),
         ),
     }
@@ -719,6 +767,124 @@ pub trait BootBackend {
     ) -> Result<SshObservation, ProvisioningError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeStartResult {
+    ManualGuest { domain: DomainBootStatus },
+    CloudInitManaged(BootResult),
+}
+
+/// Executes the policy-selected runtime start observation boundary.
+///
+/// `ManualGuest` proves only that the exact domain reached `running`. It never
+/// invokes DHCP, QGA, SSH, cloud-init, user, hostname, or image operations.
+///
+/// # Errors
+/// Returns the first libvirt start or required policy observation error.
+pub fn execute_runtime_start<B: BootBackend>(
+    backend: &mut B,
+    policy: &FirstBootSuccessPolicy,
+    ssh_private_key_path: &str,
+    timeouts: BootTimeouts,
+) -> Result<RuntimeStartResult, ProvisioningError> {
+    backend.start()?;
+    backend.wait_running(Duration::from_secs(timeouts.domain_running_seconds))?;
+    if matches!(policy, FirstBootSuccessPolicy::ManualGuest) {
+        return Ok(RuntimeStartResult::ManualGuest {
+            domain: DomainBootStatus::Running,
+        });
+    }
+    let FirstBootSuccessPolicy::CloudInitManaged {
+        require_guest_agent,
+        ..
+    } = policy
+    else {
+        return Ok(RuntimeStartResult::ManualGuest {
+            domain: DomainBootStatus::Running,
+        });
+    };
+    let ip_address = backend.discover_ip(Duration::from_secs(timeouts.dhcp_lease_seconds))?;
+    let guest_agent = if *require_guest_agent {
+        backend.wait_guest_agent(Duration::from_secs(timeouts.guest_agent_seconds))?
+    } else {
+        GuestAgentStatus::Unavailable
+    };
+    let ssh = if let Some(ip) = ip_address.as_deref() {
+        backend.observe_ssh(
+            ip,
+            ssh_private_key_path,
+            Duration::from_secs(timeouts.ssh_seconds),
+        )?
+    } else {
+        SshObservation {
+            status: SshStatus::TimedOut {
+                after_seconds: timeouts.dhcp_lease_seconds,
+            },
+            cloud_init: CloudInitStatus::Unknown,
+            forge_user_confirmed: false,
+            hostname: None,
+        }
+    };
+    Ok(RuntimeStartResult::CloudInitManaged(BootResult {
+        domain: DomainBootStatus::Running,
+        dhcp_lease: ip_address.map_or(
+            DhcpLeaseStatus::TimedOut {
+                after_seconds: timeouts.dhcp_lease_seconds,
+            },
+            DhcpLeaseStatus::Available,
+        ),
+        guest_agent,
+        ssh: ssh.status,
+        cloud_init: ssh.cloud_init,
+        forge_user_confirmed: ssh.forge_user_confirmed,
+        hostname: ssh.hostname,
+    }))
+}
+
+pub trait RuntimeStopBackend {
+    /// Sends one graceful shutdown request and waits for shutoff.
+    ///
+    /// # Errors
+    /// Returns a typed timeout or backend error without attempting force-stop.
+    fn graceful_shutdown_and_wait(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ManagedShutdownStatus, ProvisioningError>;
+
+    /// Force-stops the exact UUID-bound domain and waits for shutoff.
+    ///
+    /// # Errors
+    /// Returns an error when identity/state validation or the stop operation fails.
+    fn force_stop_and_wait(
+        &mut self,
+        expected_domain_uuid: &str,
+        timeout: Duration,
+    ) -> Result<(), ProvisioningError>;
+}
+
+/// Executes only graceful shutdown. A timeout is returned unchanged and never
+/// escalates to force-stop.
+///
+/// # Errors
+/// Returns the graceful backend error unchanged.
+pub fn execute_graceful_shutdown<B: RuntimeStopBackend>(
+    backend: &mut B,
+    timeout: Duration,
+) -> Result<ManagedShutdownStatus, ProvisioningError> {
+    backend.graceful_shutdown_and_wait(timeout)
+}
+
+/// Executes the separately confirmed force-stop boundary for an exact UUID.
+///
+/// # Errors
+/// Returns an error when the exact bound domain cannot be force-stopped and verified.
+pub fn execute_force_stop<B: RuntimeStopBackend>(
+    backend: &mut B,
+    expected_domain_uuid: &str,
+    timeout: Duration,
+) -> Result<(), ProvisioningError> {
+    backend.force_stop_and_wait(expected_domain_uuid, timeout)
+}
+
 pub trait RebuildBackend: BootBackend {
     /// # Errors
     /// Returns an error if rebuild names collide or the new overlay fails validation.
@@ -923,6 +1089,9 @@ pub enum ProvisioningError {
         stage: WaitStage,
         after_seconds: u64,
     },
+    GracefulShutdownTimedOut {
+        after_seconds: u64,
+    },
     RebuildBeforeSwitch {
         primary: String,
         rollback: Vec<String>,
@@ -963,6 +1132,10 @@ impl fmt::Display for ProvisioningError {
             } => write!(
                 formatter,
                 "timed out waiting for {stage} after {after_seconds}s"
+            ),
+            Self::GracefulShutdownTimedOut { after_seconds } => write!(
+                formatter,
+                "graceful shutdown timed out after {after_seconds}s; force-stop was not attempted"
             ),
             Self::RebuildBeforeSwitch { primary, rollback } if rollback.is_empty() => {
                 write!(
@@ -1125,6 +1298,7 @@ mod tests {
     #[derive(Default)]
     struct MockBackend {
         mutations: usize,
+        operations: Vec<&'static str>,
     }
 
     impl BootBackend for MockBackend {
@@ -1141,15 +1315,19 @@ mod tests {
         }
         fn start(&mut self) -> Result<(), ProvisioningError> {
             self.mutations += 1;
+            self.operations.push("start");
             Ok(())
         }
         fn wait_running(&mut self, _: Duration) -> Result<(), ProvisioningError> {
+            self.operations.push("wait_running");
             Ok(())
         }
         fn discover_ip(&mut self, _: Duration) -> Result<Option<String>, ProvisioningError> {
+            self.operations.push("dhcp");
             Ok(Some("192.0.2.2".to_owned()))
         }
         fn wait_guest_agent(&mut self, _: Duration) -> Result<GuestAgentStatus, ProvisioningError> {
+            self.operations.push("qga");
             Ok(GuestAgentStatus::Available)
         }
         fn observe_ssh(
@@ -1158,6 +1336,7 @@ mod tests {
             _: &str,
             _: Duration,
         ) -> Result<SshObservation, ProvisioningError> {
+            self.operations.push("ssh_cloud_init_user_hostname");
             Ok(SshObservation {
                 status: SshStatus::Authenticated,
                 cloud_init: CloudInitStatus::Done,
@@ -1245,6 +1424,169 @@ mod tests {
         assert_eq!(result.cloud_init, CloudInitStatus::Done);
         assert!(result.forge_user_confirmed);
         assert_eq!(result.hostname.as_deref(), Some("fedora-lab"));
+    }
+
+    #[test]
+    fn manual_guest_runtime_start_stops_at_running_without_guest_or_image_operations() {
+        let mut backend = MockBackend::default();
+        let result = execute_runtime_start(
+            &mut backend,
+            &FirstBootSuccessPolicy::ManualGuest,
+            "/unused",
+            BootTimeouts::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            RuntimeStartResult::ManualGuest {
+                domain: DomainBootStatus::Running
+            }
+        );
+        assert_eq!(backend.operations, ["start", "wait_running"]);
+    }
+
+    #[test]
+    fn cloud_init_runtime_start_preserves_full_observability() {
+        let mut backend = MockBackend::default();
+        let result = execute_runtime_start(
+            &mut backend,
+            &FirstBootSuccessPolicy::CloudInitManaged {
+                expected_user: "forge".to_owned(),
+                require_guest_agent: true,
+            },
+            "/keys/forge_ed25519",
+            BootTimeouts::default(),
+        )
+        .unwrap();
+        assert!(matches!(result, RuntimeStartResult::CloudInitManaged(_)));
+        assert_eq!(
+            backend.operations,
+            [
+                "start",
+                "wait_running",
+                "dhcp",
+                "qga",
+                "ssh_cloud_init_user_hostname"
+            ]
+        );
+    }
+
+    #[test]
+    fn cloud_init_policy_can_explicitly_skip_qga_without_skipping_other_observability() {
+        let mut backend = MockBackend::default();
+        let result = execute_runtime_start(
+            &mut backend,
+            &FirstBootSuccessPolicy::CloudInitManaged {
+                expected_user: "forge".to_owned(),
+                require_guest_agent: false,
+            },
+            "/keys/forge_ed25519",
+            BootTimeouts::default(),
+        )
+        .unwrap();
+        let RuntimeStartResult::CloudInitManaged(result) = result else {
+            panic!("expected CloudInitManaged result");
+        };
+        assert_eq!(result.guest_agent, GuestAgentStatus::Unavailable);
+        assert_eq!(
+            backend.operations,
+            [
+                "start",
+                "wait_running",
+                "dhcp",
+                "ssh_cloud_init_user_hostname"
+            ]
+        );
+    }
+
+    #[derive(Default)]
+    struct MockRuntimeStopBackend {
+        graceful_calls: usize,
+        force_calls: usize,
+        forced_uuid: Option<String>,
+        graceful_result: Option<Result<ManagedShutdownStatus, ProvisioningError>>,
+        actual_uuid: Option<String>,
+    }
+
+    impl RuntimeStopBackend for MockRuntimeStopBackend {
+        fn graceful_shutdown_and_wait(
+            &mut self,
+            _: Duration,
+        ) -> Result<ManagedShutdownStatus, ProvisioningError> {
+            self.graceful_calls += 1;
+            self.graceful_result
+                .take()
+                .unwrap_or(Ok(ManagedShutdownStatus::GracefulShutdownCompleted))
+        }
+
+        fn force_stop_and_wait(
+            &mut self,
+            expected_domain_uuid: &str,
+            _: Duration,
+        ) -> Result<(), ProvisioningError> {
+            self.force_calls += 1;
+            if self
+                .actual_uuid
+                .as_deref()
+                .is_some_and(|actual| actual != expected_domain_uuid)
+            {
+                return Err(ProvisioningError::LifecycleUnsafe(
+                    "domain UUID changed before force-stop".to_owned(),
+                ));
+            }
+            self.forced_uuid = Some(expected_domain_uuid.to_owned());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn graceful_shutdown_success_never_force_stops() {
+        let mut backend = MockRuntimeStopBackend::default();
+        assert_eq!(
+            execute_graceful_shutdown(&mut backend, Duration::from_secs(120)).unwrap(),
+            ManagedShutdownStatus::GracefulShutdownCompleted
+        );
+        assert_eq!(backend.graceful_calls, 1);
+        assert_eq!(backend.force_calls, 0);
+    }
+
+    #[test]
+    fn graceful_shutdown_timeout_is_typed_and_never_force_stops() {
+        let mut backend = MockRuntimeStopBackend {
+            graceful_result: Some(Err(ProvisioningError::GracefulShutdownTimedOut {
+                after_seconds: 120,
+            })),
+            ..MockRuntimeStopBackend::default()
+        };
+        assert!(matches!(
+            execute_graceful_shutdown(&mut backend, Duration::from_secs(120)),
+            Err(ProvisioningError::GracefulShutdownTimedOut { after_seconds: 120 })
+        ));
+        assert_eq!(backend.graceful_calls, 1);
+        assert_eq!(backend.force_calls, 0);
+    }
+
+    #[test]
+    fn force_stop_is_a_separate_exact_uuid_bound_operation() {
+        let mut backend = MockRuntimeStopBackend::default();
+        execute_force_stop(&mut backend, "exact-domain-uuid", Duration::from_secs(30)).unwrap();
+        assert_eq!(backend.graceful_calls, 0);
+        assert_eq!(backend.force_calls, 1);
+        assert_eq!(backend.forced_uuid.as_deref(), Some("exact-domain-uuid"));
+    }
+
+    #[test]
+    fn force_stop_refuses_domain_uuid_drift() {
+        let mut backend = MockRuntimeStopBackend {
+            actual_uuid: Some("replacement-domain-uuid".to_owned()),
+            ..MockRuntimeStopBackend::default()
+        };
+        assert!(matches!(
+            execute_force_stop(&mut backend, "planned-domain-uuid", Duration::from_secs(30)),
+            Err(ProvisioningError::LifecycleUnsafe(_))
+        ));
+        assert_eq!(backend.force_calls, 1);
+        assert!(backend.forced_uuid.is_none());
     }
 
     #[test]
@@ -1394,6 +1736,60 @@ mod tests {
                 .iter()
                 .any(|step| step.contains("never fall back"))
         );
+    }
+
+    #[test]
+    fn explicit_force_stop_plan_requires_running_and_warns_about_power_cut() {
+        let status = lifecycle_status();
+        let plan = plan_lifecycle_action(&status, LifecycleAction::ForceStop).unwrap();
+        assert_eq!(
+            plan.timeout_seconds,
+            ShutdownTimeoutPolicy::default().force_seconds
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.contains("cutting VM power"))
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.contains("do not undefine"))
+        );
+
+        let mut shutoff = status;
+        shutoff.domain_state = VmState::Shutoff;
+        assert!(matches!(
+            plan_lifecycle_action(&shutoff, LifecycleAction::ForceStop),
+            Err(ProvisioningError::LifecycleUnsafe(_))
+        ));
+    }
+
+    #[test]
+    fn manual_guest_start_plan_has_only_running_observation_boundary() {
+        let profile = forge_profiles::whonix_workstation();
+        let mut status = lifecycle_status();
+        status.domain_state = VmState::Shutoff;
+        status.current_overlay.capacity_bytes = Some(profile.resources.disk_bytes);
+        status.current_seed.exists = false;
+        status.current_seed.path.clear();
+        status.active_seed_path = None;
+        let plan =
+            plan_instance_lifecycle(&status, &profile, true, LifecycleAction::Start).unwrap();
+        assert_eq!(
+            plan.timeout_seconds,
+            BootTimeouts::default().domain_running_seconds
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.contains("return after domain running"))
+        );
+        assert!(!plan.steps.iter().any(|step| {
+            ["DHCP", "QGA", "SSH", "cloud-init"]
+                .iter()
+                .any(|operation| step.contains(operation))
+        }));
     }
 
     #[test]

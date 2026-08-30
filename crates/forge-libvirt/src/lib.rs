@@ -1978,6 +1978,59 @@ impl forge_provisioning::RebuildBackend for LibvirtBootBackend {
     }
 }
 
+impl forge_provisioning::RuntimeStopBackend for LibvirtBootBackend {
+    fn graceful_shutdown_and_wait(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<forge_provisioning::ManagedShutdownStatus, forge_provisioning::ProvisioningError>
+    {
+        match <Self as forge_provisioning::RebuildBackend>::shutdown_and_wait(self, timeout) {
+            Err(forge_provisioning::ProvisioningError::Timeout {
+                stage: forge_provisioning::WaitStage::DomainShutoff,
+                after_seconds,
+            }) => Err(
+                forge_provisioning::ProvisioningError::GracefulShutdownTimedOut { after_seconds },
+            ),
+            result => result,
+        }
+    }
+
+    fn force_stop_and_wait(
+        &mut self,
+        expected_domain_uuid: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), forge_provisioning::ProvisioningError> {
+        let domain = self.domain()?;
+        let actual_uuid = domain
+            .get_uuid_string()
+            .map_err(provisioning_backend_error)?;
+        if actual_uuid != expected_domain_uuid {
+            return Err(forge_provisioning::ProvisioningError::LifecycleUnsafe(
+                "domain UUID changed before force-stop".to_owned(),
+            ));
+        }
+        let (raw_state, _) = domain.get_state().map_err(provisioning_backend_error)?;
+        if map_domain_state(raw_state).ok() != Some(VmState::Running) {
+            return Err(forge_provisioning::ProvisioningError::LifecycleUnsafe(
+                "exact bound domain is no longer running".to_owned(),
+            ));
+        }
+        domain.destroy().map_err(provisioning_backend_error)?;
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let (raw_state, _) = domain.get_state().map_err(provisioning_backend_error)?;
+            if map_domain_state(raw_state).ok() == Some(VmState::Shutoff) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        Err(forge_provisioning::ProvisioningError::Timeout {
+            stage: forge_provisioning::WaitStage::DomainShutoff,
+            after_seconds: timeout.as_secs(),
+        })
+    }
+}
+
 fn provisioning_backend_error(error: VirtError) -> forge_provisioning::ProvisioningError {
     let message = error.to_string();
     drop(error);

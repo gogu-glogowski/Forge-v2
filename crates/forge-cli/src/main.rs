@@ -48,10 +48,32 @@ fn main() -> ExitCode {
         ["vm", "status", instance] => lifecycle_status(instance),
         ["vm", "cleanup", "fedora-lab", "--dry-run"] => cleanup_vm_dry_run(),
         ["vm", "cleanup", "fedora-lab"] => managed_cleanup(false),
-        ["vm", "start", instance, "--dry-run"] => lifecycle_action(instance, true, true),
-        ["vm", "start", instance] => lifecycle_action(instance, true, false),
-        ["vm", "shutdown", instance, "--dry-run"] => lifecycle_action(instance, false, true),
-        ["vm", "shutdown", instance] => lifecycle_action(instance, false, false),
+        ["vm", "start", instance, "--dry-run"] => {
+            lifecycle_action(instance, forge_provisioning::LifecycleAction::Start, true)
+        }
+        ["vm", "start", instance] => {
+            lifecycle_action(instance, forge_provisioning::LifecycleAction::Start, false)
+        }
+        ["vm", "shutdown", instance, "--dry-run"] => lifecycle_action(
+            instance,
+            forge_provisioning::LifecycleAction::Shutdown,
+            true,
+        ),
+        ["vm", "shutdown", instance] => lifecycle_action(
+            instance,
+            forge_provisioning::LifecycleAction::Shutdown,
+            false,
+        ),
+        ["vm", "stop", instance, "--force", "--dry-run"] => lifecycle_action(
+            instance,
+            forge_provisioning::LifecycleAction::ForceStop,
+            true,
+        ),
+        ["vm", "stop", instance, "--force"] => lifecycle_action(
+            instance,
+            forge_provisioning::LifecycleAction::ForceStop,
+            false,
+        ),
         ["state", "show", "fedora-lab"] => state_show(),
         ["state", "reconcile", instance] => state_reconcile(instance),
         ["state", "recover", "fedora-lab", "--dry-run"] => state_recover(true),
@@ -531,6 +553,10 @@ fn state_adopt(dry_run: bool) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn confirmation_accepted(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 fn print_adoption_plan(
@@ -1145,7 +1171,11 @@ fn managed_cleanup(dry_run: bool) -> ExitCode {
 }
 
 #[allow(clippy::too_many_lines)]
-fn lifecycle_action(instance_name: &str, start: bool, dry_run: bool) -> ExitCode {
+fn lifecycle_action(
+    instance_name: &str,
+    action: forge_provisioning::LifecycleAction,
+    dry_run: bool,
+) -> ExitCode {
     let operational = match operational_instance(instance_name) {
         Ok(operational) => operational,
         Err(error) => {
@@ -1159,11 +1189,6 @@ fn lifecycle_action(instance_name: &str, start: bool, dry_run: bool) -> ExitCode
             eprintln!("{error}");
             return ExitCode::from(1);
         }
-    };
-    let action = if start {
-        forge_provisioning::LifecycleAction::Start
-    } else {
-        forge_provisioning::LifecycleAction::Shutdown
     };
     let plan = match forge_provisioning::plan_instance_lifecycle(
         &status,
@@ -1186,8 +1211,18 @@ fn lifecycle_action(instance_name: &str, start: bool, dry_run: bool) -> ExitCode
         }
     );
     println!("Action: {:?}", plan.action);
+    println!("Instance: {instance_name}");
+    println!(
+        "Active generation: {}",
+        operational.index.active_generation_id
+    );
+    println!("Domain UUID: {}", status.domain_uuid);
     println!("Current state: {}", plan.current_state);
     println!("Timeout: {} seconds", plan.timeout_seconds);
+    println!(
+        "Confirmation required: {}",
+        plan.idempotent_result.is_none()
+    );
     println!(
         "Idempotent result: {}",
         plan.idempotent_result
@@ -1201,18 +1236,23 @@ fn lifecycle_action(instance_name: &str, start: bool, dry_run: bool) -> ExitCode
     for step in &plan.steps {
         println!("- {step}");
     }
+    println!("Mutation: {}", !dry_run && plan.idempotent_result.is_none());
     if dry_run || plan.idempotent_result.is_some() {
         return ExitCode::SUCCESS;
     }
     eprint!(
         "{} instance {} now? [y/N] ",
-        if start { "Start" } else { "Shutdown" },
+        match action {
+            forge_provisioning::LifecycleAction::Start => "Start",
+            forge_provisioning::LifecycleAction::Shutdown => "Gracefully shut down",
+            forge_provisioning::LifecycleAction::ForceStop => {
+                "FORCE-STOP (equivalent to cutting VM power)"
+            }
+        },
         instance_name,
     );
     let mut answer = String::new();
-    if io::stdin().read_line(&mut answer).is_err()
-        || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-    {
+    if io::stdin().read_line(&mut answer).is_err() || !confirmation_accepted(&answer) {
         eprintln!("Lifecycle action cancelled.");
         return ExitCode::SUCCESS;
     }
@@ -1263,15 +1303,66 @@ fn lifecycle_action(instance_name: &str, start: bool, dry_run: bool) -> ExitCode
         eprintln!("pre-mutation lifecycle state changed; action denied");
         return ExitCode::from(1);
     }
-    let result = if start {
-        execute_lifecycle_start(&mut backend)
-    } else {
-        backend
-            .shutdown_and_wait(Duration::from_secs(plan.timeout_seconds))
+    let result = match action {
+        forge_provisioning::LifecycleAction::Start => {
+            execute_lifecycle_start(&mut backend, &fresh_operational.profile.first_boot_success)
+        }
+        forge_provisioning::LifecycleAction::Shutdown => {
+            forge_provisioning::execute_graceful_shutdown(
+                &mut backend,
+                Duration::from_secs(plan.timeout_seconds),
+            )
             .map(|_| ())
+        }
+        forge_provisioning::LifecycleAction::ForceStop => forge_provisioning::execute_force_stop(
+            &mut backend,
+            &fresh.domain_uuid,
+            Duration::from_secs(plan.timeout_seconds),
+        ),
     };
     match result {
         Ok(()) => {
+            if action == forge_provisioning::LifecycleAction::ForceStop {
+                let post = match operational_instance(instance_name) {
+                    Ok(post) => post,
+                    Err(error) => {
+                        eprintln!(
+                            "force-stop completed but durable state revalidation failed: {error}"
+                        );
+                        return ExitCode::from(1);
+                    }
+                };
+                if post.profile != fresh_operational.profile
+                    || post.index != fresh_operational.index
+                    || post.manifests != fresh_operational.manifests
+                    || post.active != fresh_operational.active
+                {
+                    eprintln!(
+                        "force-stop completed but durable state or generation ownership changed"
+                    );
+                    return ExitCode::from(1);
+                }
+                let post_status = match discover_lifecycle_status(&post) {
+                    Ok(status) => status,
+                    Err(error) => {
+                        eprintln!("force-stop completed but final reconciliation failed: {error}");
+                        return ExitCode::from(1);
+                    }
+                };
+                if post_status.domain_state != forge_core::VmState::Shutoff
+                    || post_status.domain_uuid != fresh.domain_uuid
+                    || post_status.active_overlay_path != fresh.active_overlay_path
+                    || post_status.active_backing_path != fresh.active_backing_path
+                    || post_status.active_seed_path != fresh.active_seed_path
+                {
+                    eprintln!("force-stop completed but final exact state verification failed");
+                    return ExitCode::from(1);
+                }
+                println!("Post-force reconciliation: Consistent");
+                println!(
+                    "WARNING: force-stop was equivalent to cutting VM power; the guest filesystem may be unclean."
+                );
+            }
             println!("Lifecycle action completed.");
             ExitCode::SUCCESS
         }
@@ -1284,30 +1375,30 @@ fn lifecycle_action(instance_name: &str, start: bool, dry_run: bool) -> ExitCode
 
 fn execute_lifecycle_start(
     backend: &mut forge_libvirt::LibvirtBootBackend,
+    policy: &forge_core::FirstBootSuccessPolicy,
 ) -> Result<(), forge_provisioning::ProvisioningError> {
     let timeouts = forge_provisioning::BootTimeouts::default();
-    backend.start()?;
-    backend.wait_running(Duration::from_secs(timeouts.domain_running_seconds))?;
-    let ip = backend.discover_ip(Duration::from_secs(timeouts.dhcp_lease_seconds))?;
-    let guest_agent =
-        backend.wait_guest_agent(Duration::from_secs(timeouts.guest_agent_seconds))?;
-    println!("DomainBootStatus: Running");
-    println!("GuestAgentStatus: {guest_agent:?}");
-    if let Some(ip) = ip {
-        println!("DhcpLeaseStatus: Available({ip})");
-        let key = env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default()
-            .join(".ssh/forge_ed25519");
-        let ssh = backend.observe_ssh(
-            &ip,
-            key.to_string_lossy().as_ref(),
-            Duration::from_secs(timeouts.ssh_seconds),
-        )?;
-        println!("SshStatus: {:?}", ssh.status);
-        println!("CloudInitStatus: {:?}", ssh.cloud_init);
-    } else {
-        println!("DhcpLeaseStatus: TimedOut");
+    let key = env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join(".ssh/forge_ed25519");
+    match forge_provisioning::execute_runtime_start(
+        backend,
+        policy,
+        key.to_string_lossy().as_ref(),
+        timeouts,
+    )? {
+        forge_provisioning::RuntimeStartResult::ManualGuest { domain } => {
+            println!("DomainBootStatus: {domain:?}");
+            println!("Guest observability: skipped by ManualGuest policy");
+        }
+        forge_provisioning::RuntimeStartResult::CloudInitManaged(result) => {
+            println!("DomainBootStatus: {:?}", result.domain);
+            println!("GuestAgentStatus: {:?}", result.guest_agent);
+            println!("DhcpLeaseStatus: {:?}", result.dhcp_lease);
+            println!("SshStatus: {:?}", result.ssh);
+            println!("CloudInitStatus: {:?}", result.cloud_init);
+        }
     }
     Ok(())
 }
@@ -3418,6 +3509,7 @@ fn print_usage() {
     eprintln!("  forge vm cleanup fedora-lab --dry-run");
     eprintln!("  forge vm start fedora-lab [--dry-run]");
     eprintln!("  forge vm shutdown fedora-lab [--dry-run]");
+    eprintln!("  forge vm stop fedora-lab --force [--dry-run]");
     eprintln!("  forge state show fedora-lab");
     eprintln!("  forge state reconcile fedora-lab");
     eprintln!("  forge state recover fedora-lab [--dry-run]");
@@ -3599,5 +3691,13 @@ mod tests {
             PrepareBaseStrategy::VerifiedQcow2,
         );
         assert!(validate_preparation_strategy(&unsupported).is_err());
+    }
+
+    #[test]
+    fn explicit_force_stop_confirmation_is_fail_closed() {
+        assert!(!confirmation_accepted(""));
+        assert!(!confirmation_accepted("no"));
+        assert!(!confirmation_accepted("force"));
+        assert!(confirmation_accepted("yes\n"));
     }
 }
