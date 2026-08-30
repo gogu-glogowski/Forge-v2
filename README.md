@@ -43,6 +43,32 @@ The design goal is simple: **safe defaults, explicit mutations, fast normal oper
 
 ---
 
+## Installation from source
+
+Forge V2 is currently distributed as source code rather than as an RPM/DNF package. On a Fedora host with Rust/Cargo and the required virtualization stack already available, clone the repository and build the release binary:
+
+```bash
+git clone https://github.com/gogu-glogowski/Forge-v2.git
+cd Forge-v2
+cargo build --release -p forge-cli
+mkdir -p ~/.local/bin
+install -m 755 target/release/forge ~/.local/bin/forge
+```
+
+Verify that `~/.local/bin` is in your `PATH`, then confirm the installation:
+
+```bash
+command -v forge
+forge --help
+forge doctor
+```
+
+If `command -v forge` prints a path such as `~/.local/bin/forge`, the CLI is ready to use from any directory.
+
+> **Important:** this is the current developer/source installation path. Forge is not yet a one-command consumer package. RPM/DNF packaging and a simpler installation experience are planned for a later V2.5 distribution/UX phase.
+
+---
+
 ## Quick start
 
 Once the release binary is installed in `$PATH`:
