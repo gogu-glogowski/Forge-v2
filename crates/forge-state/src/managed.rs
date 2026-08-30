@@ -68,6 +68,7 @@ pub struct GenerationIndex {
 pub enum CleanupPhase {
     SeedDeletePending,
     OverlayDeletePending,
+    FlatOverlayDeletePending,
     IncompleteAfterSeed,
 }
 
@@ -249,16 +250,32 @@ pub fn execute_cleanup_candidate<B: CleanupBackend>(
     candidate: &ManagedCleanupCandidate,
 ) -> Result<CleanupExecution, String> {
     backend.revalidate(plan, candidate)?;
-    let seed = candidate
-        .resources
-        .iter()
-        .find(|resource| resource.role == ResourceRole::NoCloudSeed)
-        .ok_or_else(|| "cleanup candidate has no exact seed".to_owned())?;
     let overlay = candidate
         .resources
         .iter()
         .find(|resource| resource.role == ResourceRole::WritableOverlay)
         .ok_or_else(|| "cleanup candidate has no exact overlay".to_owned())?;
+    if candidate.resources.len() == 1 && overlay.backing_path.is_none() {
+        let current = begin_flat_cleanup(&plan.source_index, &candidate.generation_id)
+            .map_err(|error| error.to_string())?;
+        backend.persist_index(&plan.source_index, &current)?;
+        if let Err(error) = backend.delete_exact(overlay) {
+            return Err(format!("flat clone overlay delete failed: {error}"));
+        }
+        backend.verify_absent(overlay)?;
+        let next_index = complete_flat_cleanup(&current, &candidate.generation_id)
+            .map_err(|error| error.to_string())?;
+        backend.persist_index(&current, &next_index)?;
+        return Ok(CleanupExecution {
+            next_index,
+            deleted: vec![overlay.path.clone()],
+        });
+    }
+    let seed = candidate
+        .resources
+        .iter()
+        .find(|resource| resource.role == ResourceRole::NoCloudSeed)
+        .ok_or_else(|| "cleanup candidate has no exact seed".to_owned())?;
     if candidate.resources.len() != 2 {
         return Err("cleanup candidate must contain exactly seed and overlay".to_owned());
     }
@@ -294,6 +311,75 @@ pub fn execute_cleanup_candidate<B: CleanupBackend>(
         next_index,
         deleted,
     })
+}
+
+fn begin_flat_cleanup(
+    index: &GenerationIndex,
+    generation_id: &str,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    let entry = index
+        .generations
+        .iter()
+        .find(|entry| entry.generation_id == generation_id)
+        .ok_or_else(|| StateError::InvalidObservedState("cleanup generation is absent".into()))?;
+    if entry.status != GenerationStatus::Retained {
+        return Err(StateError::InvalidObservedState(
+            "cleanup requires a Retained generation".into(),
+        ));
+    }
+    if index
+        .cleanup_progress
+        .iter()
+        .any(|progress| progress.generation_id == generation_id)
+    {
+        return Err(StateError::InvalidObservedState(
+            "generation already has durable cleanup progress".into(),
+        ));
+    }
+    let mut next = index.clone();
+    next.cleanup_progress.push(CleanupProgress {
+        generation_id: generation_id.to_owned(),
+        phase: CleanupPhase::FlatOverlayDeletePending,
+        deleted_roles: Vec::new(),
+    });
+    validate_index(&next)?;
+    Ok(next)
+}
+
+fn complete_flat_cleanup(
+    index: &GenerationIndex,
+    generation_id: &str,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    let progress = index
+        .cleanup_progress
+        .iter()
+        .find(|progress| progress.generation_id == generation_id)
+        .ok_or_else(|| StateError::InvalidObservedState("cleanup progress is absent".into()))?;
+    if progress.phase != CleanupPhase::FlatOverlayDeletePending
+        || !progress.deleted_roles.is_empty()
+    {
+        return Err(StateError::InvalidObservedState(
+            "flat cleanup is not ready for final completion".into(),
+        ));
+    }
+    let mut next = index.clone();
+    let entry = next
+        .generations
+        .iter_mut()
+        .find(|entry| entry.generation_id == generation_id)
+        .ok_or_else(|| StateError::InvalidObservedState("cleanup generation is absent".into()))?;
+    if entry.status != GenerationStatus::Retained {
+        return Err(StateError::InvalidObservedState(
+            "only Retained generation can become Cleaned".into(),
+        ));
+    }
+    entry.status = GenerationStatus::Cleaned;
+    next.cleanup_progress
+        .retain(|progress| progress.generation_id != generation_id);
+    validate_index(&next)?;
+    Ok(next)
 }
 
 /// Detects the old single-manifest layout or the current index without changing either.
@@ -548,14 +634,17 @@ fn generation_identity_matches_exact(
     manifest: &GenerationManifest,
     observed: &ObservedGeneration,
 ) -> bool {
-    manifest.domain_name == observed.domain_name
-        && manifest.domain_uuid == observed.domain_uuid
-        && observed.domain_persistent
-        && manifest.libvirt_uri == observed.libvirt_uri
-        && manifest.storage_pool_name == observed.storage_pool_name
-        && manifest.storage_pool_uuid == observed.storage_pool_uuid
-        && matches!(manifest.resources.len(), 2 | 3)
-        && manifest.resources.len() == observed.resources.len()
+    let flat_clone = manifest.resources.len() == 1
+        && observed.resources.len() == 1
+        && manifest
+            .resources
+            .iter()
+            .all(|resource| resource.role == ResourceRole::WritableOverlay)
+        && observed
+            .resources
+            .iter()
+            .all(|resource| resource.role == ResourceRole::WritableOverlay);
+    let backed_generation = manifest.resources.len() >= 2
         && manifest
             .resources
             .iter()
@@ -563,7 +652,15 @@ fn generation_identity_matches_exact(
         && manifest
             .resources
             .iter()
-            .any(|resource| resource.role == ResourceRole::WritableOverlay)
+            .any(|resource| resource.role == ResourceRole::WritableOverlay);
+    manifest.domain_name == observed.domain_name
+        && manifest.domain_uuid == observed.domain_uuid
+        && observed.domain_persistent
+        && manifest.libvirt_uri == observed.libvirt_uri
+        && manifest.storage_pool_name == observed.storage_pool_name
+        && manifest.storage_pool_uuid == observed.storage_pool_uuid
+        && (flat_clone || matches!(manifest.resources.len(), 2 | 3) && backed_generation)
+        && manifest.resources.len() == observed.resources.len()
         && manifest.resources.iter().all(|expected| {
             observed.resources.iter().any(|actual| {
                 expected.role == actual.role
@@ -984,7 +1081,7 @@ pub fn validate_index(index: &GenerationIndex) -> Result<(), StateError> {
             ));
         }
         let expected_deleted = match progress.phase {
-            CleanupPhase::SeedDeletePending => &[][..],
+            CleanupPhase::SeedDeletePending | CleanupPhase::FlatOverlayDeletePending => &[][..],
             CleanupPhase::OverlayDeletePending | CleanupPhase::IncompleteAfterSeed => {
                 &[ResourceRole::NoCloudSeed][..]
             }
@@ -1254,7 +1351,10 @@ pub fn plan_managed_cleanup(
             .iter()
             .filter(|item| item.resource.role != ResourceRole::SharedBase)
             .collect::<Vec<_>>();
-        let safe = disposable.len() == 2
+        let flat_clone = disposable.len() == 1
+            && disposable[0].resource.role == ResourceRole::WritableOverlay
+            && disposable[0].resource.backing_path.is_none();
+        let safe = (flat_clone || disposable.len() == 2)
             && disposable.iter().all(|item| {
                 item.exists
                     && item.observed_resource.as_ref() == Some(&item.resource)
@@ -1415,6 +1515,35 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn flat_clone_generation_identity_requires_one_exact_writable_disk() {
+        let mut expected = manifest("clone", GenerationStatus::Preparing);
+        expected.resources = vec![ManagedResource {
+            role: ResourceRole::WritableOverlay,
+            volume_name: "clone.qcow2".into(),
+            volume_key: "clone-key".into(),
+            path: "/p/clone.qcow2".into(),
+            format: "qcow2".into(),
+            capacity_bytes: 64,
+            backing_path: None,
+        }];
+        let mut actual = observed("clone");
+        actual.resources = vec![crate::ObservedResource {
+            role: ResourceRole::WritableOverlay,
+            volume_name: "clone.qcow2".into(),
+            volume_key: "clone-key".into(),
+            path: "/p/clone.qcow2".into(),
+            format: "qcow2".into(),
+            capacity_bytes: 64,
+            backing_path: None,
+            referenced_by_domains: vec!["fedora-lab".into()],
+            backing_for_volumes: vec![],
+        }];
+        assert!(generation_identity_matches_exact(&expected, &actual));
+        actual.resources[0].backing_path = Some("/p/source.qcow2".into());
+        assert!(!generation_identity_matches_exact(&expected, &actual));
     }
     fn index() -> GenerationIndex {
         GenerationIndex {
@@ -1901,6 +2030,40 @@ mod tests {
         )
         .unwrap();
         assert!(!plan.mutation);
+    }
+
+    #[test]
+    fn flat_clone_cleanup_selects_only_target_owned_overlay() {
+        let mut manifest = manifest("old", GenerationStatus::Retained);
+        manifest
+            .resources
+            .retain(|resource| resource.role == ResourceRole::WritableOverlay);
+        manifest.resources[0].backing_path = None;
+        let resource = manifest.resources[0].clone();
+        let evidence = RetainedEvidence {
+            manifest,
+            observed_pool_uuid: "pu".into(),
+            resources: vec![ResourceEvidence {
+                observed_resource: Some(resource.clone()),
+                resource,
+                exists: true,
+                referenced_by_domains: vec![],
+                backing_for_volumes: vec![],
+            }],
+        };
+        let plan = plan_managed_cleanup(
+            &retained_index(),
+            &[evidence],
+            vec![],
+            ManagedReconciliationStatus::Consistent,
+        )
+        .unwrap();
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].resources.len(), 1);
+        assert_eq!(
+            plan.candidates[0].resources[0].role,
+            ResourceRole::WritableOverlay
+        );
     }
     #[test]
     fn cleanup_refuses_non_retained_and_reports_unmanaged_without_candidates() {

@@ -2,6 +2,7 @@ use forge_core::{
     DoctorReport, DomainSummary, HostState, InstanceName, LibvirtInfo, ProfileId, VmResourcePlan,
 };
 use forge_provisioning::{BootBackend, RebuildBackend};
+use forge_storage::{DefineBackend, ImagePrepareBackend};
 use std::env;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -43,11 +44,13 @@ fn main() -> ExitCode {
             create_vm_dry_run(profile_name, instance_name)
         }
         ["vm", "create", profile_name, instance_name] => create_vm(profile_name, instance_name),
+        ["vm", "clone", source, target, "--dry-run"] => clone_vm(source, target, true),
+        ["vm", "clone", source, target] => clone_vm(source, target, false),
         ["hypervisor", "info"] => hypervisor_info(),
         ["vm", "list"] => vm_list(),
         ["vm", "status", instance] => lifecycle_status(instance),
-        ["vm", "cleanup", "fedora-lab", "--dry-run"] => cleanup_vm_dry_run(),
-        ["vm", "cleanup", "fedora-lab"] => managed_cleanup(false),
+        ["vm", "cleanup", instance, "--dry-run"] => cleanup_vm_dry_run(instance),
+        ["vm", "cleanup", instance] => managed_cleanup(instance, false),
         ["vm", "start", instance, "--dry-run"] => {
             lifecycle_action(instance, forge_provisioning::LifecycleAction::Start, true)
         }
@@ -86,7 +89,7 @@ fn main() -> ExitCode {
         ["vm", "prepare", "fedora-lab", "--dry-run"] => prepare_vm(true),
         ["vm", "boot", "fedora-lab"] => boot_vm(false),
         ["vm", "boot", "fedora-lab", "--dry-run"] => boot_vm(true),
-        ["vm", "rebuild", "fedora-lab", "--dry-run"] => rebuild_vm_dry_run(),
+        ["vm", "rebuild", instance, "--dry-run"] => rebuild_instance_dry_run(instance),
         ["vm", "rebuild", "fedora-lab"] => rebuild_vm(),
         ["vm", "rebuild", "fedora-lab", "--managed", "--dry-run"] => managed_rebuild(true),
         ["vm", "rebuild", "fedora-lab", "--managed"] => managed_rebuild(false),
@@ -143,12 +146,18 @@ fn state_show() -> ExitCode {
     }
 }
 
-fn discover_state() -> Result<forge_state::ObservedGeneration, String> {
-    let backend = forge_libvirt::LibvirtBootBackend::connect_local()
+fn discover_state_for(instance: &InstanceName) -> Result<forge_state::ObservedGeneration, String> {
+    let backend = forge_libvirt::LibvirtBootBackend::connect_instance(instance.clone())
         .map_err(|error| format!("libvirt connection failed: {error}"))?;
     backend
         .inspect_state()
         .map_err(|error| format!("Forge state discovery failed: {error}"))
+}
+
+fn discover_state() -> Result<forge_state::ObservedGeneration, String> {
+    discover_state_for(
+        &InstanceName::new("fedora-lab").expect("compatibility instance name is valid"),
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -650,8 +659,8 @@ fn lifecycle_status(instance_name: &str) -> ExitCode {
     }
 }
 
-fn cleanup_vm_dry_run() -> ExitCode {
-    managed_cleanup(true)
+fn cleanup_vm_dry_run(instance_name: &str) -> ExitCode {
+    managed_cleanup(instance_name, true)
 }
 
 fn managed_state_layout() -> Result<forge_state::StateLayout, String> {
@@ -693,8 +702,7 @@ fn validate_profile_binding(
     let durable_base = active
         .resources
         .iter()
-        .find(|resource| resource.role == forge_state::ResourceRole::SharedBase)
-        .ok_or_else(|| "active generation lacks SharedBase".to_owned())?;
+        .find(|resource| resource.role == forge_state::ResourceRole::SharedBase);
     let profile = if let Some(profile) = forge_profiles::find(instance_name) {
         profile
     } else {
@@ -702,7 +710,15 @@ fn validate_profile_binding(
             .into_iter()
             .filter(|profile| {
                 profile.persistence == forge_core::PersistencePolicy::Persistent
-                    && forge_profiles::base_volume_name(profile) == durable_base.volume_name
+                    && match durable_base {
+                        Some(base) => forge_profiles::base_volume_name(profile) == base.volume_name,
+                        None => {
+                            profile.kind == forge_core::GuestProfileKind::KaliLab
+                                && profile.provisioning == forge_core::ProvisioningPolicy::None
+                                && profile.first_boot_success
+                                    == forge_core::FirstBootSuccessPolicy::ManualGuest
+                        }
+                    }
             })
             .collect::<Vec<_>>();
         if matching.len() != 1 {
@@ -725,12 +741,16 @@ fn validate_profile_binding(
             .find(|resource| resource.role == role)
             .ok_or_else(|| format!("active generation lacks {role:?}"))
     };
-    let base = resource(forge_state::ResourceRole::SharedBase)?;
     let overlay = resource(forge_state::ResourceRole::WritableOverlay)?;
-    if base.volume_name != forge_profiles::base_volume_name(&profile)
-        || overlay.capacity_bytes != profile.resources.disk_bytes
-    {
+    if overlay.capacity_bytes != profile.resources.disk_bytes {
         return Err("active generation topology differs from profile policy".to_owned());
+    }
+    if let Some(base) = durable_base {
+        if base.volume_name != forge_profiles::base_volume_name(&profile) {
+            return Err("active generation topology differs from profile policy".to_owned());
+        }
+    } else if overlay.backing_path.is_some() {
+        return Err("flat clone generation unexpectedly has a backing path".to_owned());
     }
     validate_provisioning_topology(&profile.provisioning, &active.resources)?;
     Ok(profile)
@@ -760,12 +780,19 @@ fn validate_provisioning_topology(
     }
 }
 
+#[derive(Clone)]
 struct OperationalInstance {
     instance: InstanceName,
     profile: forge_core::VmProfile,
     index: forge_state::GenerationIndex,
     manifests: Vec<forge_state::GenerationManifest>,
     active: forge_state::GenerationManifest,
+}
+
+#[derive(Clone)]
+struct CloneSourceProof {
+    operational: OperationalInstance,
+    status: forge_provisioning::InstanceLifecycleStatus,
 }
 
 fn operational_instance(instance_name: &str) -> Result<OperationalInstance, String> {
@@ -970,8 +997,15 @@ impl forge_state::CleanupBackend for CleanupExecutor<'_> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn managed_cleanup(dry_run: bool) -> ExitCode {
-    let layout = match managed_state_layout() {
+fn managed_cleanup(instance_name: &str, dry_run: bool) -> ExitCode {
+    let instance = match InstanceName::new(instance_name) {
+        Ok(instance) => instance,
+        Err(error) => {
+            eprintln!("invalid instance name: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let layout = match managed_state_layout_for(&instance) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("{error}");
@@ -982,13 +1016,6 @@ fn managed_cleanup(dry_run: bool) -> ExitCode {
         Ok(value) => value,
         Err(error) => {
             eprintln!("cleanup state failed closed: {error}");
-            return ExitCode::from(1);
-        }
-    };
-    let observed_active = match discover_state() {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("{error}");
             return ExitCode::from(1);
         }
     };
@@ -1022,6 +1049,28 @@ fn managed_cleanup(dry_run: bool) -> ExitCode {
         }
         forge_state::ManagedState::Conflict(reason) => {
             eprintln!("cleanup refused: {reason}");
+            return ExitCode::from(1);
+        }
+    };
+    let active = match active_manifest(&index, &manifests) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("cleanup refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let observed_backend =
+        match forge_libvirt::LibvirtBootBackend::connect_instance(instance.clone()) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("libvirt connection failed: {error}");
+                return ExitCode::from(1);
+            }
+        };
+    let observed_active = match observed_backend.inspect_managed_state(active) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("Forge state discovery failed: {error}");
             return ExitCode::from(1);
         }
     };
@@ -1137,7 +1186,7 @@ fn managed_cleanup(dry_run: bool) -> ExitCode {
         println!("Nothing to clean.");
         return ExitCode::SUCCESS;
     }
-    eprint!("Delete exact retained-owned Fedora-Lab generation resources? [y/N] ");
+    eprint!("Delete exact retained-owned resources for {instance_name}? [y/N] ");
     let mut answer = String::new();
     if io::stdin().read_line(&mut answer).is_err()
         || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
@@ -1168,7 +1217,22 @@ fn managed_cleanup(dry_run: bool) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let final_observed = match discover_state() {
+    let final_active = match active_manifest(&execution.next_index, &final_manifests) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("cleanup completed but final reconciliation failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let final_backend = match forge_libvirt::LibvirtBootBackend::connect_instance(instance.clone())
+    {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("cleanup completed but final reconciliation failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let final_observed = match final_backend.inspect_managed_state(final_active) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("cleanup completed but final reconciliation failed: {error}");
@@ -1468,6 +1532,250 @@ fn print_lifecycle_status(
     }
 }
 
+fn resolve_clone_source(source_name: &str) -> Result<CloneSourceProof, String> {
+    let operational = operational_instance(source_name)?;
+    if !clone_profile_supported(&operational.profile) {
+        return Err(
+            "persistent clone currently supports only the shutoff Kali ManualGuest profile"
+                .to_owned(),
+        );
+    }
+    let status = discover_lifecycle_status(&operational)?;
+    if status.domain_state != forge_core::VmState::Shutoff {
+        return Err(
+            "clone source must be shutoff; Forge will not stop it automatically".to_owned(),
+        );
+    }
+    if !status.persistent || status.autostart {
+        return Err("clone source must be persistent with autostart disabled".to_owned());
+    }
+    let overlay = operational
+        .active
+        .resources
+        .iter()
+        .find(|resource| resource.role == forge_state::ResourceRole::WritableOverlay)
+        .ok_or_else(|| "clone source lacks an exact writable overlay".to_owned())?;
+    if overlay.path != status.active_overlay_path
+        || overlay.backing_path != status.active_backing_path
+        || status.active_backing_path.is_none()
+    {
+        return Err("clone source backing chain is not an understood Forge chain".to_owned());
+    }
+    Ok(CloneSourceProof {
+        operational,
+        status,
+    })
+}
+
+fn clone_profile_supported(profile: &forge_core::VmProfile) -> bool {
+    profile.kind == forge_core::GuestProfileKind::KaliLab
+        && profile.provisioning == forge_core::ProvisioningPolicy::None
+        && profile.first_boot_success == forge_core::FirstBootSuccessPolicy::ManualGuest
+        && profile.persistence == forge_core::PersistencePolicy::Persistent
+}
+
+fn build_clone_plan(
+    source: &CloneSourceProof,
+    target_name: &str,
+) -> Result<(forge_profiles::GenericCreatePlan, String, String), String> {
+    let target =
+        InstanceName::new(target_name).map_err(|error| format!("invalid target name: {error}"))?;
+    let hardware = forge_hardware::collect().map_err(|error| error.to_string())?;
+    let identity = forge_profiles::InstanceIdentity {
+        name: target.clone(),
+        profile_id: source.operational.profile.id.clone(),
+    };
+    let instance_plan =
+        forge_profiles::plan_instance(&hardware, &source.operational.profile, identity)
+            .map_err(|error| error.to_string())?;
+    let generation_id = forge_state::new_generation_id();
+    let generation = forge_state::plan_generation_resources(&target, generation_id, false)
+        .map_err(|error| error.to_string())?;
+    let factory = forge_profiles::plan_create(instance_plan, generation)
+        .map_err(|error| error.to_string())?;
+    let domain_uuid = forge_state::new_generation_id()
+        .strip_prefix("gen-")
+        .expect("generation IDs have a stable prefix")
+        .to_owned();
+    let domain = forge_domain::profile_spec(
+        &source.operational.profile,
+        &factory.instance.resources,
+        forge_domain::DomainMetadata {
+            name: target.to_string(),
+            disk_path: format!("/var/lib/libvirt/images/{}", factory.generation.overlay),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let mut domain = domain;
+    domain.uuid = Some(domain_uuid.clone());
+    let xml = forge_domain::render_xml(&domain).map_err(|error| error.to_string())?;
+    Ok((factory, xml, domain_uuid))
+}
+
+#[allow(clippy::too_many_lines)]
+fn clone_vm(source_name: &str, target_name: &str, dry_run: bool) -> ExitCode {
+    if source_name == target_name {
+        eprintln!("clone source and target must be different instances");
+        return ExitCode::from(2);
+    }
+    let source = match resolve_clone_source(source_name) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("clone source refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let target = match InstanceName::new(target_name) {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("invalid target name: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let layout = match managed_state_layout_for(&target) {
+        Ok(layout) => layout,
+        Err(error) => {
+            eprintln!("target state path failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if !matches!(
+        forge_state::inspect_layout(&layout),
+        Ok(forge_state::ManagedState::Missing)
+    ) {
+        eprintln!("clone target already has Forge durable state");
+        return ExitCode::from(1);
+    }
+    let mut storage = match forge_libvirt::LibvirtDefineBackend::connect_local() {
+        Ok(storage) => storage,
+        Err(error) => {
+            eprintln!("libvirt connection failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if DefineBackend::domain_exists(&mut storage, target_name).unwrap_or(true) {
+        eprintln!("clone target domain or volume already exists");
+        return ExitCode::from(1);
+    }
+    let (factory, xml, domain_uuid) = match build_clone_plan(&source, target_name) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("clone planning refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if ImagePrepareBackend::inspect_volume(
+        &mut storage,
+        forge_storage::DEFAULT_POOL,
+        &factory.generation.overlay,
+    )
+    .map_or(true, |volume| volume.is_some())
+    {
+        eprintln!("clone target planned volume already exists");
+        return ExitCode::from(1);
+    }
+    println!(
+        "Mode: {}",
+        if dry_run {
+            "clone dry-run (zero mutation)"
+        } else {
+            "clone real"
+        }
+    );
+    println!("Source instance: {}", source.operational.instance);
+    println!(
+        "Source generation: {}",
+        source.operational.index.active_generation_id
+    );
+    println!("Source profile: {}", source.operational.profile.id);
+    println!("Source state: {}", source.status.domain_state);
+    println!("Source reconciliation: Consistent");
+    println!("Source disk: {}", source.status.active_overlay_path);
+    println!(
+        "Source backing: {}",
+        source
+            .status
+            .active_backing_path
+            .as_deref()
+            .unwrap_or("none")
+    );
+    println!("Clone strategy: full flattened copy; target has no source-overlay dependency");
+    println!("Clone storage backend: libvirt system volume create-from");
+    println!("Direct source filesystem access by Forge CLI: no");
+    println!("Target instance: {target}");
+    println!("Target generation: {}", factory.generation.generation_id);
+    println!("Target domain UUID: {domain_uuid}");
+    println!(
+        "Target storage: /var/lib/libvirt/images/{}",
+        factory.generation.overlay
+    );
+    println!(
+        "Guest identity policy: disk state is copied; guest-level identity regeneration is not implemented for ManualGuest"
+    );
+    println!(
+        "Cleanup policy: supported for target-owned flat clone disk only; shared bases and source overlays are protected"
+    );
+    println!(
+        "Rebuild policy: unsupported for flat clones; refuse rather than reinterpret clone storage"
+    );
+    println!("Mutation: {}", !dry_run);
+    if dry_run {
+        return ExitCode::SUCCESS;
+    }
+    eprint!("Clone persistent VM {source_name} -> {target_name}? [y/N] ");
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err() || !confirmation_accepted(&answer) {
+        eprintln!("Clone cancelled.");
+        return ExitCode::SUCCESS;
+    }
+    let created_unix_seconds =
+        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(value) => value.as_secs(),
+            Err(error) => {
+                eprintln!("clock error: {error}");
+                return ExitCode::from(1);
+            }
+        };
+    let mut backend = ManualGuestCreateBackend {
+        storage: forge_libvirt::LibvirtDefineBackend::connect_local()
+            .expect("libvirt connection checked"),
+        instance: target,
+        domain_uuid,
+        source: PreparedBaseArtifact {
+            path: std::path::PathBuf::new(),
+            file_bytes: 0,
+            capacity_bytes: 0,
+            kali_proof: None,
+            whonix_workstation_proof: None,
+        },
+        layout,
+        workstation_pair_snapshot: None,
+        base_created: false,
+        overlay_created: false,
+        clone_source: Some(source),
+    };
+    match forge_storage::execute_generic_create(
+        &mut backend,
+        &forge_storage::GenericCreateExecutionPlan {
+            factory,
+            created_unix_seconds,
+            domain_xml: xml,
+        },
+    ) {
+        Ok(result) => {
+            println!("Active generation: {}", result.index.active_generation_id);
+            println!(
+                "Persistent clone created shut off; guest-level identity remains subject to the documented policy."
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("persistent clone failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn rebuild_vm_dry_run() -> ExitCode {
     match build_rebuild_plan() {
         Ok((plan, _)) => {
@@ -1479,6 +1787,28 @@ fn rebuild_vm_dry_run() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn rebuild_instance_dry_run(instance_name: &str) -> ExitCode {
+    if instance_name == "fedora-lab" {
+        return rebuild_vm_dry_run();
+    }
+    let operational = match operational_instance(instance_name) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("rebuild refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let flat_clone = operational.active.resources.len() == 1
+        && operational.active.resources[0].role == forge_state::ResourceRole::WritableOverlay
+        && operational.active.resources[0].backing_path.is_none();
+    if flat_clone {
+        eprintln!("rebuild unsupported for flat clone: {instance_name}");
+    } else {
+        eprintln!("rebuild unsupported for profile-bound instance: {instance_name}");
+    }
+    ExitCode::from(1)
 }
 
 fn rebuild_vm() -> ExitCode {
@@ -3245,6 +3575,7 @@ struct ManualGuestCreateBackend {
     workstation_pair_snapshot: Option<forge_profiles::WhonixPairSnapshot>,
     base_created: bool,
     overlay_created: bool,
+    clone_source: Option<CloneSourceProof>,
 }
 
 fn existing_shared_base_proof(
@@ -3382,6 +3713,7 @@ fn resolve_shared_base_dry_run(
 }
 
 impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
+    #[allow(clippy::too_many_lines)]
     fn revalidate_targets(
         &mut self,
         plan: &forge_storage::GenericCreateExecutionPlan,
@@ -3429,7 +3761,37 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
                 plan.factory.generation.overlay
             ));
         }
-        prove_prepared_base(&plan.factory.prepared_base, &self.source)?;
+        if let Some(source) = &self.clone_source {
+            let backend = forge_libvirt::LibvirtBootBackend::connect_instance(
+                source.operational.instance.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            let observed = backend
+                .inspect_managed_state(&source.operational.active)
+                .map_err(|error| error.to_string())?;
+            let reconciliation = forge_state::reconcile_managed(
+                &source.operational.index,
+                &source.operational.manifests,
+                &observed,
+            );
+            if reconciliation.status != forge_state::ManagedReconciliationStatus::Consistent {
+                return Err("source became non-Consistent before clone mutation".to_owned());
+            }
+            let status = backend
+                .inspect_managed_lifecycle(&source.operational.active)
+                .map_err(|error| error.to_string())?;
+            if status != source.status || status.domain_state != forge_core::VmState::Shutoff {
+                return Err("source identity or state changed before clone mutation".to_owned());
+            }
+            eprintln!(
+                "[forge] phase done: execute boundary revalidation clone source elapsed={:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+            return Ok(forge_storage::SharedBaseDisposition::ReuseProven);
+        }
+        if self.clone_source.is_none() {
+            prove_prepared_base(&plan.factory.prepared_base, &self.source)?;
+        }
         let base = ImagePrepareBackend::inspect_volume(
             &mut self.storage,
             forge_storage::DEFAULT_POOL,
@@ -3469,6 +3831,7 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
         Ok(disposition)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn prepare_storage(
         &mut self,
         plan: &forge_storage::GenericCreateExecutionPlan,
@@ -3493,6 +3856,20 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
             capacity_bytes: self.source.capacity_bytes,
             format: "qcow2".to_owned(),
         };
+        if let Some(source) = &self.clone_source {
+            self.storage.clone_flattened_volume(
+                forge_storage::DEFAULT_POOL,
+                &source.status.active_overlay_path,
+                &plan.factory.generation.overlay,
+                plan.factory.instance.resources.disk_bytes,
+            )?;
+            self.overlay_created = true;
+            eprintln!(
+                "[forge] phase done: storage clone and independent disk creation elapsed={:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+            return Ok(());
+        }
         match disposition {
             forge_storage::SharedBaseDisposition::Prepare => {
                 let directories = forge_images::default_directories()
@@ -3579,6 +3956,7 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
                 &self.instance,
                 &self.domain_uuid,
                 &plan.factory.generation.overlay,
+                None,
             )
             .map_err(|error| error.to_string())
     }
@@ -3604,13 +3982,23 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
         &mut self,
         plan: &forge_storage::GenericCreateExecutionPlan,
     ) -> Result<forge_state::ObservedGeneration, String> {
-        forge_libvirt::LibvirtBootBackend::connect_instance(self.instance.clone())
-            .map_err(|error| error.to_string())?
-            .inspect_generation_overlay_only(&format!(
-                "/var/lib/libvirt/images/{}",
-                plan.factory.generation.overlay
-            ))
-            .map_err(|error| error.to_string())
+        let backend = forge_libvirt::LibvirtBootBackend::connect_instance(self.instance.clone())
+            .map_err(|error| error.to_string())?;
+        if self.clone_source.is_some() {
+            backend
+                .inspect_generation_flat_overlay_only(&format!(
+                    "/var/lib/libvirt/images/{}",
+                    plan.factory.generation.overlay
+                ))
+                .map_err(|error| error.to_string())
+        } else {
+            backend
+                .inspect_generation_overlay_only(&format!(
+                    "/var/lib/libvirt/images/{}",
+                    plan.factory.generation.overlay
+                ))
+                .map_err(|error| error.to_string())
+        }
     }
 
     fn activate(
@@ -3758,6 +4146,7 @@ fn execute_manual_guest_create(
         workstation_pair_snapshot,
         base_created: false,
         overlay_created: false,
+        clone_source: None,
     };
     let result = forge_storage::execute_generic_create(
         &mut backend,
@@ -3799,7 +4188,8 @@ fn print_usage() {
     eprintln!("  forge vm list");
     eprintln!("  forge vm status fedora-lab");
     eprintln!("  forge vm create <profile> <instance> --dry-run");
-    eprintln!("  forge vm cleanup fedora-lab --dry-run");
+    eprintln!("  forge vm clone <source-instance> <target-instance> [--dry-run]");
+    eprintln!("  forge vm cleanup <instance> [--dry-run]");
     eprintln!("  forge vm start fedora-lab [--dry-run]");
     eprintln!("  forge vm shutdown fedora-lab [--dry-run]");
     eprintln!("  forge vm stop fedora-lab --force [--dry-run]");
@@ -3810,7 +4200,7 @@ fn print_usage() {
     eprintln!("  forge vm define fedora-lab [--dry-run]");
     eprintln!("  forge vm prepare fedora-lab [--dry-run]");
     eprintln!("  forge vm boot fedora-lab [--dry-run]");
-    eprintln!("  forge vm rebuild fedora-lab [--dry-run]");
+    eprintln!("  forge vm rebuild <instance> --dry-run");
     eprintln!("  forge vm rebuild fedora-lab --managed [--dry-run]");
     eprintln!("  forge vm cleanup fedora-lab [--dry-run]");
     eprintln!("  forge domain render fedora-lab");
@@ -4056,5 +4446,18 @@ mod tests {
         };
         let profile = validate_profile_binding("kali-2", &index, &active).unwrap();
         assert_eq!(profile.id.as_str(), "kali-lab");
+    }
+
+    #[test]
+    fn clone_profile_scope_is_typed_and_refuses_other_families() {
+        assert!(clone_profile_supported(
+            &forge_profiles::find("kali-lab").unwrap()
+        ));
+        assert!(!clone_profile_supported(
+            &forge_profiles::find("fedora-lab").unwrap()
+        ));
+        assert!(!clone_profile_supported(
+            &forge_profiles::find("whonix-gateway").unwrap()
+        ));
     }
 }

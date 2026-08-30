@@ -82,9 +82,9 @@ Any interruption before final publication must remain recoverable and must not c
 
 ### P0 — Persistent clone
 
-Provide a simple user-level operation that creates another independently owned, persistent VM from an existing trusted base/profile. Each clone receives its own instance identity, domain identity, durable generation state, and writable overlay. The shared base remains protected and non-disposable.
+Provide a simple user-level operation that creates another independently owned, persistent VM from an existing trusted base/profile. Each clone receives its own instance identity, domain identity, durable generation state, and writable storage. The shared base remains protected and non-disposable.
 
-Clone does not mean copying or sharing mutable guest state, adopting an arbitrary existing domain, or weakening per-instance ownership. Cloning from an existing VM may use that VM to select a compatible profile and trusted-base identity, but the new instance must remain independently manageable.
+Phase 2 defines persistent clone as a copy of the source instance's current visible disk state into a new flattened qcow2. The target therefore has no dependency on the source generation-owned overlay; deleting or rebuilding the source cannot invalidate the target. Clone does not mean a sibling-from-base operation, adopting an arbitrary existing domain, or weakening per-instance ownership. The initial supported profile is shutoff, Consistent Kali ManualGuest. Fedora NoCloud and Whonix paired workloads require separate clone designs. Disk cloning does not itself regenerate guest-level machine identity, SSH host keys, hostname, DHCP identifiers, or application state; Forge must report that limitation rather than claim identity independence.
 
 ### P0 — Disposable VM
 

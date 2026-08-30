@@ -17,6 +17,7 @@ use virt::stream::Stream;
 use virt::sys;
 
 pub const LOCAL_QEMU_URI: &str = "qemu:///system";
+const CLONE_CREATE_FLAGS: u32 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibvirtError {
@@ -191,11 +192,13 @@ impl LibvirtDefineBackend {
     ///
     /// # Errors
     /// Refuses missing backing, unavailable libvirt metadata, and referenced resources.
+    #[allow(clippy::too_many_lines)]
     pub fn inspect_preparing_generation(
         &self,
         instance: &forge_core::InstanceName,
         domain_uuid: &str,
         overlay_name: &str,
+        shared_base_name: Option<&str>,
     ) -> Result<forge_state::ObservedGeneration, forge_storage::ImagePrepareError> {
         let pool = self
             .pool(forge_storage::DEFAULT_POOL)
@@ -236,9 +239,78 @@ impl LibvirtDefineBackend {
             &volume_backings,
         )
         .map_err(|error| forge_storage::ImagePrepareError::Backend(error.to_string()))?;
-        let base_path = overlay.backing_path.clone().ok_or_else(|| {
-            forge_storage::ImagePrepareError::Backend("overlay has no backing path".to_owned())
-        })?;
+        let Some(base_path) = overlay.backing_path.clone() else {
+            let volume = StorageVol::lookup_by_path(&self.connection, &overlay.path)
+                .map_err(image_backend_error)?;
+            let mut resources = vec![forge_state::ObservedResource {
+                role: forge_state::ResourceRole::WritableOverlay,
+                volume_name: overlay.name,
+                volume_key: volume.get_key().map_err(image_backend_error)?,
+                path: overlay.path,
+                format: overlay.format.ok_or_else(|| {
+                    forge_storage::ImagePrepareError::Backend(
+                        "volume format unavailable".to_owned(),
+                    )
+                })?,
+                capacity_bytes: overlay.capacity_bytes.ok_or_else(|| {
+                    forge_storage::ImagePrepareError::Backend(
+                        "volume capacity unavailable".to_owned(),
+                    )
+                })?,
+                backing_path: None,
+                referenced_by_domains: overlay.referenced_by_domains,
+                backing_for_volumes: overlay.backing_for_volumes,
+            }];
+            if let Some(base_name) = shared_base_name {
+                let base = generation_volume_status(
+                    &pool,
+                    &pool_path,
+                    base_name,
+                    &domain_references,
+                    &volume_backings,
+                )
+                .map_err(|error| forge_storage::ImagePrepareError::Backend(error.to_string()))?;
+                if !base.exists {
+                    return Err(forge_storage::ImagePrepareError::Backend(
+                        "clone shared base is missing".to_owned(),
+                    ));
+                }
+                let base_volume = StorageVol::lookup_by_path(&self.connection, &base.path)
+                    .map_err(image_backend_error)?;
+                resources.insert(
+                    0,
+                    forge_state::ObservedResource {
+                        role: forge_state::ResourceRole::SharedBase,
+                        volume_name: base.name,
+                        volume_key: base_volume.get_key().map_err(image_backend_error)?,
+                        path: base.path,
+                        format: base.format.ok_or_else(|| {
+                            forge_storage::ImagePrepareError::Backend(
+                                "volume format unavailable".to_owned(),
+                            )
+                        })?,
+                        capacity_bytes: base.capacity_bytes.ok_or_else(|| {
+                            forge_storage::ImagePrepareError::Backend(
+                                "volume capacity unavailable".to_owned(),
+                            )
+                        })?,
+                        backing_path: base.backing_path,
+                        referenced_by_domains: base.referenced_by_domains,
+                        backing_for_volumes: base.backing_for_volumes,
+                    },
+                );
+            }
+            return Ok(forge_state::ObservedGeneration {
+                domain_name: instance.to_string(),
+                domain_uuid: domain_uuid.to_owned(),
+                domain_persistent: true,
+                libvirt_uri: self.connection.get_uri().map_err(image_backend_error)?,
+                storage_pool_name: forge_storage::DEFAULT_POOL.to_owned(),
+                storage_pool_uuid: pool.get_uuid_string().map_err(image_backend_error)?,
+                resources,
+                unmanaged_resources: Vec::new(),
+            });
+        };
         let base_name = std::path::Path::new(&base_path)
             .file_name()
             .and_then(|name| name.to_str())
@@ -305,6 +377,45 @@ impl LibvirtDefineBackend {
         Network::lookup_by_name(&self.connection, "default")
             .and_then(|network| network.is_active())
             .map_err(storage_backend_error)
+    }
+
+    /// Creates a fully independent qcow2 containing the source disk's visible
+    /// state through the system libvirt storage driver. The resulting volume
+    /// has no backing store and is safe to retain when the source generation
+    /// is later rebuilt or cleaned up.
+    ///
+    /// # Errors
+    /// Refuses conversion failure and removes only the target volume created by
+    /// this call.
+    pub fn clone_flattened_volume(
+        &self,
+        pool_name: &str,
+        source_path: &str,
+        target_name: &str,
+        capacity_bytes: u64,
+    ) -> Result<forge_storage::VolumeInfo, String> {
+        let pool = self.pool(pool_name).map_err(|error| error.to_string())?;
+        let xml = clone_volume_xml(target_name, capacity_bytes);
+        let source = StorageVol::lookup_by_path(&self.connection, source_path)
+            .map_err(|error| format!("exact source volume lookup failed: {error}"))?;
+        // The filesystem storage backend accepts no create-from flags. XML
+        // validation is performed by Forge's typed destination and post-create
+        // identity checks below.
+        let volume = StorageVol::create_xml_from(&pool, &xml, &source, CLONE_CREATE_FLAGS)
+            .map_err(|error| error.to_string())?;
+        pool.refresh(0).map_err(|error| error.to_string())?;
+        let info = volume_info(&volume, target_name).map_err(|error| error.to_string())?;
+        let xml = volume.get_xml_desc(0).map_err(|error| error.to_string())?;
+        let format = xml_attribute(&xml, "format", "type");
+        let backing = backing_store_path(&xml);
+        if format.as_deref() != Some("qcow2")
+            || backing.is_some()
+            || info.capacity_bytes != capacity_bytes
+        {
+            let _ = volume.delete(0);
+            return Err("libvirt create-from produced a non-flat or mismatched target".to_owned());
+        }
+        Ok(info)
     }
 }
 
@@ -1201,6 +1312,8 @@ impl LibvirtBootBackend {
             forge_storage::DEFAULT_POOL,
             overlay_path,
             Some(seed_path),
+            true,
+            None,
         )
     }
 
@@ -1212,7 +1325,50 @@ impl LibvirtBootBackend {
         &self,
         overlay_path: &str,
     ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
-        self.inspect_generation_paths_in_pool(forge_storage::DEFAULT_POOL, overlay_path, None)
+        self.inspect_generation_paths_in_pool(
+            forge_storage::DEFAULT_POOL,
+            overlay_path,
+            None,
+            true,
+            None,
+        )
+    }
+
+    /// Reads exact identities for an independently flattened generation disk.
+    /// The disk is generation-owned and intentionally has no backing volume.
+    ///
+    /// # Errors
+    /// Returns a typed discovery error when domain or volume identities cannot be read.
+    pub fn inspect_generation_flat_overlay_only(
+        &self,
+        overlay_path: &str,
+    ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
+        self.inspect_generation_paths_in_pool(
+            forge_storage::DEFAULT_POOL,
+            overlay_path,
+            None,
+            false,
+            None,
+        )
+    }
+
+    /// Reads a flattened generation disk while retaining the shared base as a
+    /// protected profile identity in durable ownership state.
+    ///
+    /// # Errors
+    /// Returns a typed discovery error when domain, volume, or base identities cannot be read.
+    pub fn inspect_generation_flat_overlay_with_shared_base(
+        &self,
+        overlay_path: &str,
+        base_path: &str,
+    ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
+        self.inspect_generation_paths_in_pool(
+            forge_storage::DEFAULT_POOL,
+            overlay_path,
+            None,
+            false,
+            Some(base_path),
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1221,6 +1377,8 @@ impl LibvirtBootBackend {
         pool_name: &str,
         overlay_path: &str,
         seed_path: Option<&str>,
+        require_backing: bool,
+        shared_base_path: Option<&str>,
     ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
         let domain = self.domain()?;
         let domain_uuid = domain
@@ -1281,22 +1439,42 @@ impl LibvirtBootBackend {
             &domain_references,
             &volume_backings,
         )?;
-        let base_path = overlay_status.backing_path.as_deref().ok_or_else(|| {
-            forge_provisioning::ProvisioningError::Backend(
-                "generation overlay has no backing volume".to_owned(),
-            )
-        })?;
-        let base_status = generation_volume_status(
-            &pool,
-            &pool_path,
-            &name(base_path)?,
-            &domain_references,
-            &volume_backings,
-        )?;
-        let mut statuses = vec![
-            (forge_state::ResourceRole::SharedBase, base_status),
-            (forge_state::ResourceRole::WritableOverlay, overlay_status),
-        ];
+        let mut statuses = Vec::new();
+        if require_backing {
+            let base_path = overlay_status.backing_path.as_deref().ok_or_else(|| {
+                forge_provisioning::ProvisioningError::Backend(
+                    "generation overlay has no backing volume".to_owned(),
+                )
+            })?;
+            let base_status = generation_volume_status(
+                &pool,
+                &pool_path,
+                &name(base_path)?,
+                &domain_references,
+                &volume_backings,
+            )?;
+            statuses.push((forge_state::ResourceRole::SharedBase, base_status));
+        } else if overlay_status.backing_path.is_some() {
+            return Err(forge_provisioning::ProvisioningError::Backend(
+                "flat generation disk unexpectedly has a backing volume".to_owned(),
+            ));
+        }
+        statuses.push((forge_state::ResourceRole::WritableOverlay, overlay_status));
+        if let Some(base_path) = shared_base_path {
+            statuses.insert(
+                0,
+                (
+                    forge_state::ResourceRole::SharedBase,
+                    generation_volume_status(
+                        &pool,
+                        &pool_path,
+                        &name(base_path)?,
+                        &domain_references,
+                        &volume_backings,
+                    )?,
+                ),
+            );
+        }
         if let Some(seed_path) = seed_path {
             statuses.push((
                 forge_state::ResourceRole::NoCloudSeed,
@@ -1393,6 +1571,13 @@ impl LibvirtBootBackend {
             &active.storage_pool_name,
             resource_path(forge_state::ResourceRole::WritableOverlay)?,
             seed,
+            active
+                .resources
+                .iter()
+                .find(|resource| resource.role == forge_state::ResourceRole::WritableOverlay)
+                .and_then(|resource| resource.backing_path.as_ref())
+                .is_some(),
+            None,
         )
     }
 
@@ -2150,6 +2335,12 @@ fn xml_element(xml: &str, name: &str) -> Option<String> {
     Some(xml[start..end].trim().to_owned())
 }
 
+fn clone_volume_xml(name: &str, capacity_bytes: u64) -> String {
+    format!(
+        "<volume><name>{name}</name><capacity unit='bytes'>{capacity_bytes}</capacity><allocation unit='bytes'>0</allocation><target><format type='qcow2'/><permissions><mode>0600</mode></permissions></target></volume>"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2230,6 +2421,23 @@ mod tests {
             seed_volume_xml("fedora-lab-seed.iso", 374_784),
             "<volume type='file'><name>fedora-lab-seed.iso</name><capacity unit='bytes'>374784</capacity><allocation unit='bytes'>0</allocation><target><format type='raw'/></target></volume>"
         );
+    }
+
+    #[test]
+    fn clone_volume_xml_requests_standalone_qcow2() {
+        let xml = clone_volume_xml("clone.qcow2", 64);
+        assert_eq!(
+            xml_attribute(&xml, "format", "type").as_deref(),
+            Some("qcow2")
+        );
+        assert!(backing_store_path(&xml).is_none());
+        assert!(xml.contains("<capacity unit='bytes'>64</capacity>"));
+        assert!(xml.contains("<mode>0600</mode>"));
+    }
+
+    #[test]
+    fn clone_create_from_uses_backend_compatible_empty_flags() {
+        assert_eq!(CLONE_CREATE_FLAGS, 0);
     }
 
     #[test]
