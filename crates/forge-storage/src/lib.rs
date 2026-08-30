@@ -8,6 +8,8 @@ mod image_prepare;
 pub use image_prepare::*;
 mod generic_create;
 pub use generic_create::*;
+mod fresh;
+pub use fresh::*;
 
 pub const DEFAULT_POOL: &str = "default";
 pub const FEDORA_LAB_VOLUME: &str = "fedora-lab.qcow2";

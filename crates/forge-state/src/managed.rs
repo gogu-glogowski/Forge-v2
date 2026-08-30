@@ -1002,6 +1002,54 @@ pub fn finalize_switch(
     Ok(next)
 }
 
+/// Commits a Fresh replacement only when both expected generation identities
+/// still match the durable index. The single returned index is the atomic
+/// publication value: old Active becomes Retained and new Preparing becomes
+/// Active together.
+///
+/// # Errors
+///
+/// Refuses stale identities, invalid indexes, or any state without exactly one
+/// expected Active and one expected Preparing generation.
+pub fn commit_fresh_switch(
+    index: &GenerationIndex,
+    expected_old_active_id: &str,
+    expected_new_preparing_id: &str,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    if index.active_generation_id != expected_old_active_id {
+        return Err(StateError::InvalidObservedState(
+            "Fresh switch refused: Active generation changed".to_owned(),
+        ));
+    }
+    let active_count = index
+        .generations
+        .iter()
+        .filter(|entry| entry.status == GenerationStatus::Active)
+        .count();
+    if active_count != 1 {
+        return Err(StateError::InvalidObservedState(
+            "Fresh switch refused: expected exactly one Active generation".to_owned(),
+        ));
+    }
+    let preparing_count = index
+        .generations
+        .iter()
+        .filter(|entry| entry.status == GenerationStatus::Preparing)
+        .count();
+    if preparing_count != 1
+        || !index.generations.iter().any(|entry| {
+            entry.generation_id == expected_new_preparing_id
+                && entry.status == GenerationStatus::Preparing
+        })
+    {
+        return Err(StateError::InvalidObservedState(
+            "Fresh switch refused: expected one exact Preparing generation".to_owned(),
+        ));
+    }
+    finalize_switch(index, expected_new_preparing_id)
+}
+
 /// Marks a Preparing generation Failed while preserving the current Active.
 /// # Errors
 /// Rejects any non-Preparing target or an invalid index.
@@ -2204,6 +2252,19 @@ mod tests {
             fs::metadata(&layout.index).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_index_publication_validation_preserves_old_active() {
+        let root = temp();
+        let layout = StateLayout::new(&root, "fedora-lab");
+        let original = index();
+        write_index_atomic(&layout.index, &original).unwrap();
+        let mut invalid = original.clone();
+        invalid.active_generation_id = "not-the-active-generation".to_owned();
+        assert!(write_index_atomic(&layout.index, &invalid).is_err());
+        assert_eq!(read_index(&layout.index).unwrap(), Some(original));
         fs::remove_dir_all(root).unwrap();
     }
     struct CleanupMock {
