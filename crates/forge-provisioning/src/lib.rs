@@ -1823,6 +1823,7 @@ mod tests {
             network_policy: NetworkPolicy::Isolated,
             graphics_policy: forge_core::GraphicsPolicy::Virtual,
             persistence: PersistencePolicy::Persistent,
+            availability: forge_core::ProductAvailability::Supported,
         };
         status.current_seed.exists = false;
         status.current_seed.path.clear();

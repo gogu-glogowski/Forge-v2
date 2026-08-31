@@ -594,6 +594,7 @@ mod tests {
             network_policy: NetworkPolicy::DefaultNat,
             graphics_policy: GraphicsPolicy::Virtual,
             persistence: PersistencePolicy::Persistent,
+            availability: forge_core::ProductAvailability::Supported,
         }
     }
 

@@ -18,7 +18,7 @@ use crate::SharedBaseDisposition;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreshUnsupportedReason {
-    FedoraNoCloudDeferred,
+    LegacyFedoraProductRetired,
     WhonixPairAwareRequired,
     ProfilePolicyUnsupported,
 }
@@ -150,7 +150,7 @@ pub fn fresh_capability(profile: &VmProfile) -> FreshCapability {
         GuestProfileKind::FedoraLab
         | GuestProfileKind::LunaDevFedora
         | GuestProfileKind::LunaLabFedora => {
-            FreshCapability::Unsupported(FreshUnsupportedReason::FedoraNoCloudDeferred)
+            FreshCapability::Unsupported(FreshUnsupportedReason::LegacyFedoraProductRetired)
         }
         _ => FreshCapability::Unsupported(FreshUnsupportedReason::ProfilePolicyUnsupported),
     }
@@ -1086,7 +1086,7 @@ mod tests {
     fn whonix_and_fedora_capabilities_are_typed_refusals() {
         assert_eq!(
             fresh_capability(&forge_profiles::fedora_lab()),
-            FreshCapability::Unsupported(FreshUnsupportedReason::FedoraNoCloudDeferred)
+            FreshCapability::Unsupported(FreshUnsupportedReason::LegacyFedoraProductRetired)
         );
         assert_eq!(
             fresh_capability(&forge_profiles::whonix_gateway()),

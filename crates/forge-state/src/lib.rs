@@ -24,6 +24,31 @@ pub enum ResourceRole {
     NoCloudSeed,
 }
 
+/// Typed product lineage derived from durable resource semantics, never an instance name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableProductClassification {
+    LegacyFedoraCloudNoCloud,
+    Other,
+}
+
+#[must_use]
+pub fn classify_durable_product(manifest: &GenerationManifest) -> DurableProductClassification {
+    let fedora_cloud_base = manifest.resources.iter().any(|resource| {
+        resource.role == ResourceRole::SharedBase
+            && resource.volume_name.starts_with("forge-base-fedora-")
+            && Path::new(&resource.volume_name).extension() == Some(std::ffi::OsStr::new("qcow2"))
+    });
+    let no_cloud = manifest
+        .resources
+        .iter()
+        .any(|resource| resource.role == ResourceRole::NoCloudSeed);
+    if fedora_cloud_base && no_cloud {
+        DurableProductClassification::LegacyFedoraCloudNoCloud
+    } else {
+        DurableProductClassification::Other
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GenerationStatus {
@@ -606,6 +631,29 @@ mod tests {
         assert_eq!(
             deserialize(&serialize(&manifest).unwrap()).unwrap(),
             manifest
+        );
+    }
+
+    #[test]
+    fn durable_legacy_fedora_classification_uses_resources_not_instance_name() {
+        let mut manifest = plan().manifest;
+        manifest.domain_name = "arbitrary-compatible-instance".to_owned();
+        manifest
+            .resources
+            .iter_mut()
+            .find(|resource| resource.role == ResourceRole::SharedBase)
+            .unwrap()
+            .volume_name = "forge-base-fedora-44.qcow2".to_owned();
+        assert_eq!(
+            classify_durable_product(&manifest),
+            DurableProductClassification::LegacyFedoraCloudNoCloud
+        );
+        manifest
+            .resources
+            .retain(|resource| resource.role != ResourceRole::NoCloudSeed);
+        assert_eq!(
+            classify_durable_product(&manifest),
+            DurableProductClassification::Other
         );
     }
 

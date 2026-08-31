@@ -33,7 +33,11 @@ fn main() -> ExitCode {
         },
         ["profile", "list"] => {
             for profile in forge_profiles::built_in_profiles() {
-                println!("{}\t{}", profile.id, profile.display_name);
+                let status = match profile.availability {
+                    forge_core::ProductAvailability::Supported => "Supported",
+                    forge_core::ProductAvailability::LegacyCompatibility(_) => "Retired/Legacy",
+                };
+                println!("{}\t{}\t{status}", profile.id, profile.display_name);
             }
             ExitCode::SUCCESS
         }
@@ -105,6 +109,17 @@ fn main() -> ExitCode {
             print_usage();
             ExitCode::from(2)
         }
+    }
+}
+
+const LEGACY_FEDORA_RETIRED: &str = "Legacy Fedora Cloud/NoCloud is retired in Forge V2.5. Fedora Workstation support is being introduced through the new Workstation architecture.";
+
+fn require_new_product(profile: &forge_core::VmProfile) -> Result<(), &'static str> {
+    match profile.availability {
+        forge_core::ProductAvailability::Supported => Ok(()),
+        forge_core::ProductAvailability::LegacyCompatibility(
+            forge_core::LegacyProductClassification::LegacyFedoraCloudNoCloud,
+        ) => Err(LEGACY_FEDORA_RETIRED),
     }
 }
 
@@ -765,6 +780,10 @@ fn print_recovery_plan(
 }
 
 fn state_adopt(dry_run: bool) -> ExitCode {
+    let _ = dry_run;
+    eprintln!("adoption refused: {LEGACY_FEDORA_RETIRED}");
+    return ExitCode::from(1);
+    #[allow(unreachable_code)]
     let path = match state_manifest_path() {
         Ok(path) => path,
         Err(error) => {
@@ -1779,6 +1798,12 @@ fn managed_cleanup(instance_name: &str, dry_run: bool) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if forge_state::classify_durable_product(active)
+        == forge_state::DurableProductClassification::LegacyFedoraCloudNoCloud
+    {
+        eprintln!("cleanup refused: legacy Fedora retirement cleanup is deferred to Phase 4.9");
+        return ExitCode::from(1);
+    }
     let observed_backend =
         match forge_libvirt::LibvirtBootBackend::connect_instance(instance.clone()) {
             Ok(value) => value,
@@ -1987,6 +2012,10 @@ fn lifecycle_action(
             return ExitCode::from(1);
         }
     };
+    if let Err(reason) = require_new_product(&operational.profile) {
+        eprintln!("instance lifecycle action refused: {reason}");
+        return ExitCode::from(1);
+    }
     let status = match discover_lifecycle_status(&operational) {
         Ok(status) => status,
         Err(error) => {
@@ -2497,6 +2526,9 @@ fn clone_vm(source_name: &str, target_name: &str, dry_run: bool) -> ExitCode {
 }
 
 fn rebuild_vm_dry_run() -> ExitCode {
+    eprintln!("rebuild refused: {LEGACY_FEDORA_RETIRED}");
+    return ExitCode::from(1);
+    #[allow(unreachable_code)]
     match build_rebuild_plan() {
         Ok((plan, _)) => {
             print_rebuild_plan(&plan);
@@ -2532,6 +2564,9 @@ fn rebuild_instance_dry_run(instance_name: &str) -> ExitCode {
 }
 
 fn rebuild_vm() -> ExitCode {
+    eprintln!("rebuild refused: {LEGACY_FEDORA_RETIRED}");
+    return ExitCode::from(1);
+    #[allow(unreachable_code)]
     let (plan, seed) = match build_rebuild_plan() {
         Ok(value) => value,
         Err(error) => {
@@ -2586,6 +2621,10 @@ fn rebuild_vm() -> ExitCode {
 
 #[allow(clippy::too_many_lines)]
 fn managed_rebuild(dry_run: bool) -> ExitCode {
+    let _ = dry_run;
+    eprintln!("managed rebuild refused: {LEGACY_FEDORA_RETIRED}");
+    return ExitCode::from(1);
+    #[allow(unreachable_code)]
     let layout = match managed_state_layout() {
         Ok(value) => value,
         Err(error) => {
@@ -3064,6 +3103,10 @@ fn print_rebuild_plan(plan: &forge_provisioning::RebuildPlan) {
 }
 
 fn boot_vm(dry_run: bool) -> ExitCode {
+    let _ = dry_run;
+    eprintln!("boot refused: {LEGACY_FEDORA_RETIRED}");
+    return ExitCode::from(1);
+    #[allow(unreachable_code)]
     let Some(home) = env::var_os("HOME") else {
         eprintln!("cannot locate dedicated Forge public key: HOME is unavailable");
         return ExitCode::from(2);
@@ -3186,6 +3229,10 @@ fn print_boot_plan(plan: &forge_provisioning::BootPlan, key_path: &std::path::Pa
 }
 
 fn prepare_vm(dry_run: bool) -> ExitCode {
+    let _ = dry_run;
+    eprintln!("prepare refused: {LEGACY_FEDORA_RETIRED}");
+    return ExitCode::from(1);
+    #[allow(unreachable_code)]
     let Some(profile) = forge_profiles::find("fedora-lab") else {
         eprintln!("fedora-lab profile is unavailable");
         return ExitCode::from(2);
@@ -3343,11 +3390,11 @@ fn image_list() -> ExitCode {
     };
     match forge_images::list(&directories) {
         Ok(images) => {
-            println!("DISTRO\tRELEASE\tARCH\tSTATUS");
+            println!("PRODUCT\tRELEASE\tARCH\tSTATUS");
             for image in images {
                 println!(
-                    "{}\t{}\t{}\t{}",
-                    image.distro, image.release, image.architecture, image.status
+                    "Fedora Cloud Base (Legacy/Retired)\t{}\t{}\t{}",
+                    image.release, image.architecture, image.status
                 );
             }
             ExitCode::SUCCESS
@@ -3365,6 +3412,7 @@ fn image_inspect() -> ExitCode {
     };
     match forge_images::inspect(&directories) {
         Ok(metadata) => {
+            println!("Product status: Legacy/Retired Fedora Cloud Base compatibility artifact");
             print_image_metadata(&metadata);
             ExitCode::SUCCESS
         }
@@ -3376,21 +3424,8 @@ fn image_inspect() -> ExitCode {
 }
 
 fn image_fetch() -> ExitCode {
-    let Ok(directories) = image_directories() else {
-        return ExitCode::from(2);
-    };
-    println!("Fetching official Fedora Cloud Base 44 x86_64 image...");
-    let mut fetcher = forge_images::SystemArtifactFetcher;
-    match forge_images::fetch_fedora(&directories, &mut fetcher) {
-        Ok(metadata) => {
-            print_image_metadata(&metadata);
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("Fedora image fetch failed: {error}");
-            ExitCode::from(1)
-        }
-    }
+    eprintln!("image fetch refused: {LEGACY_FEDORA_RETIRED}");
+    ExitCode::from(1)
 }
 
 fn recover_whonix_workstation(dry_run: bool) -> ExitCode {
@@ -3467,6 +3502,10 @@ fn print_image_metadata(metadata: &forge_images::ImageMetadata) {
 }
 
 fn define_vm(dry_run: bool) -> ExitCode {
+    let _ = dry_run;
+    eprintln!("define refused: {LEGACY_FEDORA_RETIRED}");
+    return ExitCode::from(1);
+    #[allow(unreachable_code)]
     let Some(profile) = forge_profiles::find("fedora-lab") else {
         eprintln!("fedora-lab profile is unavailable");
         return ExitCode::from(2);
@@ -3553,6 +3592,10 @@ fn render_domain(profile_name: &str) -> ExitCode {
         eprintln!("unknown VM profile: {profile_name}");
         return ExitCode::from(2);
     };
+    if let Err(reason) = require_new_product(&profile) {
+        eprintln!("domain rendering refused: {reason}");
+        return ExitCode::from(1);
+    }
     let hardware = match forge_hardware::collect() {
         Ok(hardware) => hardware,
         Err(error) => {
@@ -3653,6 +3696,10 @@ fn plan_profile(profile_name: &str) -> ExitCode {
         eprintln!("unknown VM profile: {profile_name}");
         return ExitCode::from(2);
     };
+    if let Err(reason) = require_new_product(&profile) {
+        eprintln!("profile planning refused: {reason}");
+        return ExitCode::from(1);
+    }
     let hardware = match forge_hardware::collect() {
         Ok(hardware) => hardware,
         Err(error) => {
@@ -3679,6 +3726,7 @@ fn show_profile(profile_name: &str) -> ExitCode {
     };
     println!("Profile ID: {}", profile.id);
     println!("Display name: {}", profile.display_name);
+    println!("Product availability: {:?}", profile.availability);
     println!("Guest family: {}", profile.guest_family);
     println!("Instance kind: {:?}", profile.instance_kind);
     println!("Architecture: {:?}", profile.architecture);
@@ -3702,6 +3750,10 @@ fn plan_instance(profile_name: &str, instance_name: &str) -> ExitCode {
         eprintln!("unknown VM profile: {profile_name}");
         return ExitCode::from(2);
     };
+    if let Err(reason) = require_new_product(&profile) {
+        eprintln!("instance planning refused: {reason}");
+        return ExitCode::from(1);
+    }
     let instance = match InstanceName::new(instance_name) {
         Ok(instance) => instance,
         Err(error) => {
@@ -4762,6 +4814,12 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
 }
 
 fn create_vm(profile_name: &str, instance_name: &str) -> ExitCode {
+    if let Some(profile) = forge_profiles::find(profile_name)
+        && let Err(reason) = require_new_product(&profile)
+    {
+        eprintln!("create refused: {reason}");
+        return ExitCode::from(1);
+    }
     if !matches!(
         profile_name,
         "kali-lab" | "whonix-gateway" | "whonix-workstation"
@@ -4910,24 +4968,16 @@ fn print_usage() {
     eprintln!("  forge vm create <profile> <instance> --dry-run");
     eprintln!("  forge vm clone <source-instance> <target-instance> [--dry-run]");
     eprintln!("  forge vm cleanup <instance> [--dry-run]");
-    eprintln!("  forge vm start fedora-lab [--dry-run]");
-    eprintln!("  forge vm shutdown fedora-lab [--dry-run]");
-    eprintln!("  forge vm stop fedora-lab --force [--dry-run]");
     eprintln!("  forge state show fedora-lab");
     eprintln!("  forge state reconcile fedora-lab");
     eprintln!("  forge state recover fedora-lab [--dry-run]");
-    eprintln!("  forge state adopt fedora-lab [--dry-run]");
-    eprintln!("  forge vm define fedora-lab [--dry-run]");
-    eprintln!("  forge vm prepare fedora-lab [--dry-run]");
-    eprintln!("  forge vm boot fedora-lab [--dry-run]");
     eprintln!("  forge vm rebuild <instance> --dry-run");
-    eprintln!("  forge vm rebuild fedora-lab --managed [--dry-run]");
-    eprintln!("  forge vm cleanup fedora-lab [--dry-run]");
-    eprintln!("  forge domain render fedora-lab");
     eprintln!("  forge image list");
     eprintln!("  forge image inspect fedora");
-    eprintln!("  forge image fetch fedora");
     eprintln!("  forge image recover whonix-workstation [--dry-run]");
+    eprintln!(
+        "Legacy Fedora Cloud/NoCloud is retired; compatibility inspection remains available."
+    );
 }
 
 fn print_report(report: &DoctorReport) {

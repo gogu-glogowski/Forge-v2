@@ -17,7 +17,7 @@ The project grew from a simple host-readiness checker into a lifecycle, image, s
 
 The current V2 fleet consists of four persistent managed VM roles:
 
-- **Fedora Lab** — currently based on Fedora Cloud Base; replacement with a normal Fedora Workstation-oriented profile is planned for V2.5.
+- **Fedora Lab compatibility state** — the former Fedora Cloud Base/NoCloud product is retired for new operations in V2.5; its exact durable state remains readable for later explicit retirement. Fedora Workstation runtime support is not implemented yet.
 - **Kali Lab** — persistent ManualGuest based on the verified Kali QEMU image.
 - **Whonix Gateway** — isolated Tor gateway.
 - **Whonix Workstation** — workstation with a single enforced path through its paired Gateway.
@@ -164,7 +164,7 @@ V2 is accepted, but it is not presented as finished consumer software.
 
 Known limitations include:
 
-- Fedora Lab currently uses **Fedora Cloud Base**, which is not the desired interactive desktop experience.
+- The legacy Fedora Lab used **Fedora Cloud Base**. That product path is retired and retained only for exact compatibility inspection pending explicit retirement.
 - Guest-side Whonix Tor/connectivity proof remained unobserved during formal host-side isolation validation.
 - Some guests can ignore graceful ACPI/libvirt shutdown and reach the 120-second timeout.
 - QGA probing can still produce noisy libvirt messages on profiles where the guest agent is absent.
