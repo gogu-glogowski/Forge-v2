@@ -19,6 +19,14 @@ pub const FEDORA_FILENAME: &str = "Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2
 pub const FEDORA_SOURCE_URL: &str = "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2";
 pub const FEDORA_CHECKSUM_URL: &str = "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-44-1.7-x86_64-CHECKSUM";
 pub const FEDORA_KEYRING_URL: &str = "https://fedoraproject.org/fedora.gpg";
+pub const FEDORA_WORKSTATION_RELEASE: &str = "44";
+pub const FEDORA_WORKSTATION_COMPOSE: &str = "1.7";
+pub const FEDORA_WORKSTATION_FILENAME: &str = "Fedora-Workstation-Live-44-1.7.x86_64.iso";
+pub const FEDORA_WORKSTATION_CHECKSUM_FILENAME: &str = "Fedora-Workstation-44-1.7-x86_64-CHECKSUM";
+pub const FEDORA_WORKSTATION_SOURCE_URL: &str = "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-Live-44-1.7.x86_64.iso";
+pub const FEDORA_WORKSTATION_CHECKSUM_URL: &str = "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-44-1.7-x86_64-CHECKSUM";
+pub const FEDORA_44_SIGNING_KEY_FINGERPRINT: &str = "36F612DCF27F7D1A48A835E4DBFCF71C6D9F90A6";
+pub const FEDORA_WORKSTATION_PRODUCT_LABEL: &str = "Fedora Workstation Live ISO";
 pub const KALI_RELEASE: &str = "2026.2";
 pub const KALI_ARCHIVE_FILENAME: &str = "kali-linux-2026.2-qemu-amd64.7z";
 pub const KALI_QCOW2_FILENAME: &str = "kali-linux-2026.2-qemu-amd64.qcow2";
@@ -92,6 +100,7 @@ pub enum FullReadOperation {
     ExtractedBundleArtifactHash(BundleArtifactRole),
     WorkstationImport,
     KaliPreparedHash,
+    FedoraWorkstationIsoHash,
     OtherHash,
 }
 
@@ -457,6 +466,157 @@ pub struct ImageDirectories {
     pub downloads: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FedoraIsoArchitecture {
+    X86_64,
+    Aarch64,
+}
+
+impl fmt::Display for FedoraIsoArchitecture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FedoraArtifactClass {
+    WorkstationLiveIso,
+    Server,
+    CloudBase,
+    CoreOs,
+    Minimal,
+    Container,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FedoraWorkstationIsoSource {
+    release: String,
+    compose: String,
+    architecture: FedoraIsoArchitecture,
+    filename: String,
+    source_url: String,
+    checksum_filename: String,
+    checksum_url: String,
+    signing_key_fingerprint: String,
+}
+
+impl FedoraWorkstationIsoSource {
+    #[must_use]
+    pub fn release(&self) -> &str {
+        &self.release
+    }
+
+    #[must_use]
+    pub fn compose(&self) -> &str {
+        &self.compose
+    }
+
+    #[must_use]
+    pub fn architecture(&self) -> FedoraIsoArchitecture {
+        self.architecture
+    }
+
+    #[must_use]
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+
+    #[must_use]
+    pub fn source_url(&self) -> &str {
+        &self.source_url
+    }
+
+    #[must_use]
+    pub fn checksum_filename(&self) -> &str {
+        &self.checksum_filename
+    }
+
+    #[must_use]
+    pub fn checksum_url(&self) -> &str {
+        &self.checksum_url
+    }
+
+    #[must_use]
+    pub fn signing_key_fingerprint(&self) -> &str {
+        &self.signing_key_fingerprint
+    }
+}
+
+/// Resolves only the release-bound official Workstation Live `x86_64` artifact.
+///
+/// # Errors
+/// Refuses other releases, composes, architectures, and Fedora artifact classes.
+pub fn resolve_fedora_workstation_iso(
+    release: &str,
+    compose: &str,
+    architecture: FedoraIsoArchitecture,
+    artifact_class: FedoraArtifactClass,
+) -> Result<FedoraWorkstationIsoSource, ImageError> {
+    if release != FEDORA_WORKSTATION_RELEASE
+        || compose != FEDORA_WORKSTATION_COMPOSE
+        || architecture != FedoraIsoArchitecture::X86_64
+        || artifact_class != FedoraArtifactClass::WorkstationLiveIso
+    {
+        return Err(ImageError::UnsupportedImage(format!(
+            "Fedora Workstation source must be release {FEDORA_WORKSTATION_RELEASE}, compose {FEDORA_WORKSTATION_COMPOSE}, x86_64 Workstation Live ISO"
+        )));
+    }
+    Ok(FedoraWorkstationIsoSource {
+        release: release.to_owned(),
+        compose: compose.to_owned(),
+        architecture,
+        filename: FEDORA_WORKSTATION_FILENAME.to_owned(),
+        source_url: FEDORA_WORKSTATION_SOURCE_URL.to_owned(),
+        checksum_filename: FEDORA_WORKSTATION_CHECKSUM_FILENAME.to_owned(),
+        checksum_url: FEDORA_WORKSTATION_CHECKSUM_URL.to_owned(),
+        signing_key_fingerprint: FEDORA_44_SIGNING_KEY_FINGERPRINT.to_owned(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FedoraWorkstationIsoMetadata {
+    pub release: String,
+    pub compose: String,
+    pub architecture: FedoraIsoArchitecture,
+    pub artifact_class: String,
+    pub filename: String,
+    pub source_url: String,
+    pub local_path: PathBuf,
+    pub byte_size: u64,
+    pub sha256: String,
+    pub signed_checksum_filename: String,
+    pub signing_key_fingerprint: String,
+    pub verified_at_unix_seconds: u64,
+    pub status: ImageStatus,
+}
+
+/// Byte-backed evidence for an installation source, deliberately not a prepared base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedFedoraWorkstationIso {
+    metadata: FedoraWorkstationIsoMetadata,
+    identity: VerifiedFileIdentity,
+}
+
+impl VerifiedFedoraWorkstationIso {
+    #[must_use]
+    pub fn metadata(&self) -> &FedoraWorkstationIsoMetadata {
+        &self.metadata
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FedoraWorkstationIsoState {
+    Missing {
+        source: FedoraWorkstationIsoSource,
+        local_path: PathBuf,
+    },
+    Verified(FedoraWorkstationIsoMetadata),
+    Conflict(String),
+}
+
 #[derive(Debug)]
 pub enum ImageError {
     Io(io::Error),
@@ -532,6 +692,23 @@ pub trait ArtifactFetcher {
         keyring: &Path,
         verified_output: &Path,
     ) -> Result<(), ImageError>;
+
+    /// Verifies Fedora clear-signed metadata and returns the exact primary signer.
+    ///
+    /// # Errors
+    /// Refuses a bad signature or a signer other than the independently pinned release key.
+    fn verify_fedora_checksum_signature(
+        &mut self,
+        checksum: &Path,
+        keyring: &Path,
+        verified_output: &Path,
+        expected_fingerprint: &str,
+    ) -> Result<String, ImageError> {
+        self.verify_checksum_signature(checksum, keyring, verified_output)?;
+        Err(ImageError::SignatureVerification(format!(
+            "Fedora signer identity was not reported; expected {expected_fingerprint}"
+        )))
+    }
 
     /// Verifies a detached signature with a pinned signing-key fingerprint.
     ///
@@ -720,6 +897,35 @@ impl ArtifactFetcher for SystemArtifactFetcher {
                 String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             ))
         }
+    }
+
+    fn verify_fedora_checksum_signature(
+        &mut self,
+        checksum: &Path,
+        keyring: &Path,
+        verified_output: &Path,
+        expected_fingerprint: &str,
+    ) -> Result<String, ImageError> {
+        let output = Command::new("gpgv")
+            .args(["--status-fd", "1", "--keyring"])
+            .arg(keyring)
+            .arg("--output")
+            .arg(verified_output)
+            .arg(checksum)
+            .output()?;
+        if !output.status.success() {
+            return Err(ImageError::SignatureVerification(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        let fingerprint =
+            parse_openpgp_primary_fingerprint(&String::from_utf8_lossy(&output.stdout))?;
+        if fingerprint != expected_fingerprint {
+            return Err(ImageError::SignatureVerification(format!(
+                "Fedora signing key fingerprint mismatch: expected {expected_fingerprint}, got {fingerprint}"
+            )));
+        }
+        Ok(fingerprint)
     }
 
     fn verify_detached_signature(
@@ -969,6 +1175,22 @@ fn parse_whonix_gpg_status(status: &str) -> Result<WhonixSignatureEvidence, Imag
     })
 }
 
+fn parse_openpgp_primary_fingerprint(status: &str) -> Result<String, ImageError> {
+    status
+        .lines()
+        .filter_map(|line| line.strip_prefix("[GNUPG:] VALIDSIG "))
+        .filter_map(|fields| fields.split_whitespace().last())
+        .find(|fingerprint| {
+            fingerprint.len() == 40 && fingerprint.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ImageError::SignatureVerification(
+                "OpenPGP VALIDSIG primary fingerprint evidence is missing".to_owned(),
+            )
+        })
+}
+
 fn parse_tar_verbose_listing(listing: &str) -> Result<Vec<ArchiveEntry>, ImageError> {
     listing
         .lines()
@@ -1021,6 +1243,260 @@ pub fn default_directories() -> Option<ImageDirectories> {
         images: home.join(".local/share/forge/images"),
         downloads: home.join(".cache/forge/downloads"),
     })
+}
+
+fn workstation_metadata_path(directories: &ImageDirectories) -> PathBuf {
+    let release = FEDORA_WORKSTATION_RELEASE;
+    let compose = FEDORA_WORKSTATION_COMPOSE;
+    directories.downloads.join(format!(
+        "fedora-workstation-{release}-{compose}-x86_64.metadata.json"
+    ))
+}
+
+fn workstation_iso_path(
+    directories: &ImageDirectories,
+    source: &FedoraWorkstationIsoSource,
+) -> PathBuf {
+    directories.downloads.join(source.filename())
+}
+
+fn validate_workstation_metadata(
+    source: &FedoraWorkstationIsoSource,
+    metadata: &FedoraWorkstationIsoMetadata,
+) -> Result<(), ImageError> {
+    if metadata.release != source.release
+        || metadata.compose != source.compose
+        || metadata.architecture != source.architecture
+        || metadata.artifact_class != FEDORA_WORKSTATION_PRODUCT_LABEL
+        || metadata.filename != source.filename
+        || metadata.source_url != source.source_url
+        || metadata.signed_checksum_filename != source.checksum_filename
+        || metadata.signing_key_fingerprint != source.signing_key_fingerprint
+        || metadata.status != ImageStatus::Verified
+        || !valid_sha256(&metadata.sha256)
+        || metadata.byte_size == 0
+    {
+        return Err(ImageError::Metadata(
+            "Fedora Workstation provenance contradicts the requested source".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reads Workstation installation-source inventory without hashing or mutation.
+///
+/// # Errors
+/// Returns a typed conflict for stale or contradictory persisted provenance.
+pub fn inspect_fedora_workstation_iso(
+    directories: &ImageDirectories,
+    source: &FedoraWorkstationIsoSource,
+) -> Result<FedoraWorkstationIsoState, ImageError> {
+    let path = workstation_metadata_path(directories);
+    if !path.exists() {
+        return Ok(FedoraWorkstationIsoState::Missing {
+            source: source.clone(),
+            local_path: workstation_iso_path(directories, source),
+        });
+    }
+    let metadata: FedoraWorkstationIsoMetadata = serde_json::from_slice(&fs::read(path)?)
+        .map_err(|error| ImageError::Metadata(error.to_string()))?;
+    if let Err(error) = validate_workstation_metadata(source, &metadata) {
+        return Ok(FedoraWorkstationIsoState::Conflict(error.to_string()));
+    }
+    Ok(FedoraWorkstationIsoState::Verified(metadata))
+}
+
+fn checksum_size_for(contents: &str, filename: &str) -> Result<u64, ImageError> {
+    let prefix = format!("# {filename}: ");
+    let values = contents
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .filter_map(|rest| rest.strip_suffix(" bytes"))
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| ImageError::IncompleteVerificationData)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    match values.as_slice() {
+        [value] if *value > 0 => Ok(*value),
+        _ => Err(ImageError::IncompleteVerificationData),
+    }
+}
+
+fn exact_checksum_for(contents: &str, filename: &str) -> Result<String, ImageError> {
+    let values = contents
+        .lines()
+        .filter_map(|line| {
+            let bsd = line
+                .strip_prefix("SHA256 (")
+                .and_then(|rest| rest.split_once(") = "));
+            let (candidate, checksum) = bsd?;
+            (candidate == filename && valid_sha256(checksum)).then(|| checksum.to_ascii_lowercase())
+        })
+        .collect::<Vec<_>>();
+    match values.as_slice() {
+        [value] => Ok(value.clone()),
+        _ => Err(ImageError::IncompleteVerificationData),
+    }
+}
+
+fn workstation_proof(
+    source: &FedoraWorkstationIsoSource,
+    metadata: FedoraWorkstationIsoMetadata,
+) -> Result<VerifiedFedoraWorkstationIso, ImageError> {
+    validate_workstation_metadata(source, &metadata)?;
+    let verified = verify_file_bytes(
+        &metadata.local_path,
+        &metadata.sha256,
+        FullReadOperation::FedoraWorkstationIsoHash,
+    )?;
+    if verified.identity.bytes != metadata.byte_size {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(VerifiedFedoraWorkstationIso {
+        metadata,
+        identity: verified.identity,
+    })
+}
+
+/// Revalidates persisted provenance against the exact current ISO bytes and identity.
+///
+/// # Errors
+/// Refuses missing, contradictory, changed, or digest-mismatched sources.
+pub fn verified_fedora_workstation_iso(
+    directories: &ImageDirectories,
+    source: &FedoraWorkstationIsoSource,
+) -> Result<VerifiedFedoraWorkstationIso, ImageError> {
+    let FedoraWorkstationIsoState::Verified(metadata) =
+        inspect_fedora_workstation_iso(directories, source)?
+    else {
+        return Err(ImageError::SourceNotVerified);
+    };
+    workstation_proof(source, metadata)
+}
+
+/// Revalidates that a transaction-scoped proof still names the exact same file object.
+///
+/// # Errors
+/// Refuses replacement or metadata drift after verification.
+pub fn revalidate_fedora_workstation_iso_proof(
+    proof: &VerifiedFedoraWorkstationIso,
+) -> Result<(), ImageError> {
+    if verified_file_identity(&proof.metadata.local_path)? != proof.identity {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(())
+}
+
+/// Acquires and proves the official Workstation ISO without preparing any VM or base.
+///
+/// # Errors
+/// Refuses signature, signer, artifact identity, size, digest, cache, and file drift failures.
+pub fn fetch_fedora_workstation_iso<F: ArtifactFetcher>(
+    directories: &ImageDirectories,
+    source: &FedoraWorkstationIsoSource,
+    fetcher: &mut F,
+) -> Result<VerifiedFedoraWorkstationIso, ImageError> {
+    fs::create_dir_all(&directories.downloads)?;
+    if matches!(
+        inspect_fedora_workstation_iso(directories, source)?,
+        FedoraWorkstationIsoState::Verified(_)
+    ) {
+        return verified_fedora_workstation_iso(directories, source);
+    }
+    if workstation_metadata_path(directories).exists() {
+        return Err(ImageError::Metadata(
+            "contradictory Fedora Workstation provenance already exists".to_owned(),
+        ));
+    }
+
+    let checksum_path = directories.downloads.join(source.checksum_filename());
+    let keyring_path = directories
+        .downloads
+        .join(format!("fedora-{}-trusted-keyring.gpg", source.release()));
+    let verified_checksum_path = directories
+        .downloads
+        .join(format!("{}.verified", source.checksum_filename()));
+    fetcher.download(source.checksum_url(), &checksum_path)?;
+    fetcher.download(FEDORA_KEYRING_URL, &keyring_path)?;
+    let signer = fetcher.verify_fedora_checksum_signature(
+        &checksum_path,
+        &keyring_path,
+        &verified_checksum_path,
+        source.signing_key_fingerprint(),
+    )?;
+    if signer != source.signing_key_fingerprint() {
+        return Err(ImageError::SignatureVerification(
+            "unknown Fedora Workstation signing key".to_owned(),
+        ));
+    }
+    let signed_payload = fs::read_to_string(&verified_checksum_path)?;
+    let expected_sha256 = exact_checksum_for(&signed_payload, source.filename())?;
+    let expected_bytes = checksum_size_for(&signed_payload, source.filename())?;
+
+    let final_path = workstation_iso_path(directories, source);
+    let candidate_path = if final_path.exists() {
+        final_path.clone()
+    } else {
+        let partial = directories
+            .downloads
+            .join(format!("{}.part", source.filename()));
+        if partial.exists() {
+            return Err(ImageError::VerifiedImageExists(partial));
+        }
+        fetcher.download(source.source_url(), &partial)?;
+        partial
+    };
+    let verified = verify_file_bytes(
+        &candidate_path,
+        &expected_sha256,
+        FullReadOperation::FedoraWorkstationIsoHash,
+    )?;
+    if verified.identity.bytes != expected_bytes {
+        return Err(ImageError::UnsupportedImage(format!(
+            "Fedora Workstation ISO size mismatch: expected {expected_bytes}, got {}",
+            verified.identity.bytes
+        )));
+    }
+    if candidate_path != final_path {
+        if final_path.exists() {
+            return Err(ImageError::VerifiedImageExists(final_path));
+        }
+        fs::rename(&candidate_path, &final_path)?;
+    }
+    let metadata = FedoraWorkstationIsoMetadata {
+        release: source.release.clone(),
+        compose: source.compose.clone(),
+        architecture: source.architecture,
+        artifact_class: FEDORA_WORKSTATION_PRODUCT_LABEL.to_owned(),
+        filename: source.filename.clone(),
+        source_url: source.source_url.clone(),
+        local_path: final_path,
+        byte_size: expected_bytes,
+        sha256: expected_sha256,
+        signed_checksum_filename: source.checksum_filename.clone(),
+        signing_key_fingerprint: signer,
+        verified_at_unix_seconds: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| ImageError::Metadata(error.to_string()))?
+            .as_secs(),
+        status: ImageStatus::Verified,
+    };
+    let temporary_metadata_name = format!(
+        "fedora-workstation-{}-{}-x86_64.metadata.json.tmp",
+        source.release, source.compose
+    );
+    write_json_atomic(
+        &directories.downloads,
+        &temporary_metadata_name,
+        workstation_metadata_path(directories)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| ImageError::Metadata("invalid metadata path".to_owned()))?,
+        &metadata,
+    )?;
+    workstation_proof(source, metadata)
 }
 
 #[must_use]
@@ -3106,6 +3582,7 @@ fn sha256_open_file(
         FullReadOperation::ExtractedBundleArtifactHash(_) => "extracted bundle artifact hash",
         FullReadOperation::WorkstationImport => "Workstation import",
         FullReadOperation::KaliPreparedHash => "Kali prepared qcow2 hashing",
+        FullReadOperation::FedoraWorkstationIsoHash => "Fedora Workstation ISO hashing",
         FullReadOperation::OtherHash => "file hashing",
     };
     let expected_bytes = file.metadata()?.len();
@@ -3178,6 +3655,7 @@ pub fn qcow2_virtual_size(path: &Path) -> Result<u64, ImageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -3213,6 +3691,7 @@ mod tests {
         verified_checksum: String,
         downloads: usize,
         signature_valid: bool,
+        fedora_signer: String,
         partial_extraction_failure: bool,
     }
 
@@ -3226,6 +3705,7 @@ mod tests {
                 verified_checksum: format!("{checksum}  {FEDORA_FILENAME}\n"),
                 downloads: 0,
                 signature_valid: true,
+                fedora_signer: FEDORA_44_SIGNING_KEY_FINGERPRINT.to_owned(),
                 partial_extraction_failure: false,
             }
         }
@@ -3234,7 +3714,13 @@ mod tests {
     impl ArtifactFetcher for FixtureFetcher {
         fn download(&mut self, url: &str, destination: &Path) -> Result<(), ImageError> {
             self.downloads += 1;
-            if matches!(url, FEDORA_SOURCE_URL | KALI_SOURCE_URL | WHONIX_SOURCE_URL) {
+            if matches!(
+                url,
+                FEDORA_SOURCE_URL
+                    | FEDORA_WORKSTATION_SOURCE_URL
+                    | KALI_SOURCE_URL
+                    | WHONIX_SOURCE_URL
+            ) {
                 fs::write(destination, &self.image)?;
             } else if url == KALI_SUMS_URL {
                 let checksum = self
@@ -3302,6 +3788,22 @@ mod tests {
             Ok(())
         }
 
+        fn verify_fedora_checksum_signature(
+            &mut self,
+            _: &Path,
+            _: &Path,
+            verified_output: &Path,
+            _: &str,
+        ) -> Result<String, ImageError> {
+            if !self.signature_valid {
+                return Err(ImageError::SignatureVerification(
+                    "bad Fedora CHECKSUM signature".to_owned(),
+                ));
+            }
+            fs::write(verified_output, &self.verified_checksum)?;
+            Ok(self.fedora_signer.clone())
+        }
+
         fn verify_whonix_signature(
             &mut self,
             _: &Path,
@@ -3340,6 +3842,244 @@ mod tests {
             }
             Ok(whonix_entries())
         }
+    }
+
+    fn workstation_fixture(image: &[u8]) -> FixtureFetcher {
+        let mut fetcher = FixtureFetcher::valid(image);
+        let checksum = format!("{:x}", Sha256::digest(image));
+        fetcher.verified_checksum = format!(
+            "# {FEDORA_WORKSTATION_FILENAME}: {} bytes\nSHA256 ({FEDORA_WORKSTATION_FILENAME}) = {checksum}\n",
+            image.len()
+        );
+        fetcher
+    }
+
+    fn workstation_source_fixture() -> FedoraWorkstationIsoSource {
+        resolve_fedora_workstation_iso(
+            FEDORA_WORKSTATION_RELEASE,
+            FEDORA_WORKSTATION_COMPOSE,
+            FedoraIsoArchitecture::X86_64,
+            FedoraArtifactClass::WorkstationLiveIso,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn workstation_source_is_exact_and_distinct_from_cloud() {
+        let source = workstation_source_fixture();
+        assert_eq!(source.release(), "44");
+        assert_eq!(source.compose(), "1.7");
+        assert_eq!(source.architecture(), FedoraIsoArchitecture::X86_64);
+        assert!(source.filename().contains("Workstation-Live"));
+        assert!(!source.filename().contains("Cloud"));
+        assert_ne!(source.filename(), FEDORA_FILENAME);
+    }
+
+    #[test]
+    fn workstation_source_refuses_wrong_arch_release_compose_and_artifact_class() {
+        for result in [
+            resolve_fedora_workstation_iso(
+                "45",
+                "1.7",
+                FedoraIsoArchitecture::X86_64,
+                FedoraArtifactClass::WorkstationLiveIso,
+            ),
+            resolve_fedora_workstation_iso(
+                "44",
+                "1.8",
+                FedoraIsoArchitecture::X86_64,
+                FedoraArtifactClass::WorkstationLiveIso,
+            ),
+            resolve_fedora_workstation_iso(
+                "44",
+                "1.7",
+                FedoraIsoArchitecture::Aarch64,
+                FedoraArtifactClass::WorkstationLiveIso,
+            ),
+            resolve_fedora_workstation_iso(
+                "44",
+                "1.7",
+                FedoraIsoArchitecture::X86_64,
+                FedoraArtifactClass::CloudBase,
+            ),
+            resolve_fedora_workstation_iso(
+                "44",
+                "1.7",
+                FedoraIsoArchitecture::X86_64,
+                FedoraArtifactClass::Server,
+            ),
+        ] {
+            assert!(matches!(result, Err(ImageError::UnsupportedImage(_))));
+        }
+    }
+
+    #[test]
+    fn signed_metadata_and_iso_create_typed_workstation_evidence() {
+        let test = TestDirectories::new();
+        let source = workstation_source_fixture();
+        let mut fetcher = workstation_fixture(b"official workstation iso fixture");
+        let proof = fetch_fedora_workstation_iso(&test.directories, &source, &mut fetcher).unwrap();
+        assert_eq!(proof.metadata().release, "44");
+        assert_eq!(proof.metadata().compose, "1.7");
+        assert_eq!(
+            proof.metadata().artifact_class,
+            "Fedora Workstation Live ISO"
+        );
+        assert_eq!(
+            proof.metadata().signing_key_fingerprint,
+            FEDORA_44_SIGNING_KEY_FINGERPRINT
+        );
+        assert!(proof.metadata().local_path.is_file());
+        assert!(
+            !test
+                .directories
+                .images
+                .join("forge-base-fedora-workstation-44.qcow2")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn workstation_fetch_refuses_bad_signature_unknown_signer_and_digest() {
+        let source = workstation_source_fixture();
+        let bad_signature = TestDirectories::new();
+        let mut fetcher = workstation_fixture(b"iso");
+        fetcher.signature_valid = false;
+        assert!(matches!(
+            fetch_fedora_workstation_iso(&bad_signature.directories, &source, &mut fetcher),
+            Err(ImageError::SignatureVerification(_))
+        ));
+        assert!(!workstation_metadata_path(&bad_signature.directories).exists());
+
+        let unknown_signer = TestDirectories::new();
+        let mut fetcher = workstation_fixture(b"iso");
+        fetcher.fedora_signer = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned();
+        assert!(matches!(
+            fetch_fedora_workstation_iso(&unknown_signer.directories, &source, &mut fetcher),
+            Err(ImageError::SignatureVerification(_))
+        ));
+
+        let bad_digest = TestDirectories::new();
+        let mut fetcher = workstation_fixture(b"actual iso");
+        fetcher.verified_checksum = format!(
+            "# {FEDORA_WORKSTATION_FILENAME}: 10 bytes\nSHA256 ({FEDORA_WORKSTATION_FILENAME}) = {}\n",
+            "0".repeat(64)
+        );
+        assert!(matches!(
+            fetch_fedora_workstation_iso(&bad_digest.directories, &source, &mut fetcher),
+            Err(ImageError::SourceNotVerified)
+        ));
+        assert!(!workstation_metadata_path(&bad_digest.directories).exists());
+    }
+
+    #[test]
+    fn workstation_fetch_refuses_signed_authoritative_size_mismatch() {
+        let test = TestDirectories::new();
+        let source = workstation_source_fixture();
+        let bytes = b"iso";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let mut fetcher = workstation_fixture(bytes);
+        fetcher.verified_checksum = format!(
+            "# {FEDORA_WORKSTATION_FILENAME}: 4 bytes\nSHA256 ({FEDORA_WORKSTATION_FILENAME}) = {digest}\n"
+        );
+        assert!(matches!(
+            fetch_fedora_workstation_iso(&test.directories, &source, &mut fetcher),
+            Err(ImageError::UnsupportedImage(_))
+        ));
+        assert!(!workstation_metadata_path(&test.directories).exists());
+    }
+
+    #[test]
+    fn fedora_validsig_parser_requires_primary_fingerprint_evidence() {
+        let fingerprint = FEDORA_44_SIGNING_KEY_FINGERPRINT;
+        let status =
+            format!("[GNUPG:] VALIDSIG {fingerprint} 2026-04-24 1 0 4 0 1 8 01 {fingerprint}\n");
+        assert_eq!(
+            parse_openpgp_primary_fingerprint(&status).unwrap(),
+            FEDORA_44_SIGNING_KEY_FINGERPRINT
+        );
+        assert!(matches!(
+            parse_openpgp_primary_fingerprint("[GNUPG:] GOODSIG untrusted"),
+            Err(ImageError::SignatureVerification(_))
+        ));
+    }
+
+    #[test]
+    fn workstation_fetch_refuses_missing_or_ambiguous_signed_entry_and_size() {
+        for payload in [
+            "SHA256 (Fedora-Server-dvd-x86_64-44-1.7.iso) = 0000000000000000000000000000000000000000000000000000000000000000\n".to_owned(),
+            format!("# {FEDORA_WORKSTATION_FILENAME}: 3 bytes\n# {FEDORA_WORKSTATION_FILENAME}: 3 bytes\nSHA256 ({FEDORA_WORKSTATION_FILENAME}) = {}\n", "0".repeat(64)),
+        ] {
+            let test = TestDirectories::new();
+            let source = workstation_source_fixture();
+            let mut fetcher = workstation_fixture(b"iso");
+            fetcher.verified_checksum = payload;
+            assert!(matches!(
+                fetch_fedora_workstation_iso(&test.directories, &source, &mut fetcher),
+                Err(ImageError::IncompleteVerificationData)
+            ));
+            assert!(!workstation_metadata_path(&test.directories).exists());
+        }
+    }
+
+    #[test]
+    fn exact_cached_workstation_iso_is_reused_and_unproven_file_is_verified() {
+        let test = TestDirectories::new();
+        let source = workstation_source_fixture();
+        let bytes = b"cached official iso";
+        let mut fetcher = workstation_fixture(bytes);
+        fetch_fedora_workstation_iso(&test.directories, &source, &mut fetcher).unwrap();
+        let downloads = fetcher.downloads;
+        fetch_fedora_workstation_iso(&test.directories, &source, &mut fetcher).unwrap();
+        assert_eq!(fetcher.downloads, downloads);
+
+        let unproven = TestDirectories::new();
+        fs::create_dir_all(&unproven.directories.downloads).unwrap();
+        fs::write(workstation_iso_path(&unproven.directories, &source), bytes).unwrap();
+        let mut fetcher = workstation_fixture(bytes);
+        fetch_fedora_workstation_iso(&unproven.directories, &source, &mut fetcher).unwrap();
+        assert_eq!(
+            fetcher.downloads, 2,
+            "only CHECKSUM and keyring are fetched"
+        );
+    }
+
+    #[test]
+    fn workstation_proof_refuses_file_identity_drift() {
+        let test = TestDirectories::new();
+        let source = workstation_source_fixture();
+        let mut fetcher = workstation_fixture(b"stable iso");
+        let proof = fetch_fedora_workstation_iso(&test.directories, &source, &mut fetcher).unwrap();
+        assert!(revalidate_fedora_workstation_iso_proof(&proof).is_ok());
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&proof.metadata().local_path)
+            .unwrap();
+        file.write_all(b"drift").unwrap();
+        assert!(matches!(
+            revalidate_fedora_workstation_iso_proof(&proof),
+            Err(ImageError::SourceNotVerified)
+        ));
+    }
+
+    #[test]
+    fn workstation_inventory_is_missing_without_trusting_file_existence() {
+        let test = TestDirectories::new();
+        let source = workstation_source_fixture();
+        fs::create_dir_all(&test.directories.downloads).unwrap();
+        fs::write(
+            workstation_iso_path(&test.directories, &source),
+            b"unproven",
+        )
+        .unwrap();
+        assert!(matches!(
+            inspect_fedora_workstation_iso(&test.directories, &source).unwrap(),
+            FedoraWorkstationIsoState::Missing { .. }
+        ));
+        assert!(matches!(
+            verified_fedora_workstation_iso(&test.directories, &source),
+            Err(ImageError::SourceNotVerified)
+        ));
     }
 
     #[test]

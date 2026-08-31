@@ -323,6 +323,23 @@ rotated, so trust is explicitly release-bound and reviewed; no implementation
 may treat the current website key as an unversioned permanent key. Downloading an
 ISO and trusting its pathname is forbidden.
 
+Phase 4.2 binds the initial implementation to Fedora 44 compose 1.7,
+`Fedora-Workstation-Live-44-1.7.x86_64.iso`, and the Fedora 44 release-key
+fingerprint `36F6 12DC F27F 7D1A 48A8 35E4 DBFC F71C 6D9F 90A6`. The ISO,
+signed CHECKSUM, release keyring, authenticated CHECKSUM payload, and typed
+provenance metadata use Workstation- and release-specific download-cache names;
+none reuse legacy Cloud or prepared-base state. Adding another release requires
+an explicit source-policy entry, independent fingerprint review against Fedora's
+published security page, and tests proving cross-release evidence cannot match.
+The downloaded Fedora keyring supplies key material but is never a TOFU trust
+anchor: signature acceptance additionally requires the release-bound pinned
+primary fingerprint.
+
+`VerifiedFedoraWorkstationIso` is byte-backed installation-source evidence. It
+binds the signed metadata identity, exact byte size and SHA-256 to stable local
+file identity and cannot stand in for the future canonical SharedBase. Phase 4.2
+inventory therefore reports the canonical base as `Not prepared`.
+
 ### 14.2 Installation source is not a shared base
 
 Fedora Workstation has two distinct artifact classes:

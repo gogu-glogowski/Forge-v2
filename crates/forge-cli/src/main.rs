@@ -9,6 +9,7 @@ use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+#[allow(clippy::too_many_lines)]
 fn main() -> ExitCode {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     match arguments
@@ -103,6 +104,8 @@ fn main() -> ExitCode {
         ["image", "list"] => image_list(),
         ["image", "inspect", "fedora"] => image_inspect(),
         ["image", "fetch", "fedora"] => image_fetch(),
+        ["image", "inspect", "fedora-workstation"] => image_inspect_workstation(),
+        ["image", "fetch", "fedora-workstation"] => image_fetch_workstation(),
         ["image", "recover", "whonix-workstation", "--dry-run"] => recover_whonix_workstation(true),
         ["image", "recover", "whonix-workstation"] => recover_whonix_workstation(false),
         _ => {
@@ -3391,6 +3394,25 @@ fn image_list() -> ExitCode {
     match forge_images::list(&directories) {
         Ok(images) => {
             println!("PRODUCT\tRELEASE\tARCH\tSTATUS");
+            let source = forge_images::resolve_fedora_workstation_iso(
+                forge_images::FEDORA_WORKSTATION_RELEASE,
+                forge_images::FEDORA_WORKSTATION_COMPOSE,
+                forge_images::FedoraIsoArchitecture::X86_64,
+                forge_images::FedoraArtifactClass::WorkstationLiveIso,
+            )
+            .expect("built-in Workstation source must be valid");
+            let workstation_status =
+                match forge_images::inspect_fedora_workstation_iso(&directories, &source) {
+                    Ok(forge_images::FedoraWorkstationIsoState::Missing { .. }) => "Missing",
+                    Ok(forge_images::FedoraWorkstationIsoState::Verified(_)) => "Verified",
+                    Ok(forge_images::FedoraWorkstationIsoState::Conflict(_)) => "Conflict",
+                    Err(_) => "Invalid",
+                };
+            println!(
+                "{}\t{}\tx86_64\t{workstation_status}",
+                forge_images::FEDORA_WORKSTATION_PRODUCT_LABEL,
+                source.release()
+            );
             for image in images {
                 println!(
                     "Fedora Cloud Base (Legacy/Retired)\t{}\t{}\t{}",
@@ -3401,6 +3423,83 @@ fn image_list() -> ExitCode {
         }
         Err(error) => {
             eprintln!("image listing failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn workstation_source() -> forge_images::FedoraWorkstationIsoSource {
+    forge_images::resolve_fedora_workstation_iso(
+        forge_images::FEDORA_WORKSTATION_RELEASE,
+        forge_images::FEDORA_WORKSTATION_COMPOSE,
+        forge_images::FedoraIsoArchitecture::X86_64,
+        forge_images::FedoraArtifactClass::WorkstationLiveIso,
+    )
+    .expect("built-in Workstation source must be valid")
+}
+
+fn image_inspect_workstation() -> ExitCode {
+    let Ok(directories) = image_directories() else {
+        return ExitCode::from(2);
+    };
+    let source = workstation_source();
+    println!("Product: Fedora Workstation");
+    println!("Artifact class: Workstation Live ISO");
+    println!("Release: {}", source.release());
+    println!("Compose: {}", source.compose());
+    println!("Architecture: {}", source.architecture());
+    println!("Expected filename: {}", source.filename());
+    println!("Signing key: {}", source.signing_key_fingerprint());
+    match forge_images::inspect_fedora_workstation_iso(&directories, &source) {
+        Ok(forge_images::FedoraWorkstationIsoState::Missing { local_path, .. }) => {
+            println!("Local ISO: {}", local_path.display());
+            println!("Verification status: Missing");
+            println!("Signed CHECKSUM: Not verified");
+            println!("SHA-256: unavailable until signed CHECKSUM verification");
+        }
+        Ok(forge_images::FedoraWorkstationIsoState::Verified(metadata)) => {
+            println!("Local ISO: {}", metadata.local_path.display());
+            println!("Verification status: Verified");
+            println!("Signed CHECKSUM: Verified");
+            println!("SHA-256: {}", metadata.sha256);
+            println!("Bytes: {}", metadata.byte_size);
+        }
+        Ok(forge_images::FedoraWorkstationIsoState::Conflict(reason)) => {
+            println!("Verification status: Conflict");
+            eprintln!("{reason}");
+            return ExitCode::from(1);
+        }
+        Err(error) => {
+            eprintln!("Workstation ISO inspection failed: {error}");
+            return ExitCode::from(1);
+        }
+    }
+    println!("Canonical base: Not prepared");
+    ExitCode::SUCCESS
+}
+
+fn image_fetch_workstation() -> ExitCode {
+    let Ok(directories) = image_directories() else {
+        return ExitCode::from(2);
+    };
+    let source = workstation_source();
+    println!(
+        "Fetching official Fedora Workstation {} {} Live ISO...",
+        source.release(),
+        source.architecture()
+    );
+    let mut fetcher = forge_images::SystemArtifactFetcher;
+    match forge_images::fetch_fedora_workstation_iso(&directories, &source, &mut fetcher) {
+        Ok(proof) => {
+            let metadata = proof.metadata();
+            println!("Verified ISO: {}", metadata.local_path.display());
+            println!("SHA-256: {}", metadata.sha256);
+            println!("Signing key: {}", metadata.signing_key_fingerprint);
+            println!("Canonical base: Not prepared");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Fedora Workstation ISO fetch failed: {error}");
             ExitCode::from(1)
         }
     }
@@ -4974,6 +5073,8 @@ fn print_usage() {
     eprintln!("  forge vm rebuild <instance> --dry-run");
     eprintln!("  forge image list");
     eprintln!("  forge image inspect fedora");
+    eprintln!("  forge image inspect fedora-workstation");
+    eprintln!("  forge image fetch fedora-workstation");
     eprintln!("  forge image recover whonix-workstation [--dry-run]");
     eprintln!(
         "Legacy Fedora Cloud/NoCloud is retired; compatibility inspection remains available."
