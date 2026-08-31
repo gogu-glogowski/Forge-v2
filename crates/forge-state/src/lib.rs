@@ -48,6 +48,14 @@ pub struct ManagedResource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct FreshDomainEvidence {
+    pub old_persistent_xml: String,
+    pub old_normalized_topology: String,
+    pub replacement_normalized_topology: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GenerationManifest {
     pub schema_version: u32,
     pub domain_name: String,
@@ -59,6 +67,8 @@ pub struct GenerationManifest {
     pub storage_pool_uuid: String,
     pub status: GenerationStatus,
     pub resources: Vec<ManagedResource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_domain_evidence: Option<FreshDomainEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,6 +329,7 @@ pub fn plan_adoption(
         storage_pool_uuid: observed.storage_pool_uuid.clone(),
         status: GenerationStatus::Active,
         resources: resources.clone(),
+        fresh_domain_evidence: None,
     };
     Ok(AdoptionPlan {
         manifest_path: path,

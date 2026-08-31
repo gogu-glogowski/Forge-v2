@@ -417,6 +417,187 @@ impl LibvirtDefineBackend {
         }
         Ok(info)
     }
+
+    /// Reads the persistent shutoff domain identity used by Fresh replacement/recovery.
+    ///
+    /// # Errors
+    /// Refuses missing domains, unreadable XML, unsupported state, or a missing primary disk.
+    pub fn inspect_stable_domain(
+        &self,
+        name: &str,
+    ) -> Result<(forge_storage::StableDomainEvidence, String), String> {
+        let domain = Domain::lookup_by_name(&self.connection, name).map_err(|e| e.to_string())?;
+        let persistent = domain.is_persistent().map_err(|e| e.to_string())?;
+        let (state, _) = domain.get_state().map_err(|e| e.to_string())?;
+        let xml = domain.get_xml_desc(0).map_err(|e| e.to_string())?;
+        let disk_path = domain_disk_path(&xml)
+            .ok_or_else(|| "persistent domain XML has no primary file disk".to_owned())?;
+        let topology =
+            persistent_topology(&xml, domain.get_autostart().map_err(|e| e.to_string())?)?;
+        let network_identity = topology.interfaces.first().map(|nic| nic.mac.clone());
+        Ok((
+            forge_storage::StableDomainEvidence {
+                name: domain.get_name().map_err(|e| e.to_string())?,
+                uuid: domain.get_uuid_string().map_err(|e| e.to_string())?,
+                persistent,
+                shutoff: map_domain_state(state).map_err(|e| e.to_string())?
+                    == forge_core::VmState::Shutoff,
+                disk_path,
+                network_identity,
+                topology,
+            },
+            xml,
+        ))
+    }
+}
+
+/// Produces a define-over-existing document by changing only the exact old disk source.
+///
+/// # Errors
+/// Refuses ambiguous/missing old paths and documents already containing the new path.
+pub fn replace_domain_disk(xml: &str, old_path: &str, new_path: &str) -> Result<String, String> {
+    let single = xml.matches(old_path).count();
+    if single != 1 || xml.contains(new_path) {
+        return Err("domain XML does not contain one exact replaceable old disk source".to_owned());
+    }
+    Ok(xml.replacen(old_path, new_path, 1))
+}
+
+fn xml_blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let start = format!("<{tag}");
+    let end = format!("</{tag}>");
+    let mut rest = xml;
+    let mut blocks = Vec::new();
+    while let Some(offset) = rest.find(&start) {
+        rest = &rest[offset..];
+        let Some(close) = rest.find(&end) else { break };
+        let length = close + end.len();
+        blocks.push(&rest[..length]);
+        rest = &rest[length..];
+    }
+    blocks
+}
+
+fn tag_text(xml: &str, tag: &str) -> Option<String> {
+    let after = &xml[xml.find(&format!("<{tag}"))?..];
+    let open = after.find('>')? + 1;
+    let close = after[open..].find(&format!("</{tag}>"))? + open;
+    Some(after[open..close].trim().to_owned())
+}
+
+fn source_identity(block: &str) -> String {
+    [
+        "file", "network", "bridge", "dev", "address", "path", "name", "type", "mode",
+    ]
+    .iter()
+    .filter_map(|key| xml_attribute(block, "source", key).map(|value| format!("{key}={value}")))
+    .collect::<Vec<_>>()
+    .join(";")
+}
+
+fn direct_child_kinds(xml: &str) -> Vec<String> {
+    let Some(open) = xml.find('>') else {
+        return Vec::new();
+    };
+    let mut rest = &xml[open + 1..];
+    let mut depth = 0usize;
+    let mut kinds = Vec::new();
+    while let Some(start) = rest.find('<') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('>') else { break };
+        let token = &rest[..end];
+        if token.starts_with('/') {
+            depth = depth.saturating_sub(1);
+        } else if !token.starts_with(['?', '!']) {
+            if depth == 0 {
+                kinds.push(
+                    token
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches('/')
+                        .to_owned(),
+                );
+            }
+            if !token.ends_with('/') {
+                depth += 1;
+            }
+        }
+        rest = &rest[end + 1..];
+    }
+    kinds.sort();
+    kinds
+}
+
+fn persistent_topology(
+    xml: &str,
+    autostart: bool,
+) -> Result<forge_storage::PersistentDomainTopology, String> {
+    let os = xml_blocks(xml, "os")
+        .into_iter()
+        .next()
+        .ok_or("domain XML has no os topology")?;
+    let machine = xml_attribute(os, "type", "machine").ok_or("domain XML has no machine type")?;
+    let vcpus = tag_text(xml, "vcpu")
+        .ok_or("domain XML has no vcpu")?
+        .parse()
+        .map_err(|_| "invalid vcpu")?;
+    let memory_kib = tag_text(xml, "memory")
+        .ok_or("domain XML has no memory")?
+        .parse()
+        .map_err(|_| "invalid memory")?;
+    let disks = xml_blocks(xml, "disk")
+        .into_iter()
+        .map(|block| forge_storage::PersistentDisk {
+            device: xml_attribute(block, "disk", "device").unwrap_or_default(),
+            kind: xml_attribute(block, "disk", "type").unwrap_or_default(),
+            driver: xml_attribute(block, "driver", "name").unwrap_or_default(),
+            format: xml_attribute(block, "driver", "type").unwrap_or_default(),
+            source: xml_attribute(block, "source", "file")
+                .unwrap_or_else(|| source_identity(block)),
+            target: xml_attribute(block, "target", "dev").unwrap_or_default(),
+            bus: xml_attribute(block, "target", "bus").unwrap_or_default(),
+            readonly: block.contains("<readonly"),
+        })
+        .collect();
+    let interfaces = xml_blocks(xml, "interface")
+        .into_iter()
+        .map(|block| forge_storage::PersistentInterface {
+            kind: xml_attribute(block, "interface", "type").unwrap_or_default(),
+            model: xml_attribute(block, "model", "type").unwrap_or_default(),
+            mac: xml_attribute(block, "mac", "address").unwrap_or_default(),
+            source: source_identity(block),
+            backend: xml_attribute(block, "backend", "type"),
+        })
+        .collect();
+    let devices = xml_blocks(xml, "devices").into_iter().next().unwrap_or("");
+    let device_kinds = direct_child_kinds(devices);
+    Ok(forge_storage::PersistentDomainTopology {
+        machine,
+        firmware_loader: tag_text(os, "loader"),
+        vcpus,
+        memory_kib,
+        disks,
+        interfaces,
+        graphics: xml_blocks(xml, "graphics")
+            .into_iter()
+            .map(|b| {
+                format!(
+                    "type={};{}",
+                    xml_attribute(b, "graphics", "type").unwrap_or_default(),
+                    source_identity(b)
+                )
+            })
+            .collect(),
+        qga_channels: xml_blocks(xml, "channel")
+            .into_iter()
+            .filter(|b| b.contains("org.qemu.guest_agent.0"))
+            .count(),
+        hostdevs: xml_blocks(devices, "hostdev").len(),
+        filesystems: xml_blocks(devices, "filesystem").len(),
+        device_kinds,
+        autostart,
+    })
 }
 
 impl forge_storage::DefineBackend for LibvirtDefineBackend {
@@ -2469,6 +2650,18 @@ mod tests {
             validate_managed_seed_topology(Some("/pool/expected.iso"), Some("/pool/other.iso"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn normalized_topology_detects_every_persistent_device_surprise() {
+        let xml = "<domain><memory unit='KiB'>1024</memory><vcpu>2</vcpu><os><type machine='pc-q35-10.2'>hvm</type></os><devices><emulator>/usr/bin/qemu</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='/old.qcow2'/><target dev='vda' bus='virtio'/></disk><interface type='network'><mac address='52:54:00:00:00:01'/><source network='default'/><model type='virtio'/></interface><graphics type='spice'/><hostdev mode='subsystem'></hostdev></devices></domain>";
+        let topology = persistent_topology(xml, false).unwrap();
+        assert_eq!(topology.machine, "pc-q35-10.2");
+        assert_eq!(topology.disks[0].source, "/old.qcow2");
+        assert_eq!(topology.interfaces[0].source, "network=default");
+        assert_eq!(topology.hostdevs, 1);
+        assert!(topology.device_kinds.contains(&"hostdev".to_owned()));
+        assert!(forge_storage::validate_kali_topology(&topology, "/old.qcow2").is_err());
     }
 
     #[test]

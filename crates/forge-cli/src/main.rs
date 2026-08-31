@@ -46,6 +46,8 @@ fn main() -> ExitCode {
         ["vm", "create", profile_name, instance_name] => create_vm(profile_name, instance_name),
         ["vm", "clone", source, target, "--dry-run"] => clone_vm(source, target, true),
         ["vm", "clone", source, target] => clone_vm(source, target, false),
+        ["vm", "fresh", instance, "--dry-run"] => fresh_vm(instance, true),
+        ["vm", "fresh", instance] => fresh_vm(instance, false),
         ["hypervisor", "info"] => hypervisor_info(),
         ["vm", "list"] => vm_list(),
         ["vm", "status", instance] => lifecycle_status(instance),
@@ -79,8 +81,8 @@ fn main() -> ExitCode {
         ),
         ["state", "show", "fedora-lab"] => state_show(),
         ["state", "reconcile", instance] => state_reconcile(instance),
-        ["state", "recover", "fedora-lab", "--dry-run"] => state_recover(true),
-        ["state", "recover", "fedora-lab"] => state_recover(false),
+        ["state", "recover", instance, "--dry-run"] => state_recover(instance, true),
+        ["state", "recover", instance] => state_recover(instance, false),
         ["state", "adopt", "fedora-lab", "--dry-run"] => state_adopt(true),
         ["state", "adopt", "fedora-lab"] => state_adopt(false),
         ["vm", "define", "fedora-lab"] => define_vm(false),
@@ -344,7 +346,10 @@ fn recovery_inputs(
 }
 
 #[allow(clippy::too_many_lines)]
-fn state_recover(dry_run: bool) -> ExitCode {
+fn state_recover(instance_name: &str, dry_run: bool) -> ExitCode {
+    if instance_name != "fedora-lab" {
+        return fresh_restore_old(instance_name, dry_run);
+    }
     let layout = match managed_state_layout() {
         Ok(value) => value,
         Err(error) => {
@@ -449,6 +454,276 @@ fn state_recover(dry_run: bool) -> ExitCode {
         }
         Err(error) => {
             eprintln!("atomic recovery state transition failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+struct FreshRestoreBackend {
+    storage: forge_libvirt::LibvirtDefineBackend,
+    boot: forge_libvirt::LibvirtBootBackend,
+    layout: forge_state::StateLayout,
+    instance: InstanceName,
+}
+
+impl forge_storage::FreshRecoveryBackend for FreshRestoreBackend {
+    fn revalidate_restore(&mut self, plan: &forge_storage::RestoreOldPlan) -> Result<(), String> {
+        let index = forge_state::read_index(&self.layout.index)
+            .map_err(|e| e.to_string())?
+            .ok_or("recovery index disappeared")?;
+        let manifests = load_index_manifests(&self.layout, &index)?;
+        if index != plan.source_index
+            || manifests
+                .iter()
+                .find(|m| m.generation_id == plan.old_active.generation_id)
+                != Some(&plan.old_active)
+            || manifests
+                .iter()
+                .find(|m| m.generation_id == plan.preparing.generation_id)
+                != Some(&plan.preparing)
+        {
+            return Err("durable Fresh recovery identities changed".to_owned());
+        }
+        let (domain, _) = self.storage.inspect_stable_domain(self.instance.as_str())?;
+        if domain != plan.current_domain {
+            return Err("current Preparing domain topology changed".to_owned());
+        }
+        forge_storage::validate_kali_topology(&domain.topology, &domain.disk_path)?;
+        let observed = self
+            .boot
+            .inspect_generation_overlay_only(&domain.disk_path)
+            .map_err(|e| e.to_string())?;
+        let report = forge_state::reconcile_managed(&index, &manifests, &observed);
+        if !matches!(
+            report.recovery_reason,
+            Some(forge_state::ManagedRecoveryReason::FreshReplacementPending { .. })
+        ) {
+            return Err("state is no longer FreshReplacementPending".to_owned());
+        }
+        Ok(())
+    }
+    fn define_old(&mut self, xml: &str) -> Result<(), String> {
+        let domain = forge_storage::DefineBackend::define_domain(&mut self.storage, xml)
+            .map_err(|e| e.error.to_string())?;
+        if domain.uuid == self.instance_uuid()? && domain.state == forge_core::VmState::Shutoff {
+            Ok(())
+        } else {
+            Err("restored domain UUID/state mismatch".to_owned())
+        }
+    }
+    fn inspect_old(
+        &mut self,
+        _: &forge_storage::RestoreOldPlan,
+    ) -> Result<forge_storage::StableDomainEvidence, String> {
+        self.storage
+            .inspect_stable_domain(self.instance.as_str())
+            .map(|v| v.0)
+    }
+    fn publish_failed(
+        &mut self,
+        expected: &forge_state::GenerationIndex,
+        next: &forge_state::GenerationIndex,
+    ) -> Result<(), String> {
+        let current = forge_state::read_index(&self.layout.index)
+            .map_err(|e| e.to_string())?
+            .ok_or("recovery index disappeared")?;
+        if &current != expected {
+            return Err("recovery index changed before atomic publication".to_owned());
+        }
+        forge_state::write_index_atomic(&self.layout.index, next).map_err(|e| e.to_string())
+    }
+    fn cleanup_failed_preparing(
+        &mut self,
+        manifest: &forge_state::GenerationManifest,
+    ) -> Result<(), String> {
+        let targets = manifest
+            .resources
+            .iter()
+            .filter(|r| r.role != forge_state::ResourceRole::SharedBase)
+            .collect::<Vec<_>>();
+        if targets.len() != 1 || targets[0].role != forge_state::ResourceRole::WritableOverlay {
+            return Err("Fresh recovery cleanup ownership is not one exact overlay".to_owned());
+        }
+        self.boot
+            .delete_managed_volume_exact(targets[0])
+            .map_err(|e| e.to_string())?;
+        self.boot
+            .verify_managed_volume_absent(targets[0])
+            .map_err(|e| e.to_string())
+    }
+    fn reconcile_old(&mut self, expected: &forge_state::GenerationIndex) -> Result<(), String> {
+        let manifests = load_index_manifests(&self.layout, expected)?;
+        let active = active_manifest(expected, &manifests)?;
+        let observed = self
+            .boot
+            .inspect_managed_state(active)
+            .map_err(|e| e.to_string())?;
+        let report = forge_state::reconcile_managed(expected, &manifests, &observed);
+        if report.status == forge_state::ManagedReconciliationStatus::Consistent {
+            Ok(())
+        } else {
+            Err(format!(
+                "restored old Active reconciliation is {:?}",
+                report.status
+            ))
+        }
+    }
+}
+
+impl FreshRestoreBackend {
+    fn instance_uuid(&self) -> Result<String, String> {
+        forge_state::read_index(&self.layout.index)
+            .map_err(|e| e.to_string())?
+            .map(|i| i.domain_uuid)
+            .ok_or("recovery index disappeared".to_owned())
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn fresh_restore_old(instance_name: &str, dry_run: bool) -> ExitCode {
+    let operational = match operational_instance_internal(instance_name, true) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("recovery refused: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if operational.profile.kind != forge_core::GuestProfileKind::KaliLab {
+        eprintln!("recovery refused: Fresh restore-old is supported only for Kali");
+        return ExitCode::from(1);
+    }
+    let layout = match managed_state_layout_for(&operational.instance) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("recovery refused: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let storage = match forge_libvirt::LibvirtDefineBackend::connect_local() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("recovery refused: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let boot =
+        match forge_libvirt::LibvirtBootBackend::connect_instance(operational.instance.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("recovery refused: {e}");
+                return ExitCode::from(1);
+            }
+        };
+    let (current, _) = match storage.inspect_stable_domain(instance_name) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("recovery refused: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = forge_storage::validate_kali_topology(&current.topology, &current.disk_path) {
+        eprintln!("recovery refused: {e}");
+        return ExitCode::from(1);
+    }
+    let Some(preparing) = operational
+        .manifests
+        .iter()
+        .find(|m| m.status == forge_state::GenerationStatus::Preparing)
+    else {
+        eprintln!("recovery refused: no Preparing generation");
+        return ExitCode::from(1);
+    };
+    let Some(new_disk) = preparing
+        .resources
+        .iter()
+        .find(|r| r.role == forge_state::ResourceRole::WritableOverlay)
+    else {
+        eprintln!("recovery refused: Preparing overlay missing");
+        return ExitCode::from(1);
+    };
+    let Some(old_disk) = operational
+        .active
+        .resources
+        .iter()
+        .find(|r| r.role == forge_state::ResourceRole::WritableOverlay)
+    else {
+        eprintln!("recovery refused: Active overlay missing");
+        return ExitCode::from(1);
+    };
+    let preparing_observed = match boot.inspect_generation_overlay_only(&new_disk.path) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("recovery refused: Preparing storage proof failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let recovery = forge_state::reconcile_managed(
+        &operational.index,
+        &operational.manifests,
+        &preparing_observed,
+    );
+    if !matches!(
+        recovery.recovery_reason,
+        Some(forge_state::ManagedRecoveryReason::FreshReplacementPending { .. })
+    ) {
+        eprintln!("recovery refused: state is not exact FreshReplacementPending");
+        return ExitCode::from(1);
+    }
+    let Some(domain_evidence) = preparing.fresh_domain_evidence.as_ref() else {
+        eprintln!("recovery refused: Preparing has no durable Fresh domain evidence");
+        return ExitCode::from(1);
+    };
+    if format!("{:?}", current.topology) != domain_evidence.replacement_normalized_topology {
+        eprintln!("recovery refused: current topology differs from durable Preparing evidence");
+        return ExitCode::from(1);
+    }
+    let old_xml = domain_evidence.old_persistent_xml.clone();
+    let plan = match forge_storage::plan_restore_old(
+        &operational.index,
+        &operational.manifests,
+        current,
+        old_xml,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("recovery refused: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    println!("RecoveryReason: FreshReplacementPending");
+    println!("Durable old Active: {}", plan.old_active.generation_id);
+    println!("Preparing generation: {}", plan.preparing.generation_id);
+    println!(
+        "Observed Preparing binding: {}",
+        plan.current_domain.disk_path
+    );
+    println!("Planned restore-old binding: {}", old_disk.path);
+    println!("Recovery cleanup target: {}", new_disk.path);
+    println!("Mutation: {}", !dry_run);
+    if dry_run {
+        return ExitCode::SUCCESS;
+    }
+    eprint!("Restore exact old Active definition and recover Preparing resources? [y/N] ");
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err()
+        || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    {
+        println!("Recovery cancelled; state unchanged.");
+        return ExitCode::SUCCESS;
+    }
+    let mut backend = FreshRestoreBackend {
+        storage,
+        boot,
+        layout,
+        instance: operational.instance,
+    };
+    match forge_storage::execute_restore_old(&mut backend, &plan) {
+        Ok(_) => {
+            println!("Fresh restore-old recovery completed.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Fresh restore-old recovery failed closed: {e}");
             ExitCode::from(1)
         }
     }
@@ -663,6 +938,439 @@ fn cleanup_vm_dry_run(instance_name: &str) -> ExitCode {
     managed_cleanup(instance_name, true)
 }
 
+/// Plans the Kali Fresh transaction. Execution remains deliberately disabled
+/// until the stable-name libvirt replacement/recovery boundary is implemented.
+#[allow(clippy::too_many_lines)]
+fn fresh_vm(instance_name: &str, dry_run: bool) -> ExitCode {
+    let operational = match operational_instance(instance_name) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("fresh refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if !operational
+        .active
+        .resources
+        .iter()
+        .any(|resource| resource.role == forge_state::ResourceRole::SharedBase)
+    {
+        eprintln!("fresh refused: flat RAW clone is not supported for Kali Fresh");
+        return ExitCode::from(1);
+    }
+    let backend =
+        match forge_libvirt::LibvirtBootBackend::connect_instance(operational.instance.clone()) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("fresh inspection failed: {error}");
+                return ExitCode::from(1);
+            }
+        };
+    let (old_domain, old_domain_xml) = match forge_libvirt::LibvirtDefineBackend::connect_local()
+        .map_err(|e| e.to_string())
+        .and_then(|b| b.inspect_stable_domain(instance_name))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("fresh domain inspection failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) =
+        forge_storage::validate_kali_topology(&old_domain.topology, &old_domain.disk_path)
+    {
+        eprintln!("fresh refused before mutation: {error}");
+        return ExitCode::from(1);
+    }
+    let status = match backend.inspect_managed_lifecycle(&operational.active) {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("fresh lifecycle inspection failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let observed = match backend.inspect_managed_state(&operational.active) {
+        Ok(observed) => observed,
+        Err(error) => {
+            eprintln!("fresh storage inspection failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let reconciliation =
+        forge_state::reconcile_managed(&operational.index, &operational.manifests, &observed);
+    let shared_base = operational
+        .active
+        .resources
+        .iter()
+        .find(|resource| resource.role == forge_state::ResourceRole::SharedBase);
+    let plan = match forge_storage::plan_fresh(
+        forge_storage::FreshPlanInput {
+            instance: operational.instance.clone(),
+            profile: Some(operational.profile.clone()),
+            index: operational.index.clone(),
+            active: Some(operational.active.clone()),
+            observed,
+            domain_state: status.domain_state,
+            reconciliation: reconciliation.status,
+            shared_base_disposition: if shared_base.is_some() {
+                forge_storage::SharedBaseDisposition::ReuseProven
+            } else {
+                forge_storage::SharedBaseDisposition::Prepare
+            },
+            old_seed: operational
+                .active
+                .resources
+                .iter()
+                .find(|resource| resource.role == forge_state::ResourceRole::NoCloudSeed)
+                .cloned(),
+            old_network_identity: old_domain.network_identity.clone(),
+        },
+        forge_state::new_generation_id(),
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("fresh refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    println!(
+        "Mode: {}",
+        if dry_run {
+            "fresh dry-run (zero mutation)"
+        } else {
+            "fresh real"
+        }
+    );
+    println!("Instance: {}", plan.stable_instance);
+    println!("Profile: {}", plan.profile_id);
+    println!(
+        "Current Active generation: {}",
+        plan.old_active_generation_id
+    );
+    println!("Current domain UUID: {}", plan.old_domain_uuid);
+    println!("Current state: {}", status.domain_state);
+    println!("Reconciliation: {:?}", reconciliation.status);
+    println!(
+        "Shared base disposition: {:?}",
+        plan.trusted_base_disposition
+    );
+    println!(
+        "Existing trusted base: {}",
+        shared_base.map_or("unknown", |r| r.path.as_str())
+    );
+    println!("Planned new generation: {}", plan.new_generation_id);
+    println!(
+        "Planned new overlay: /var/lib/libvirt/images/{}",
+        plan.new_overlay
+    );
+    println!("Seed: {}", plan.new_seed.as_deref().unwrap_or("none"));
+    println!("Domain identity: stable instance name / stable UUID");
+    println!(
+        "Persistent topology proof: exact normalized machine/firmware, CPU/memory, disks, NICs, graphics, QGA, device inventory, and autostart"
+    );
+    println!(
+        "Domain replacement: redefine existing shutoff persistent domain with same stable name/UUID after replacement storage proof"
+    );
+    println!(
+        "Recovery boundary: if domain XML advances before durable Active switch, normal lifecycle refuses until explicit Fresh recovery"
+    );
+    println!(
+        "Guest state: fresh from trusted Kali base; current writable guest changes are not copied"
+    );
+    println!("Activation: old Active -> Retained; new Preparing -> Active");
+    println!("Old generation: retained after success");
+    println!("Automatic cleanup: no");
+    println!("Automatic boot: no");
+    println!("Confirmation required: yes");
+    println!("Mutation: false");
+    if !dry_run {
+        eprint!("Replace {instance_name} with a fresh shutoff Kali generation? [y/N] ");
+        let mut answer = String::new();
+        if io::stdin().read_line(&mut answer).is_err()
+            || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+        {
+            eprintln!("Fresh cancelled.");
+            return ExitCode::SUCCESS;
+        }
+        let old_disk = if let Some(value) = plan
+            .old_storage
+            .iter()
+            .find(|r| r.role == forge_state::ResourceRole::WritableOverlay)
+        {
+            value.path.clone()
+        } else {
+            eprintln!("fresh refused: old Active overlay missing");
+            return ExitCode::from(1);
+        };
+        let new_path = format!("/var/lib/libvirt/images/{}", plan.new_overlay);
+        let replacement_xml =
+            match forge_libvirt::replace_domain_disk(&old_domain_xml, &old_disk, &new_path) {
+                Ok(xml) => xml,
+                Err(error) => {
+                    eprintln!("fresh refused: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+        let created_unix_seconds =
+            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(value) => value.as_secs(),
+                Err(error) => {
+                    eprintln!("fresh refused: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+        let layout = match managed_state_layout_for(&operational.instance) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("fresh refused: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        let mut executor = KaliFreshBackend {
+            storage: match forge_libvirt::LibvirtDefineBackend::connect_local() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("fresh refused: {e}");
+                    return ExitCode::from(1);
+                }
+            },
+            instance: operational.instance.clone(),
+            layout,
+            source: operational.clone(),
+            old_domain,
+            overlay_created: false,
+        };
+        return match forge_storage::execute_fresh(
+            &mut executor,
+            &forge_storage::FreshExecutionPlan {
+                fresh: plan,
+                created_unix_seconds,
+                replacement_xml,
+            },
+        ) {
+            Ok(result) => {
+                println!("Active generation: {}", result.index.active_generation_id);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("fresh failed: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+    ExitCode::SUCCESS
+}
+
+struct KaliFreshBackend {
+    storage: forge_libvirt::LibvirtDefineBackend,
+    instance: InstanceName,
+    layout: forge_state::StateLayout,
+    source: OperationalInstance,
+    old_domain: forge_storage::StableDomainEvidence,
+    overlay_created: bool,
+}
+
+impl forge_storage::FreshExecutionBackend for KaliFreshBackend {
+    fn revalidate(
+        &mut self,
+        plan: &forge_storage::FreshExecutionPlan,
+    ) -> Result<forge_storage::StableDomainEvidence, String> {
+        let fresh = operational_instance(self.instance.as_str())?;
+        if fresh.index != self.source.index
+            || fresh.active != self.source.active
+            || fresh.manifests != self.source.manifests
+        {
+            return Err("durable Active/Preparing state changed since planning".to_owned());
+        }
+        let boot = forge_libvirt::LibvirtBootBackend::connect_instance(self.instance.clone())
+            .map_err(|e| e.to_string())?;
+        let lifecycle = boot
+            .inspect_managed_lifecycle(&fresh.active)
+            .map_err(|e| e.to_string())?;
+        let observed = boot
+            .inspect_managed_state(&fresh.active)
+            .map_err(|e| e.to_string())?;
+        if lifecycle.domain_state != forge_core::VmState::Shutoff
+            || forge_state::reconcile_managed(&fresh.index, &fresh.manifests, &observed).status
+                != forge_state::ManagedReconciliationStatus::Consistent
+        {
+            return Err("source is no longer shutoff and Consistent".to_owned());
+        }
+        let (domain, _) = self.storage.inspect_stable_domain(self.instance.as_str())?;
+        if domain != self.old_domain {
+            return Err("old domain identity, disk, or network changed".to_owned());
+        }
+        forge_storage::validate_kali_topology(&domain.topology, &domain.disk_path)?;
+        if forge_storage::DefineBackend::volume_exists(
+            &mut self.storage,
+            forge_storage::DEFAULT_POOL,
+            &plan.fresh.new_overlay,
+        )
+        .map_err(|e| e.to_string())?
+        {
+            return Err("candidate overlay collision".to_owned());
+        }
+        Ok(domain)
+    }
+
+    fn create_overlay(&mut self, plan: &forge_storage::FreshExecutionPlan) -> Result<(), String> {
+        let base = self
+            .source
+            .active
+            .resources
+            .iter()
+            .find(|r| r.role == forge_state::ResourceRole::SharedBase)
+            .ok_or("trusted shared base missing")?;
+        let overlay = forge_storage::OverlayVolume {
+            name: plan.fresh.new_overlay.clone(),
+            path: format!("/var/lib/libvirt/images/{}", plan.fresh.new_overlay),
+            capacity_bytes: self.source.profile.resources.disk_bytes,
+            allocation_bytes: 0,
+            format: "qcow2".to_owned(),
+            backing_path: Some(base.path.clone()),
+        };
+        forge_storage::ImagePrepareBackend::create_overlay(
+            &mut self.storage,
+            forge_storage::DEFAULT_POOL,
+            &overlay,
+        )
+        .map_err(|e| e.to_string())?;
+        self.overlay_created = true;
+        Ok(())
+    }
+
+    fn inspect_overlay(
+        &mut self,
+        plan: &forge_storage::FreshExecutionPlan,
+    ) -> Result<forge_state::ObservedGeneration, String> {
+        let observed = self
+            .storage
+            .inspect_preparing_generation(
+                &self.instance,
+                &plan.fresh.new_domain_uuid,
+                &plan.fresh.new_overlay,
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        let overlay = observed
+            .resources
+            .iter()
+            .find(|r| r.role == forge_state::ResourceRole::WritableOverlay)
+            .ok_or("new overlay observation missing")?;
+        let base = self
+            .source
+            .active
+            .resources
+            .iter()
+            .find(|r| r.role == forge_state::ResourceRole::SharedBase)
+            .ok_or("trusted shared base missing")?;
+        if overlay.format != "qcow2"
+            || overlay.capacity_bytes != self.source.profile.resources.disk_bytes
+            || overlay.backing_path.as_deref() != Some(base.path.as_str())
+        {
+            return Err("new overlay format/capacity/backing proof failed".to_owned());
+        }
+        Ok(observed)
+    }
+
+    fn publish_preparing(
+        &mut self,
+        manifest: &forge_state::GenerationManifest,
+    ) -> Result<forge_state::GenerationIndex, String> {
+        forge_state::write_manifest_atomic(
+            &self.layout.generation_path(&manifest.generation_id),
+            manifest,
+        )
+        .map_err(|e| e.to_string())?;
+        let next =
+            forge_state::add_preparing(&self.source.index, manifest).map_err(|e| e.to_string())?;
+        forge_state::write_index_atomic(&self.layout.index, &next).map_err(|e| e.to_string())?;
+        Ok(next)
+    }
+    fn revalidate_old_domain(
+        &mut self,
+        expected: &forge_storage::StableDomainEvidence,
+    ) -> Result<(), String> {
+        let (actual, _) = self.storage.inspect_stable_domain(self.instance.as_str())?;
+        if &actual == expected {
+            Ok(())
+        } else {
+            Err("old domain changed before redefine".to_owned())
+        }
+    }
+    fn define_replacement(&mut self, xml: &str) -> Result<(), String> {
+        let d = forge_storage::DefineBackend::define_domain(&mut self.storage, xml)
+            .map_err(|e| e.error.to_string())?;
+        if d.uuid == self.old_domain.uuid && d.state == forge_core::VmState::Shutoff {
+            Ok(())
+        } else {
+            Err("defined replacement identity/state mismatch".to_owned())
+        }
+    }
+    fn inspect_replacement(
+        &mut self,
+        plan: &forge_storage::FreshExecutionPlan,
+    ) -> Result<
+        (
+            forge_storage::StableDomainEvidence,
+            forge_state::ObservedGeneration,
+        ),
+        String,
+    > {
+        let (domain, _) = self.storage.inspect_stable_domain(self.instance.as_str())?;
+        let boot = forge_libvirt::LibvirtBootBackend::connect_instance(self.instance.clone())
+            .map_err(|e| e.to_string())?;
+        let observed = boot
+            .inspect_generation_overlay_only(&format!(
+                "/var/lib/libvirt/images/{}",
+                plan.fresh.new_overlay
+            ))
+            .map_err(|e| e.to_string())?;
+        Ok((domain, observed))
+    }
+    fn activate(
+        &mut self,
+        expected: &forge_state::GenerationIndex,
+        next: &forge_state::GenerationIndex,
+    ) -> Result<(), String> {
+        let current = forge_state::read_index(&self.layout.index)
+            .map_err(|e| e.to_string())?
+            .ok_or("Fresh index disappeared")?;
+        if &current != expected {
+            return Err("Fresh index changed before activation".to_owned());
+        }
+        forge_state::write_index_atomic(&self.layout.index, next).map_err(|e| e.to_string())
+    }
+    fn reconcile_final(
+        &mut self,
+        expected: &forge_state::GenerationIndex,
+        observed: &forge_state::ObservedGeneration,
+    ) -> Result<(), String> {
+        let manifests = load_index_manifests(&self.layout, expected)?;
+        let report = forge_state::reconcile_managed(expected, &manifests, observed);
+        if report.status == forge_state::ManagedReconciliationStatus::Consistent {
+            Ok(())
+        } else {
+            Err(format!(
+                "final reconciliation is {:?}: {}",
+                report.status, report.detail
+            ))
+        }
+    }
+    fn rollback_overlay(&mut self, plan: &forge_storage::FreshExecutionPlan) -> Result<(), String> {
+        if self.overlay_created {
+            forge_storage::DefineBackend::delete_volume(
+                &mut self.storage,
+                forge_storage::DEFAULT_POOL,
+                &plan.fresh.new_overlay,
+            )
+            .map_err(|e| e.to_string())?;
+            self.overlay_created = false;
+        }
+        Ok(())
+    }
+}
+
 fn managed_state_layout() -> Result<forge_state::StateLayout, String> {
     let instance = InstanceName::new("fedora-lab").expect("compatibility instance name is valid");
     managed_state_layout_for(&instance)
@@ -796,6 +1504,13 @@ struct CloneSourceProof {
 }
 
 fn operational_instance(instance_name: &str) -> Result<OperationalInstance, String> {
+    operational_instance_internal(instance_name, false)
+}
+
+fn operational_instance_internal(
+    instance_name: &str,
+    allow_recovery: bool,
+) -> Result<OperationalInstance, String> {
     let instance = InstanceName::new(instance_name)
         .map_err(|error| format!("invalid instance name: {error}"))?;
     let layout = managed_state_layout_for(&instance)?;
@@ -810,6 +1525,9 @@ fn operational_instance(instance_name: &str) -> Result<OperationalInstance, Stri
         forge_state::ManagedState::Conflict(reason) => return Err(reason),
     };
     let manifests = load_index_manifests(&layout, &index)?;
+    if !allow_recovery {
+        forge_state::require_normal_lifecycle(&index).map_err(|e| e.to_string())?;
+    }
     let active = active_manifest(&index, &manifests)?.clone();
     let profile = validate_profile_binding(instance_name, &index, &active)?;
     Ok(OperationalInstance {
@@ -859,6 +1577,8 @@ fn discover_cleanup_evidence(
                 .map_or("", |resource| resource.path.as_str());
             let actual = if manifest.generation_id == index.active_generation_id {
                 Ok(observed_active.clone())
+            } else if seed.is_empty() {
+                backend.inspect_generation_overlay_only(overlay)
             } else {
                 backend.inspect_generation_paths(overlay, seed)
             };
@@ -4443,6 +5163,7 @@ mod tests {
                     backing_path: Some("/pool/base".to_owned()),
                 },
             ],
+            fresh_domain_evidence: None,
         };
         let profile = validate_profile_binding("kali-2", &index, &active).unwrap();
         assert_eq!(profile.id.as_str(), "kali-lab");

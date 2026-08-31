@@ -102,6 +102,10 @@ pub enum ManagedRecoveryReason {
         preparing_generation_id: String,
         observed_generation_id: Option<String>,
     },
+    FreshReplacementPending {
+        durable_active_generation_id: String,
+        preparing_generation_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,12 +259,12 @@ pub fn execute_cleanup_candidate<B: CleanupBackend>(
         .iter()
         .find(|resource| resource.role == ResourceRole::WritableOverlay)
         .ok_or_else(|| "cleanup candidate has no exact overlay".to_owned())?;
-    if candidate.resources.len() == 1 && overlay.backing_path.is_none() {
+    if candidate.resources.len() == 1 {
         let current = begin_flat_cleanup(&plan.source_index, &candidate.generation_id)
             .map_err(|error| error.to_string())?;
         backend.persist_index(&plan.source_index, &current)?;
         if let Err(error) = backend.delete_exact(overlay) {
-            return Err(format!("flat clone overlay delete failed: {error}"));
+            return Err(format!("overlay-only generation delete failed: {error}"));
         }
         backend.verify_absent(overlay)?;
         let next_index = complete_flat_cleanup(&current, &candidate.generation_id)
@@ -435,14 +439,23 @@ pub fn reconcile_managed(
         .iter()
         .find(|entry| entry.status == GenerationStatus::Preparing)
     {
+        let recovery_reason =
+            if observed_generation_id.as_deref() == Some(preparing.generation_id.as_str()) {
+                ManagedRecoveryReason::FreshReplacementPending {
+                    durable_active_generation_id: index.active_generation_id.clone(),
+                    preparing_generation_id: preparing.generation_id.clone(),
+                }
+            } else {
+                ManagedRecoveryReason::PreparingGenerationPresent {
+                    durable_active_generation_id: index.active_generation_id.clone(),
+                    preparing_generation_id: preparing.generation_id.clone(),
+                    observed_generation_id: observed_generation_id.clone(),
+                }
+            };
         return ManagedReconciliation {
             status: ManagedReconciliationStatus::RecoveryRequired,
             observed_generation_id: observed_generation_id.clone(),
-            recovery_reason: Some(ManagedRecoveryReason::PreparingGenerationPresent {
-                durable_active_generation_id: index.active_generation_id.clone(),
-                preparing_generation_id: preparing.generation_id.clone(),
-                observed_generation_id,
-            }),
+            recovery_reason: Some(recovery_reason),
             conflict_reason: None,
             detail: "durable Preparing generation requires recovery; libvirt attachment is not proof of successful first boot or authorization to finalize state".to_owned(),
         };
@@ -964,6 +977,7 @@ pub fn manifest_from_observed(
                 backing_path: resource.backing_path.clone(),
             })
             .collect(),
+        fresh_domain_evidence: None,
     }
 }
 
@@ -1139,6 +1153,25 @@ pub fn validate_index(index: &GenerationIndex) -> Result<(), StateError> {
                 "cleanup progress roles do not match its phase".to_owned(),
             ));
         }
+    }
+    Ok(())
+}
+
+/// Refuses every normal mutation while an explicit recovery boundary exists.
+///
+/// # Errors
+/// Returns a typed refusal for an invalid index or any durable Preparing generation.
+pub fn require_normal_lifecycle(index: &GenerationIndex) -> Result<(), StateError> {
+    validate_index(index)?;
+    if index
+        .generations
+        .iter()
+        .any(|entry| entry.status == GenerationStatus::Preparing)
+    {
+        return Err(StateError::InvalidObservedState(
+            "normal lifecycle refused: a Preparing generation requires explicit recovery"
+                .to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1399,10 +1432,9 @@ pub fn plan_managed_cleanup(
             .iter()
             .filter(|item| item.resource.role != ResourceRole::SharedBase)
             .collect::<Vec<_>>();
-        let flat_clone = disposable.len() == 1
-            && disposable[0].resource.role == ResourceRole::WritableOverlay
-            && disposable[0].resource.backing_path.is_none();
-        let safe = (flat_clone || disposable.len() == 2)
+        let overlay_only =
+            disposable.len() == 1 && disposable[0].resource.role == ResourceRole::WritableOverlay;
+        let safe = (overlay_only || disposable.len() == 2)
             && disposable.iter().all(|item| {
                 item.exists
                     && item.observed_resource.as_ref() == Some(&item.resource)
@@ -1562,6 +1594,7 @@ mod tests {
                     backing_path: None,
                 },
             ],
+            fresh_domain_evidence: None,
         }
     }
 
@@ -1888,13 +1921,11 @@ mod tests {
         assert_eq!(next.active_generation_id, "old");
         assert!(matches!(
             report.recovery_reason,
-            Some(ManagedRecoveryReason::PreparingGenerationPresent {
+            Some(ManagedRecoveryReason::FreshReplacementPending {
                 durable_active_generation_id,
                 preparing_generation_id,
-                observed_generation_id: Some(observed_generation_id),
             }) if durable_active_generation_id == "old"
                 && preparing_generation_id == "new"
-                && observed_generation_id == "new"
         ));
     }
     #[test]
@@ -1911,6 +1942,28 @@ mod tests {
         assert_eq!(report.status, ManagedReconciliationStatus::RecoveryRequired);
         assert_eq!(next.generations[0].status, GenerationStatus::Active);
         assert_eq!(next.generations[1].status, GenerationStatus::Preparing);
+    }
+
+    #[test]
+    fn preparing_blocks_every_normal_mutation_surface() {
+        let pending =
+            add_preparing(&index(), &manifest("new", GenerationStatus::Preparing)).unwrap();
+        for operation in [
+            "start",
+            "shutdown",
+            "force-stop",
+            "clone",
+            "fresh",
+            "rebuild",
+            "cleanup",
+            "adoption",
+        ] {
+            assert!(
+                require_normal_lifecycle(&pending).is_err(),
+                "{operation} must route only to explicit recovery"
+            );
+        }
+        assert!(require_normal_lifecycle(&index()).is_ok());
     }
     #[test]
     fn observed_generation_uses_exact_libvirt_identities_not_names_or_shape() {
