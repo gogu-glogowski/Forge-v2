@@ -106,6 +106,9 @@ fn main() -> ExitCode {
         ["image", "fetch", "fedora"] => image_fetch(),
         ["image", "inspect", "fedora-workstation"] => image_inspect_workstation(),
         ["image", "fetch", "fedora-workstation"] => image_fetch_workstation(),
+        ["image", "prepare", "fedora-workstation", "--dry-run"] => {
+            image_prepare_workstation_dry_run()
+        }
         ["image", "recover", "whonix-workstation", "--dry-run"] => recover_whonix_workstation(true),
         ["image", "recover", "whonix-workstation"] => recover_whonix_workstation(false),
         _ => {
@@ -3505,6 +3508,55 @@ fn image_fetch_workstation() -> ExitCode {
     }
 }
 
+fn image_prepare_workstation_dry_run() -> ExitCode {
+    let Ok(directories) = image_directories() else {
+        return ExitCode::from(2);
+    };
+    let source = workstation_source();
+    let source_status = match forge_images::inspect_fedora_workstation_iso(&directories, &source) {
+        Ok(forge_images::FedoraWorkstationIsoState::Verified(_)) => "verified",
+        Ok(forge_images::FedoraWorkstationIsoState::Missing { .. }) => {
+            "acquisition required (not downloaded by dry-run)"
+        }
+        Ok(forge_images::FedoraWorkstationIsoState::Conflict(_)) => "conflict; preparation refused",
+        Err(_) => "invalid; preparation refused",
+    };
+    println!("Mode: Fedora Workstation preparation dry-run");
+    println!(
+        "Source: Fedora Workstation {} compose {} {} ({source_status})",
+        source.release(),
+        source.compose(),
+        source.architecture()
+    );
+    println!("Installer: operator-assisted Anaconda in a temporary preparation-owned domain");
+    println!("Installer topology: Q35, UEFI, virtio network, SPICE, virtio-gpu, keyboard/tablet");
+    println!(
+        "Staging disk: forge-stage-fedora-workstation-{}-{}-<transaction>.qcow2",
+        source.release(),
+        source.compose()
+    );
+    println!(
+        "Staging capacity: {} GiB, sparse qcow2, no backing, preparation-owned",
+        forge_images::FEDORA_WORKSTATION_STAGING_CAPACITY_BYTES / 1024 / 1024 / 1024
+    );
+    println!("NoCloud: none");
+    println!("Cloud-init: none");
+    println!("SSH requirement: none");
+    println!("QGA requirement: none");
+    println!(
+        "Normalization: {} (hybrid controlled in-guest plus offline final proof)",
+        forge_images::FEDORA_WORKSTATION_NORMALIZATION_RECIPE
+    );
+    println!("Promotion: exact copy/import to image-store-owned protected SharedBase");
+    println!(
+        "Canonical base: forge-base-fedora-workstation-{}-{}.qcow2 (not created)",
+        source.release(),
+        source.compose()
+    );
+    println!("Mutation: false");
+    ExitCode::SUCCESS
+}
+
 fn image_inspect() -> ExitCode {
     let Ok(directories) = image_directories() else {
         return ExitCode::from(2);
@@ -5075,6 +5127,7 @@ fn print_usage() {
     eprintln!("  forge image inspect fedora");
     eprintln!("  forge image inspect fedora-workstation");
     eprintln!("  forge image fetch fedora-workstation");
+    eprintln!("  forge image prepare fedora-workstation --dry-run");
     eprintln!("  forge image recover whonix-workstation [--dry-run]");
     eprintln!(
         "Legacy Fedora Cloud/NoCloud is retired; compatibility inspection remains available."

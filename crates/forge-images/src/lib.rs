@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod preparation;
+pub use preparation::*;
+
 pub const FEDORA_RELEASE: &str = "44";
 pub const FEDORA_ARCH: &str = "x86_64";
 pub const FEDORA_FILENAME: &str = "Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2";

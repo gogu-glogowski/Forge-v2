@@ -424,6 +424,34 @@ future topology that exposes sibling disks together must add a typed UUID policy
 Normalization is intentionally distinct from RAW clone, which copies visible
 writable guest identity and cannot claim independent identity.
 
+Phase 4.3 models this as a durable image-store transaction with states
+`Planned`, `InstallerReady`, `Installing`, `InstalledPendingProof`,
+`InstalledValidated`, `NormalizationRequired`, `Normalized`, `PromotionReady`,
+`Promoted`, `Cancelled`, and `RecoveryRequired`. The transaction owns its
+temporary domain and sparse, no-backing staging qcow2 independently from normal
+instance generations. Process exit, terminal closure, host reboot, or an
+operator pause never imply a transition. Installation completion requires an
+explicit operator continuation plus exact shutoff/domain/disk/topology,
+bootable-system, controlled disk-boot, and clean-shutdown observations.
+
+`FedoraWorkstationNormalizationV1` uses a hybrid method: controlled in-guest
+steps for Fedora-aware package, account, GNOME, and SELinux work, followed by
+offline read-only inspection for final identity, residue, disk-shape, and clean
+shutdown proof. Forge must not mount guest filesystems ad hoc on the host.
+Normalization evidence is a private typed value produced only by the complete
+checklist; a metadata boolean cannot authorize promotion.
+
+Promotion performs an exact copy/import from preparation-owned staging into a
+new, collision-free `forge-base-fedora-workstation-<release>-<compose>.qcow2`,
+proves its digest, capacity, qcow2/no-backing shape, publishes ISO/install/
+recipe/preparation provenance, protects the image-store `SharedBase`, and only
+then retires staging. Before provenance publication, staging remains the
+recoverable authority and no canonical base is trusted. After publication, the
+canonical base remains authoritative and staging cleanup is separate and
+idempotent. Protection combines durable SharedBase ownership, deletion and
+writable-attachment refusal, exact consumer proof, and compatible filesystem
+permissions; `chmod` alone is insufficient.
+
 ### 14.5 Guest observability and first boot
 
 The replacement provisioning/readiness policy is conceptually
