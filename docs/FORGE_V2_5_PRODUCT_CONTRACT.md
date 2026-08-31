@@ -286,3 +286,343 @@ A V2.5 feature is acceptable only when:
 - documentation and CLI help distinguish stable user workflows from maintenance/developer operations.
 
 V2.5 succeeds by making the V2 safety machinery pleasant and predictable to use—not by routing around it.
+
+## 14. Fedora Workstation Replacement Architecture
+
+This section is authoritative for Fedora in Forge V2.5. It supersedes earlier
+Fedora Cloud Base, NoCloud, cloud-init, seed ISO, mandatory SSH, and mandatory
+QGA product assumptions. Those assumptions remain relevant only while reading
+and safely retiring legacy state; they are not a compatibility requirement for
+the replacement profile. The existing host `fedora-lab` must not be adopted,
+converted, deleted, or otherwise mutated as part of this design phase.
+
+### 14.1 Product and source definition
+
+The supported Fedora product is a normal Fedora Workstation x86_64 installation
+with GNOME and a graphical login/session. Its installation source is the official
+Fedora Workstation x86_64 Live ISO published by the Fedora Project, represented
+by a typed source such as `FedoraWorkstationIso { release, compose, arch }`.
+Cloud Base, CoreOS, Server, Minimal, containers, and unofficial repacks are not
+valid substitutes. `fedora-lab` may remain the stable Forge profile and instance
+name after an explicit legacy transition, but the guest product is Fedora
+Workstation.
+
+The official source and verification entry points are:
+
+- <https://fedoraproject.org/workstation/download/>;
+- <https://fedoraproject.org/security/>; and
+- <https://fedoraproject.org/fedora.gpg> for the published Fedora keyring.
+
+The source record binds release, compose/build identity, architecture, exact ISO
+filename, byte size, digest, signed CHECKSUM identity, and the expected release
+signing-key fingerprint. Forge verifies the CHECKSUM signature using a
+project-maintained, independently reviewed trusted keyring or pinned fingerprint,
+then verifies the exact ISO digest and identity named by that signed metadata.
+A key downloaded beside the ISO is not by itself a trust root. Release keys are
+rotated, so trust is explicitly release-bound and reviewed; no implementation
+may treat the current website key as an unversioned permanent key. Downloading an
+ISO and trusting its pathname is forbidden.
+
+### 14.2 Installation source is not a shared base
+
+Fedora Workstation has two distinct artifact classes:
+
+```text
+verified official Workstation ISO                 installation source
+    -> controlled installation
+    -> installation-completion proof
+    -> versioned normalization
+    -> canonical installed Workstation qcow2      trusted SharedBase
+    -> per-instance generation overlay            writable instance state
+```
+
+The ISO is immutable verified installation media, not a bootable Forge instance
+base. The canonical qcow2 is an installed, generalized, cleanly shut down disk
+with a durable preparation record linking it to the exact verified ISO,
+installer policy and normalization-recipe version. Promotion into the image
+store is explicit, collision-intolerant, fully verified at the preparation
+boundary, and gives the result `SharedBase` ownership. Forge protects it from
+generation cleanup and treats it as logically read-only.
+
+### 14.3 First canonical installation
+
+V2.5 should initially use an operator-assisted interactive installation. Forge
+creates a temporary, explicitly preparation-owned installer domain with the
+verified Workstation Live ISO and a new blank qcow2 staging disk. The operator
+uses the normal graphical Anaconda workflow. Forge does not claim completion
+from elapsed time, SSH, cloud-init, or QGA. Promotion requires an explicit
+operator completion action while the installer domain is shut off, proof that
+the target disk is the exact preparation-owned disk, proof that installer media
+is no longer part of the candidate boot topology, a controlled successful boot
+and clean shutdown of the installed system, completion of the versioned
+normalization procedure, and final storage/provenance inspection.
+
+This choice favors the actual Workstation user experience and a small initial
+automation surface. Kickstart remains a legitimate native Fedora installation
+technology, but it is not the V2.5 canonical path: Anaconda documents that
+Kickstart installation from the Live OS/Live ISO is unsupported and directs
+automated installations to boot/netinstall media. Forge must not silently swap
+the chosen official Workstation Live ISO for another product merely to automate
+installation. A later reproducible builder may use a separately reviewed
+official installation source and explicit Kickstart policy, without restoring
+NoCloud or changing the resulting Workstation product.
+
+The interactive installer must leave no personal or universal account in the
+canonical base. The preferred flow stops before per-user GNOME Initial Setup; if
+a temporary builder account is unavoidable, normalization must remove it and
+prove its home, credentials, authorization, and secrets absent before promotion.
+Root remains locked. Each new instance lets its user choose a local account and
+credentials through the normal graphical first-use experience. Forge does not
+store plaintext passwords, embed a universal default password, or inherit the
+legacy `forge` user.
+
+### 14.4 Canonical-base normalization
+
+Normalization is a versioned, reviewable preparation recipe executed before
+promotion, followed by offline/host-side evidence where practical. It must:
+
+- clear `/etc/machine-id` so systemd regenerates it and preserve the compatible
+  `/var/lib/dbus/machine-id` relationship;
+- remove SSH host keys and leave the SSH server absent or disabled by default;
+- reset the hostname to the approved generic first-use state;
+- remove persistent NetworkManager MAC/interface bindings, connection UUIDs and
+  DHCP client identity that would be unsafe to duplicate;
+- remove the saved random seed and other documented per-machine entropy state;
+- remove installer media/repository residue, temporary files, crash data, and
+  identifying logs/journals while retaining a consistent RPM database;
+- remove personal and builder accounts and GNOME per-user first-login state,
+  keep root locked, and enable normal first-use account setup;
+- complete package transactions, remove locks, and record the installed package
+  and normalization-policy identity without silently updating later;
+- verify bootloader and filesystem references, a clean shutdown, and SELinux
+  labeling (scheduling a relabel when the recipe requires one);
+- install and test SPICE desktop integration according to profile policy; and
+- record whether QGA is installed/configured without making it a promotion or
+  runtime success requirement.
+
+Filesystem UUIDs are not blindly rewritten. A qcow2 backing chain presents one
+filesystem to one VM, so a shared filesystem UUID is not by itself a collision;
+changing it would also require consistent bootloader and `fstab` updates. Any
+future topology that exposes sibling disks together must add a typed UUID policy.
+Normalization is intentionally distinct from RAW clone, which copies visible
+writable guest identity and cannot claim independent identity.
+
+### 14.5 Guest observability and first boot
+
+The replacement provisioning/readiness policy is conceptually
+`InteractiveWorkstation`, not `CloudInitManaged`. Creation can succeed without
+starting the VM once Forge has proven the persistent shutoff domain, exact
+generation disk, expected graphics topology, and durable ownership. When the
+user starts it, lifecycle success means the expected domain reached `running`;
+desktop usability remains an interactive user observation rather than something
+Forge pretends to prove through SSH.
+
+SSH is absent or disabled by default. A user may explicitly enable it later as a
+maintenance feature, but Forge does not expose it merely for observability and
+does not require an SSH login for create, start, installation, or first-boot
+success.
+
+QGA is optional management integration. It may provide advisory IP/status data
+and optional shutdown assistance when configured, but QGA availability is
+separate from installation completion, domain running state, and graphical
+desktop usability. ACPI/libvirt graceful shutdown remains available without it.
+There is no universal QGA wait and no long readiness timeout inherited from the
+legacy Fedora path.
+
+### 14.6 Shared storage, create and Fresh
+
+The canonical base is image-store owned and separate from every instance. The
+first `fedora-lab` follows the same warm path as later instances:
+
+```text
+prove exact canonical Fedora Workstation SharedBase
+    -> create exactly one generation-owned overlay
+    -> define one persistent domain
+    -> publish one Active generation
+```
+
+It does not run Anaconda, attach the ISO, generate a seed, invoke cloud-init,
+require SSH, or repeat full installation. The installer staging disk is promoted
+to the canonical image-store base first; `fedora-lab` itself never becomes the
+SharedBase.
+
+Fedora Workstation Fresh is enabled only after this model is proven. It reuses
+the Phase 3 recoverable transaction and creates a new overlay directly from the
+instance's bound canonical base: old `Active` remains authoritative until the
+single durable switch changes it to `Retained` and changes the new `Preparing`
+generation to `Active`. Fresh never launches Anaconda, copies old writable guest
+state, boots automatically, or cleans the retained generation automatically.
+Reconciliation and recovery remain fail-closed.
+
+Each profile/instance binding records the Fedora release and exact canonical
+base provenance identity. Fresh preserves that binding by default. A newer
+accepted base is never selected silently.
+
+### 14.7 Clone, disposables and identity
+
+Fedora Workstation clone remains unsupported initially. A RAW clone would copy
+machine identity, local users, credentials and application state; a warning is
+not sufficient to call the result independent. Enabling clone requires a
+guest-aware identity-regeneration design or a deliberately scoped RAW-copy mode
+whose risks are explicit.
+
+The base/overlay split is compatible with a future disposable lifecycle:
+canonical trusted base, temporary session-owned overlay and domain, then exact
+overlay destruction. No Fedora-specific seed or per-instance base mutation may
+be introduced that would block that design.
+
+### 14.8 Desktop domain policy
+
+The Workstation domain uses a modern desktop-oriented, normalized topology:
+
+- Q35 and UEFI; Secure Boot is enabled only after firmware/key enrollment and
+  reproducibility are proven, otherwise its disabled state is explicit;
+- virtio qcow2 system disk and virtio network on the approved network source;
+- SPICE display, virtio-gpu video, graphical/input devices and audio suitable
+  for GNOME;
+- SPICE guest tools for clipboard and dynamic resolution, subject to an explicit
+  clipboard policy;
+- conservative 3D acceleration disabled by default until render-node access,
+  host compatibility and isolation are proven;
+- profile-derived memory/vCPU defaults sized for an interactive Workstation,
+  with an initial target of four vCPUs and 8 GiB where host policy permits;
+- no seed/CD-ROM after installation, no hostdev, no filesystem passthrough, no
+  unapproved bridge or alternate NIC, and no unexpected persistent devices; and
+- an optional QGA channel only when the profile explicitly enables it.
+
+Persistent normalized topology, autostart policy, storage and network identity
+remain Forge-owned and are verified before mutation and after definition.
+virt-manager is a supported viewer/console for the system libvirt domain. GNOME
+Boxes may later be supported as a viewer where system/session visibility allows,
+but neither tool may silently become authoritative over Forge XML, storage or
+durable generation state.
+
+### 14.9 Legacy retirement classification and transition
+
+The old architecture is classified as follows:
+
+| Classification | Legacy elements | Direction |
+| --- | --- | --- |
+| Remove entirely | `FedoraCloudBase`, the Fedora Cloud artifact selector/names, Fedora-only NoCloud and seed authoring, `default_user = forge`, Fedora SSH/cloud-init/QGA readiness probes, Cloud-Base create/rebuild flows and their product tests/help | Delete after legacy-state compatibility is no longer required. |
+| Keep as generic infrastructure | atomic downloads/writes, checksum/signature execution, durable provenance, image-store ownership, SharedBase/overlay logic, generation indexes, reconciliation, recovery, cleanup, generic libvirt storage/domain operations and lifecycle | Preserve and make profile-neutral. |
+| Reuse for Workstation | reviewed Fedora signing-key/checksum concepts, shared-base proof, recoverable Fresh transaction, Q35/UEFI/virtio/SPICE building blocks | Reuse only through new typed Workstation policy and proof. |
+| Replace with Workstation-specific model | Fedora profile/source types, preparation state machine, canonical-base promotion, readiness, normalized domain topology, image inventory, release policy, CLI workflow, tests and docs | Implement according to this section. |
+
+`NoCloudSeed`, `CloudInitManaged`, and legacy manifest fields may temporarily
+survive only in an isolated compatibility reader and exact retirement/recovery
+path for already-owned legacy state. They must not remain selectable by a new
+Fedora profile. Once the legacy host object is retired and no other profile
+legitimately uses them, delete the policy variants and generic-looking dead code
+rather than preserving it indefinitely. Historical learning documents may remain
+clearly historical; current README, CLI help, tests and product documentation
+must describe Workstation.
+
+The existing Cloud/NoCloud `fedora-lab` receives a later explicit transition:
+
+1. require it persistent, shut off and unambiguously reconciled, and record its
+   exact domain UUID, active/retained generations, overlay, seed, base and state;
+2. offer a separately authorized user-data export or retention decision;
+3. require explicit confirmation to retire the legacy instance;
+4. use exact ownership cleanup to remove only its legacy overlays/seeds and old
+   Cloud Base after all references are absent, recording partial failure;
+5. undefine the old stable domain only as an explicit retirement action, never
+   as adoption or an in-place product conversion; and
+6. create the new Workstation `fedora-lab` from the canonical base only after the
+   name is free. It is a new product lineage and receives a new durable domain
+   UUID; the stable name is reused deliberately, not silently.
+
+Phase 4.0 performs none of these operations.
+
+### 14.10 Inventory, updates and user workflow
+
+Future image inventory separates source and prepared artifacts, for example:
+
+```text
+FEDORA WORKSTATION 44 x86_64
+Source ISO:     Fedora-Workstation-Live-x86_64-44-<compose>.iso  verified=yes
+Canonical base: forge-base-fedora-workstation-44.qcow2          trusted=yes ready=yes
+```
+
+Each line also exposes the source/provenance identity, release binding and any
+known newer release without presenting Cloud Base as Fedora Workstation. The
+update flow is detect, inform, explicit approval, acquire and verify a new ISO,
+prepare a separate new canonical base, and leave all Active instances untouched.
+
+Fresh resets the currently bound release. A future explicit upgrade/rebase
+operation may bind an instance to a newer accepted canonical base, but Fresh is
+not an OS-upgrade command and a major release is never crossed silently.
+
+The intended normal-user workflow is conceptually:
+
+```text
+prepare Fedora Workstation image (fetch, verify, install, normalize, promote)
+create fedora-workstation fedora-lab
+open/start fedora-lab
+```
+
+Exact command names remain a later CLI decision. A high-level preparation command
+may orchestrate the safe stages, while developer/admin commands expose evidence
+and recovery. Users should not need to understand volume imports, backing chains,
+XML rendering or provenance-state internals.
+
+### 14.11 Implementation acceptance criteria
+
+Fedora Workstation implementation is acceptable only when all of the following
+are proven:
+
+1. only the official Fedora Workstation installation source is selected;
+2. the exact ISO has release-bound cryptographic verification through a trusted
+   Fedora key policy;
+3. Fedora Cloud Base is absent from the supported product path;
+4. NoCloud is absent from the supported product path;
+5. cloud-init is not a dependency;
+6. SSH is not mandatory and is disabled/absent by default;
+7. QGA is not mandatory unless a later explicit policy justifies a scoped use;
+8. the guest is a normal GNOME Fedora Workstation;
+9. an installed, normalized qcow2 is promoted as the protected SharedBase;
+10. each persistent instance has a distinct generation-owned overlay;
+11. first canonical installation is separate from warm instance creation;
+12. repeated create does not reinstall from the ISO;
+13. Fresh resets from the bound canonical Workstation base;
+14. Fresh does not copy old writable guest state;
+15. Forge ownership, normalized topology and durable reconciliation remain exact;
+16. cleanup/recovery fail closed and never select the SharedBase;
+17. the old legacy `fedora-lab` is not silently mutated or adopted;
+18. no Fedora release change occurs without an explicit rebase/upgrade decision;
+19. the desktop is usable through virt-manager with the intended SPICE policy;
+20. the architecture supports a future base-backed disposable Workstation;
+21. canonical normalization prevents duplicated per-machine and user identity;
+22. no embedded universal password or plaintext credential enters repository or
+    durable Forge state; and
+23. tests prove source/type refusal, provenance, normalization evidence, warm
+    create, topology, release pinning, Fresh, cleanup and recovery boundaries.
+
+### 14.12 Phase 4 implementation breakdown
+
+1. **Phase 4.1 — typed retirement boundary:** introduce Workstation types and
+   refuse new Cloud/NoCloud Fedora work; inventory and isolate legacy schema
+   readers without deleting the host object.
+2. **Phase 4.2 — official ISO provenance:** implement typed Live ISO acquisition,
+   release-key trust, signed CHECKSUM and exact artifact verification.
+3. **Phase 4.3 — canonical preparation model:** implement preparation ownership,
+   interactive installer state, completion evidence, normalization record and
+   atomic SharedBase promotion.
+4. **Phase 4.4 — Workstation profile/domain:** implement the desktop hardware,
+   `InteractiveWorkstation` lifecycle policy and normalized topology proofs.
+5. **Phase 4.5 — first canonical base proof:** perform one authorized installation,
+   normalization and image-store promotion with complete evidence.
+6. **Phase 4.6 — persistent instance creation:** create the new Workstation
+   instance from one overlay after the legacy name transition permits it.
+7. **Phase 4.7 — lifecycle and desktop UX:** prove start/stop, graphical use,
+   optional integrations and viewer ownership boundaries without SSH/QGA waits.
+8. **Phase 4.8 — Workstation Fresh:** bind release/base identity and reuse the
+   recoverable Phase 3 transaction with Workstation topology tests.
+9. **Phase 4.9 — explicit legacy retirement:** preserve/export as authorized,
+   then exactly clean and undefine the old Cloud/NoCloud object; remove remaining
+   compatibility-only code after proving no consumers remain.
+10. **Phase 4.10 — final acceptance:** exercise inventory, update/pinning,
+    repeated creation, Fresh, cleanup/recovery and future-disposable constraints.
+
+No phase may use implementation convenience to reintroduce Cloud Base, NoCloud,
+cloud-init, universal credentials, mandatory SSH/QGA, implicit release upgrades,
+or silent mutation of the legacy host object.
