@@ -1,0 +1,64 @@
+<domain type='kvm'>
+  <name>@NAME@</name>
+  <uuid>@UUID@</uuid>
+  <memory unit='KiB'>8388608</memory>
+  <currentMemory unit='KiB'>8388608</currentMemory>
+  <vcpu placement='static'>4</vcpu>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='pc-q35-10.2'>hvm</type>
+    <firmware>
+      <feature enabled='no' name='enrolled-keys'/>
+      <feature enabled='no' name='secure-boot'/>
+    </firmware>
+    <loader readonly='yes' type='pflash' format='qcow2'>/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2</loader>
+    <nvram template='/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2' templateFormat='qcow2' format='qcow2'>/var/lib/libvirt/qemu/nvram/@NAME@_VARS.qcow2</nvram>
+    <boot dev='cdrom'/>
+    <boot dev='hd'/>
+  </os>
+  <features><acpi/><apic/></features>
+  <cpu mode='host-passthrough' check='none' migratable='on'/>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='@STAGING@'/>
+      <target dev='vda' bus='virtio'/>
+      <address type='pci' domain='0x0000' bus='0x03' slot='0x00' function='0x0'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='@ISO@'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+      <address type='drive' controller='0' bus='0' target='0' unit='0'/>
+    </disk>
+    <controller type='usb' index='0' model='qemu-xhci'><address type='pci'/></controller>
+    <controller type='sata' index='0'><address type='pci'/></controller>
+    <controller type='pci' index='0' model='pcie-root'/>
+    <controller type='pci' index='1' model='pcie-root-port'><model name='pcie-root-port'/><target chassis='1' port='0x10'/><address type='pci'/></controller>
+    <controller type='pci' index='2' model='pcie-root-port'><model name='pcie-root-port'/><target chassis='2' port='0x11'/><address type='pci'/></controller>
+    <controller type='pci' index='3' model='pcie-root-port'><model name='pcie-root-port'/><target chassis='3' port='0x12'/><address type='pci'/></controller>
+    <controller type='pci' index='4' model='pcie-root-port'><model name='pcie-root-port'/><target chassis='4' port='0x13'/><address type='pci'/></controller>
+    <controller type='pci' index='5' model='pcie-root-port'><model name='pcie-root-port'/><target chassis='5' port='0x14'/><address type='pci'/></controller>
+    <interface type='network'>
+      <mac address='52:54:00:e3:80:9e'/>
+      <source network='default'/>
+      <model type='virtio'/>
+      <address type='pci'/>
+    </interface>
+    <input type='tablet' bus='usb'><address type='usb'/></input>
+    <input type='keyboard' bus='usb'><address type='usb'/></input>
+    <input type='mouse' bus='ps2'/>
+    <input type='keyboard' bus='ps2'/>
+    <graphics type='spice' autoport='yes'><listen type='address'/></graphics>
+    <sound model='ich9'><address type='pci'/></sound>
+    <audio id='1' type='spice'/>
+    <video><model type='virtio' heads='1' primary='yes'/><address type='pci'/></video>
+    <watchdog model='itco' action='reset'/>
+    <memballoon model='virtio'><address type='pci'/></memballoon>
+  </devices>
+</domain>

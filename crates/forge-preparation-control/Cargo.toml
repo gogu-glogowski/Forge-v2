@@ -1,0 +1,32 @@
+[package]
+name = "forge-preparation-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "forge-preparation-control"
+path = "src/main.rs"
+
+[[bin]]
+name = "forge-b1"
+path = "src/b1.rs"
+
+[[bin]]
+name = "forge-preparation-broker"
+path = "src/broker.rs"
+
+[[bin]]
+name = "forge-broker-client"
+path = "src/client.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+forge-images = { path = "../forge-images" }
+forge-libvirt = { path = "../forge-libvirt" }
+rustix = { version = "0.38", features = ["fs", "net", "process"] }
+
+[lints]
+workspace = true

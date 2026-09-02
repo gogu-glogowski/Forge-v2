@@ -1,0 +1,36 @@
+[Unit]
+Description=Forge preparation-only privileged broker
+After=virtqemud.socket
+Requires=virtqemud.socket
+
+[Service]
+Type=simple
+User=root
+Group=majorforge
+UMask=0007
+ExecStart=/usr/libexec/forge-preparation-broker
+Restart=no
+RuntimeDirectory=forge-preparation-broker
+RuntimeDirectoryMode=0770
+StateDirectory=forge-preparation-broker
+StateDirectoryMode=0700
+CacheDirectory=forge-preparation-broker
+CacheDirectoryMode=0755
+NoNewPrivileges=yes
+PrivateTmp=no
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp /var/tmp
+ProtectKernelTunables=yes
+ProtectKernelModules=no
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target

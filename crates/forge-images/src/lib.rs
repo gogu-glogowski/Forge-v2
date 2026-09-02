@@ -28,6 +28,9 @@ pub const FEDORA_WORKSTATION_FILENAME: &str = "Fedora-Workstation-Live-44-1.7.x8
 pub const FEDORA_WORKSTATION_CHECKSUM_FILENAME: &str = "Fedora-Workstation-44-1.7-x86_64-CHECKSUM";
 pub const FEDORA_WORKSTATION_SOURCE_URL: &str = "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-Live-44-1.7.x86_64.iso";
 pub const FEDORA_WORKSTATION_CHECKSUM_URL: &str = "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-44-1.7-x86_64-CHECKSUM";
+pub const FEDORA_WORKSTATION_ISO_BYTES: u64 = 2_851_612_672;
+pub const FEDORA_WORKSTATION_ISO_SHA256: &str =
+    "1620295f6a00c27c3208f0c00b8ece4eab1ec69b9002152d97488bf26a426ddf";
 pub const FEDORA_44_SIGNING_KEY_FINGERPRINT: &str = "36F612DCF27F7D1A48A835E4DBFCF71C6D9F90A6";
 pub const FEDORA_WORKSTATION_PRODUCT_LABEL: &str = "Fedora Workstation Live ISO";
 pub const KALI_RELEASE: &str = "2026.2";

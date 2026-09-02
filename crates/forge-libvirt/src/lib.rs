@@ -2,6 +2,7 @@
 
 use forge_core::{DomainSummary, HostCapabilities, LibvirtInfo, VmState};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
@@ -182,6 +183,87 @@ impl LibvirtDefineBackend {
                 uri: LOCAL_QEMU_URI.to_owned(),
                 message: error.to_string(),
             })
+    }
+
+    /// Starts one explicitly named preparation domain after its caller has
+    /// completed the read-only identity/topology preflight.
+    ///
+    /// # Errors
+    /// Returns the libvirt lookup or start failure.
+    pub fn start_preparation_domain(&self, name: &str) -> Result<(), String> {
+        let domain =
+            Domain::lookup_by_name(&self.connection, name).map_err(|error| error.to_string())?;
+        domain
+            .create()
+            .map_err(|error| error.to_string())
+            .map(|_| ())
+    }
+
+    /// # Errors
+    /// Returns the libvirt lookup or state-query failure.
+    pub fn preparation_domain_running(&self, name: &str) -> Result<bool, String> {
+        let domain =
+            Domain::lookup_by_name(&self.connection, name).map_err(|error| error.to_string())?;
+        let (state, _) = domain.get_state().map_err(|error| error.to_string())?;
+        Ok(map_domain_state(state).map_err(|error| error.to_string())?
+            == forge_core::VmState::Running)
+    }
+
+    /// Attaches the single fixed preparation-only channel to persistent configuration.
+    ///
+    /// # Errors
+    /// Refuses an absent/running domain or any pre-existing channel.
+    pub fn attach_preparation_control_channel(&self, name: &str) -> Result<(), String> {
+        let domain = Domain::lookup_by_name(&self.connection, name).map_err(|e| e.to_string())?;
+        let (state, _) = domain.get_state().map_err(|e| e.to_string())?;
+        if map_domain_state(state).map_err(|e| e.to_string())? != forge_core::VmState::Shutoff {
+            return Err("preparation channel attachment requires shutoff domain".to_owned());
+        }
+        let xml = domain.get_xml_desc(2).map_err(|e| e.to_string())?;
+        if xml.contains("<channel") || xml.contains("org.majorforge.preparation.0") {
+            return Err("preparation domain already has a channel".to_owned());
+        }
+        domain.attach_device_flags(
+            "<channel type='unix'><target type='virtio' name='org.majorforge.preparation.0'/></channel>",
+            virt::sys::VIR_DOMAIN_AFFECT_CONFIG,
+        ).map_err(|e| e.to_string()).map(|_| ())
+    }
+
+    /// Returns inactive preparation XML for exact topology proof.
+    ///
+    /// # Errors
+    /// Returns lookup/XML errors.
+    pub fn preparation_domain_xml(&self, name: &str) -> Result<String, String> {
+        Domain::lookup_by_name(&self.connection, name)
+            .map_err(|e| e.to_string())?
+            .get_xml_desc(2)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Performs one request/result exchange over the fixed preparation channel.
+    ///
+    /// # Errors
+    /// Returns transport failures or bounded message-size violations.
+    pub fn preparation_control_exchange(
+        &self,
+        name: &str,
+        request: &[u8],
+    ) -> Result<(String, String), String> {
+        let domain = Domain::lookup_by_name(&self.connection, name).map_err(|e| e.to_string())?;
+        let stream = Stream::new(&self.connection, 0).map_err(|e| e.to_string())?;
+        domain
+            .open_channel(Some("org.majorforge.preparation.0"), &stream, 0)
+            .map_err(|e| e.to_string())?;
+        let handshake = receive_line(&stream)?;
+        let mut payload = request.to_vec();
+        payload.push(b'\n');
+        let mut sent = 0;
+        while sent < payload.len() {
+            sent += stream.send(&payload[sent..]).map_err(|e| e.to_string())?;
+        }
+        let result = receive_line(&stream)?;
+        stream.finish().map_err(|e| e.to_string())?;
+        Ok((handshake, result))
     }
 
     fn pool(&self, name: &str) -> Result<StoragePool, forge_storage::StorageError> {
@@ -451,6 +533,23 @@ impl LibvirtDefineBackend {
     }
 }
 
+fn receive_line(stream: &Stream) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    while bytes.len() < 1024 * 1024 {
+        let mut buffer = [0_u8; 4096];
+        let count = stream.recv(&mut buffer).map_err(|e| e.to_string())?;
+        if count == 0 {
+            return Err("preparation channel closed before a complete message".to_owned());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        if let Some(newline) = bytes.iter().position(|b| *b == b'\n') {
+            bytes.truncate(newline);
+            return String::from_utf8(bytes).map_err(|e| e.to_string());
+        }
+    }
+    Err("preparation channel message exceeded one MiB".to_owned())
+}
+
 /// Produces a define-over-existing document by changing only the exact old disk source.
 ///
 /// # Errors
@@ -700,6 +799,197 @@ impl forge_storage::DefineBackend for LibvirtDefineBackend {
         let pool = self.pool(pool)?;
         let volume = StorageVol::lookup_by_name(&pool, name).map_err(storage_backend_error)?;
         volume.delete(0).map_err(storage_backend_error)
+    }
+}
+
+impl forge_images::FedoraWorkstationPreparationBackend for LibvirtDefineBackend {
+    fn stream_installer_iso_digest(
+        &mut self,
+        pool: &str,
+        name: &str,
+        expected_bytes: u64,
+    ) -> Result<(forge_images::PreparationVolumeEvidence, u64, String), String> {
+        let pool_obj = self.pool(pool).map_err(|error| error.to_string())?;
+        let volume =
+            StorageVol::lookup_by_name(&pool_obj, name).map_err(|error| error.to_string())?;
+        let evidence = {
+            let info = volume.get_info().map_err(|error| error.to_string())?;
+            let xml = volume.get_xml_desc(0).map_err(|error| error.to_string())?;
+            forge_images::PreparationVolumeEvidence {
+                name: name.to_owned(),
+                key: volume.get_key().map_err(|error| error.to_string())?,
+                path: volume.get_path().map_err(|error| error.to_string())?.into(),
+                format: xml_attribute(&xml, "format", "type").unwrap_or_default(),
+                capacity_bytes: info.capacity,
+                allocation_bytes: info.allocation,
+                backing_path: backing_store_path(&xml).map(Into::into),
+            }
+        };
+        if evidence.capacity_bytes != expected_bytes || evidence.backing_path.is_some() {
+            return Err("runtime installer ISO storage identity mismatch".to_owned());
+        }
+        let stream = Stream::new(&self.connection, 0).map_err(|error| error.to_string())?;
+        volume
+            .download(&stream, 0, expected_bytes, 0)
+            .map_err(|error| error.to_string())?;
+        let mut hash = Sha256::new();
+        let mut bytes = 0u64;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let count = stream
+                .recv(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            bytes = bytes
+                .checked_add(count as u64)
+                .ok_or_else(|| "runtime ISO byte count overflow".to_owned())?;
+            hash.update(&buffer[..count]);
+            if bytes > expected_bytes {
+                return Err("runtime ISO stream exceeded expected size".to_owned());
+            }
+        }
+        stream.finish().map_err(|error| error.to_string())?;
+        Ok((evidence, bytes, format!("{:x}", hash.finalize())))
+    }
+
+    fn materialize_installer_iso(
+        &mut self,
+        pool: &str,
+        name: &str,
+        source_path: &std::path::Path,
+        source_bytes: u64,
+    ) -> Result<forge_images::PreparationVolumeEvidence, String> {
+        let pool_obj = self.pool(pool).map_err(|error| error.to_string())?;
+        if StorageVol::lookup_by_name(&pool_obj, name).is_ok() {
+            return Err("runtime installer ISO volume collision".to_owned());
+        }
+        let xml = format!(
+            "<volume><name>{name}</name><capacity unit='bytes'>{source_bytes}</capacity><target><format type='raw'/></target></volume>"
+        );
+        let volume =
+            StorageVol::create_xml(&pool_obj, &xml, 0).map_err(|error| error.to_string())?;
+        upload_file(
+            &self.connection,
+            &volume,
+            &source_path.to_string_lossy(),
+            source_bytes,
+        )
+        .map_err(|error| error.to_string())?;
+        let info = volume.get_info().map_err(|error| error.to_string())?;
+        let xml = volume.get_xml_desc(0).map_err(|error| error.to_string())?;
+        Ok(forge_images::PreparationVolumeEvidence {
+            name: name.to_owned(),
+            key: volume.get_key().map_err(|error| error.to_string())?,
+            path: volume.get_path().map_err(|error| error.to_string())?.into(),
+            format: xml_attribute(&xml, "format", "type").unwrap_or_default(),
+            capacity_bytes: info.capacity,
+            allocation_bytes: info.allocation,
+            backing_path: backing_store_path(&xml).map(Into::into),
+        })
+    }
+
+    fn inspect_pool(
+        &mut self,
+        name: &str,
+    ) -> Result<forge_images::PreparationPoolEvidence, String> {
+        let pool = self.pool(name).map_err(|error| error.to_string())?;
+        let active = pool.is_active().map_err(|error| error.to_string())?;
+        let xml = pool.get_xml_desc(0).map_err(|error| error.to_string())?;
+        let target = xml_element(&xml, "path")
+            .ok_or_else(|| "storage pool target path is absent".to_owned())?;
+        Ok(forge_images::PreparationPoolEvidence {
+            name: name.to_owned(),
+            active,
+            target_path: target.into(),
+        })
+    }
+
+    fn inspect_volume(
+        &mut self,
+        pool: &str,
+        name: &str,
+    ) -> Result<Option<forge_images::PreparationVolumeEvidence>, String> {
+        let pool = self.pool(pool).map_err(|error| error.to_string())?;
+        let volume = match StorageVol::lookup_by_name(&pool, name) {
+            Ok(volume) => volume,
+            Err(error) if error.code() == ErrorNumber::NoStorageVolume => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        let info = volume.get_info().map_err(|error| error.to_string())?;
+        let xml = volume.get_xml_desc(0).map_err(|error| error.to_string())?;
+        Ok(Some(forge_images::PreparationVolumeEvidence {
+            name: name.to_owned(),
+            key: volume.get_key().map_err(|error| error.to_string())?,
+            path: volume.get_path().map_err(|error| error.to_string())?.into(),
+            format: xml_attribute(&xml, "format", "type").unwrap_or_default(),
+            capacity_bytes: info.capacity,
+            allocation_bytes: info.allocation,
+            backing_path: backing_store_path(&xml).map(Into::into),
+        }))
+    }
+
+    fn create_staging_volume(
+        &mut self,
+        pool: &str,
+        name: &str,
+        capacity_bytes: u64,
+    ) -> Result<(), String> {
+        forge_storage::DefineBackend::create_volume(self, pool, name, capacity_bytes)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn inspect_installer_domain(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<forge_images::InstallerDomainEvidence>, String> {
+        let domain = match Domain::lookup_by_name(&self.connection, name) {
+            Ok(domain) => domain,
+            Err(error) if error.code() == ErrorNumber::NoDomain => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        let (state, _) = domain.get_state().map_err(|error| error.to_string())?;
+        let capabilities = self
+            .connection
+            .get_capabilities()
+            .map_err(|error| error.to_string())?;
+        let q35_alias_canonical = xml_blocks(&capabilities, "machine")
+            .into_iter()
+            .find(|block| tag_text(block, "machine").as_deref() == Some("q35"))
+            .and_then(|block| xml_attribute(block, "machine", "canonical"));
+        let mapped_state = map_domain_state(state).map_err(|error| error.to_string())?;
+        Ok(Some(forge_images::InstallerDomainEvidence {
+            name: domain.get_name().map_err(|error| error.to_string())?,
+            uuid: domain
+                .get_uuid_string()
+                .map_err(|error| error.to_string())?,
+            persistent: domain.is_persistent().map_err(|error| error.to_string())?,
+            shutoff: mapped_state == forge_core::VmState::Shutoff,
+            running: mapped_state == forge_core::VmState::Running,
+            autostart: domain.get_autostart().map_err(|error| error.to_string())?,
+            xml: domain.get_xml_desc(2).map_err(|error| error.to_string())?,
+            q35_alias_canonical,
+        }))
+    }
+
+    fn define_installer_domain(&mut self, xml: &str) -> Result<(), String> {
+        let domain =
+            Domain::define_xml(&self.connection, xml).map_err(|error| error.to_string())?;
+        domain
+            .set_autostart(false)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn start_installer_domain(&mut self, name: &str) -> Result<(), String> {
+        self.start_preparation_domain(name)
+    }
+
+    fn canonical_base_exists(&mut self, pool: &str, name: &str) -> Result<bool, String> {
+        forge_storage::DefineBackend::volume_exists(self, pool, name)
+            .map_err(|error| error.to_string())
     }
 }
 

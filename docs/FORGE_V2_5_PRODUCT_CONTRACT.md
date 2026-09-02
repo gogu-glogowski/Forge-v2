@@ -441,6 +441,121 @@ shutdown proof. Forge must not mount guest filesystems ad hoc on the host.
 Normalization evidence is a private typed value produced only by the complete
 checklist; a metadata boolean cannot authorize promotion.
 
+The Phase 4.6 state sequence is `InstalledSystemProven` ->
+`NormalizationPlanned` -> `NormalizationRunning` ->
+`NormalizationGuestComplete` -> `ShutdownPending` -> `OfflineProofPending` ->
+`Normalized`. Every arrow requires newly published evidence bound to the
+preparation ID, staging identity, recipe version, and prior evidence. Resume
+re-proves the current boundary; a process crash never supplies a missing guest
+result or shutdown. Only a guest-requested shutdown followed by libvirt-observed
+shutoff qualifies. A forced stop is recovery evidence, never clean-shutdown
+evidence.
+
+The canonical product remains Fedora Workstation, not a cloud image. It has no
+normal, builder, legacy `forge`, or universally credentialed account; root is
+locked under Fedora policy. GNOME Initial Setup and its packaged system defaults
+remain available. Normalization removes only user-specific AccountsService and
+GNOME completion records whose ownership is proven; an unknown first-use state
+fails closed rather than triggering a guessed path deletion.
+
+`/etc/machine-id` is retained as an empty regular file for first-boot generation.
+The D-Bus machine-id is absent or the distribution-supported link to it, never a
+second persistent identifier. The hostname is the product-level generic value
+`localhost` until instance policy supplies another. NetworkManager profiles may
+remain only when they are generic autoconnect policy: no preparation MAC,
+interface name, connection UUID intended as instance identity, static address,
+lease, DHCP DUID/client ID, secret, or preparation hostname may survive.
+Filesystem UUIDs are preserved unless a separately typed boot-consistency
+transaction proves a replacement.
+
+OpenSSH is not installed or enabled merely for Forge. If it is already part of
+the installed package set, all generated host keys must be absent and key
+generation must remain Fedora-native on a later start. SPICE desktop integration
+is a product capability and may be included when its Fedora package and service
+state are proven generic. QGA is a separate lifecycle interface and is included
+only after Forge specifies concrete operations, a libvirt channel policy, and a
+security boundary; it is not required for display resizing.
+
+The selected package policy is a fully updated Fedora 44 system at preparation
+time. A future executor must record repositories, update timestamp, transaction
+completion, RPM database consistency, and the complete installed NEVRA manifest
+so the result remains auditable and rebuild differences are explicit. Phase 4.6A
+does not update anything. SELinux must remain enabled and enforcing. Any recipe
+change that can invalidate labels schedules the Fedora-native relabel, boots to
+complete it, and proves that no relabel is pending before final shutdown.
+
+Cleanup is bounded: remove proven credentials, tokens, histories, preparation
+commands, leases, crash artifacts, temporary files, and identifying journal/log
+content; preserve packaged defaults, package caches or logs needed for provenance
+unless policy explicitly classifies them. Anaconda files are removed only when
+documented as transient output; packaged Anaconda components and ordinary RPM
+metadata are not residue by filename alone.
+
+There is currently no proven authenticated in-guest execution channel. Forge
+must not substitute SSH, cloud-init, NoCloud, a shared host filesystem, or a
+universal credential. Phase 4.6B must first implement and prove a narrowly
+owned, preparation-only, deterministic command/evidence channel with no reusable
+secret and fail-closed self-removal. Until then execution planning reports
+`Unavailable`; a single operator terminal session is an explicit last-resort
+fallback, not an implicit automation path.
+
+Phase 4.6B selects a dedicated preparation-only virtio-serial transport with a
+fixed target name, paired with a purpose-built guest helper. The transport is
+not an executor and carries no authority by itself. The helper accepts only the
+versioned `ReadOnlyGuestInventoryProbe` operation in 4.6B; there is no command,
+argument-vector, script, or shell field in the protocol. Requests and results
+bind preparation ID, domain name/UUID, staging path, recipe, expected durable
+state, operation ID, and nonce. A successful transport disconnect or helper exit
+is not evidence: only a matching structured completed result can construct the
+private inventory-evidence type.
+
+The host operation ledger distinguishes prepared, sent/awaiting-result,
+completed, and ambiguous failure. A crash before send is safely unsent. A crash
+after send remains ambiguous; future mutating operations may not be repeated.
+The read-only inventory can be issued under a new operation ID after explicit
+reconciliation, but duplicate requests/results never create a second success.
+Durable-state or identity changes invalidate outstanding operations.
+
+The intended helper is `/usr/libexec/forge-preparation-control`, with a transient
+unit under `/run/systemd/system/`, transient binding under
+`/run/forge-preparation-control/`, and domain channel
+`org.majorforge.preparation.0`. It runs under SELinux enforcing, has a fixed
+read-only collector allowlist, creates no reusable secret, and must not expose a
+generic shell. Before `Normalized`, proof must show the helper, unit, binding,
+channel, token/secret residue, and all preparation-specific state absent.
+
+This helper cannot be safely bootstrapped into the already running preparation
+with the currently proven architecture: SSH/cloud-init/NoCloud/shared folders
+are forbidden, QGA generic execution is deliberately unavailable, and a serial
+device alone cannot install a trusted endpoint. Therefore 4.6B implementation
+must stop before topology mutation or a real probe unless a separately
+authorized, auditable bootstrap supplies the helper. Attaching an unconsumed
+transport would not constitute progress or proof.
+
+The Phase 4.6B1 read-only broker checkpoint is proven independently of that
+future in-guest channel. The privileged preparation broker forces the direct
+libguestfs backend and opens the exact shut-off staging qcow2 read-only. Its
+deterministic sequence explicitly launches the appliance, calls `inspect-os`,
+requires exactly one framed OS root, preserves Btrfs identities such as
+`btrfsvol:/dev/...`, and binds subsequent inspection calls to that exact root.
+For the Fedora Workstation 44 x86_64 preparation it proved the Workstation
+identity, enforcing SELinux configuration and bounded filesystem layout while
+preserving inode, DAC, ACL, SELinux label, timestamps, capacity, backing, dirty
+and corrupt state. A clean close publishes one bound
+`ProvenPrivilegedOfflineFedoraDiscovery` while durable preparation state remains
+`InstalledSystemProven`. This checkpoint grants no write capability, helper
+injection, preparation channel, normalization, promotion or canonical-base
+authority.
+
+After the guest checklist and controlled shutdown, a dedicated read-only image
+inspection appliance (not an ad-hoc host mount) verifies OS release/product,
+accounts, first-use state, machine/D-Bus/hostname/network/SSH identity, package
+manifest and transaction state, SELinux configuration and pending relabel,
+filesystem cleanliness, staging capacity/format/backing shape, and a full disk
+digest. Its evidence binds the preparation, recipe, source provenance, staging
+volume key/path, clean-shutdown event, and inspection-tool version. Only then can
+the private-field `NormalizedFedoraWorkstationDisk` be constructed.
+
 Promotion performs an exact copy/import from preparation-owned staging into a
 new, collision-free `forge-base-fedora-workstation-<release>-<compose>.qcow2`,
 proves its digest, capacity, qcow2/no-backing shape, publishes ISO/install/
@@ -451,6 +566,44 @@ canonical base remains authoritative and staging cleanup is separate and
 idempotent. Protection combines durable SharedBase ownership, deletion and
 writable-attachment refusal, exact consumer proof, and compatible filesystem
 permissions; `chmod` alone is insufficient.
+
+Phase 4.4 executes only the first resumable portion of that transaction. Forge
+publishes one private `Planned` record, creates and proves one sparse 80 GiB
+qcow2 with no backing store in the system libvirt image pool, defines one
+persistent but shut-off temporary Q35/UEFI installer domain, rereads its
+persistent XML, and publishes `InstallerReady` only after exact topology proof.
+The domain has the verified Workstation ISO as its sole read-only CDROM, the
+staging disk as its sole writable disk, one default-network virtio NIC, SPICE,
+virtio-gpu, USB tablet/keyboard, and ICH9 audio. It has no seed, cloud-init,
+hostdev, filesystem passthrough, or QGA requirement and autostart is disabled.
+
+The state record binds the preparation ID, exact signed ISO provenance, volume
+key/path/shape, domain name/UUID and normalized XML digest, normalization recipe,
+and future canonical name. A repeated prepare validates and reports the same
+resources rather than allocating another environment. Partial storage/domain
+failures retain their last published preparation ownership for explicit
+recovery; this executor never performs ambiguous automatic cleanup. Status is
+read-only. Continue refuses until a later phase implements explicit operator
+confirmation and installed-system proof. Phase 4.4 neither starts Anaconda nor
+creates or promotes a canonical base.
+
+Persistent installer topology is proven as requested intent plus resolved
+libvirt topology. `Q35` is a machine family request: the libvirt capabilities
+inventory must explicitly map the `q35` alias to the concrete machine persisted
+by the domain (for the proven host, `pc-q35-10.2`). A name prefix is not machine
+family authority. The resolved record retains that alias binding, concrete
+machine, UEFI loader/NVRAM paths, NIC MAC, normalized device classifications,
+and persistent-XML digest.
+
+Required devices are the single staging disk, single verified ISO CDROM, single
+default-network virtio NIC, SPICE graphics, virtio video, USB tablet/keyboard,
+ICH9 sound, CPU/memory, UEFI, and boot policy. Narrow libvirt normalization is
+accepted only for the observed emulator, qemu-xhci/SATA/PCIe controllers, PS/2
+mouse/keyboard, SPICE audio backend, ITCO reset watchdog, and virtio balloon,
+with their exact constrained properties. Hostdev, filesystem, channel/QGA, TPM,
+RNG, redirection, serial/console, panic, extra storage/network/media, unknown
+direct device kinds, alternate host paths, and autostart remain forbidden. No
+unknown device is ignored.
 
 ### 14.5 Guest observability and first boot
 
@@ -652,8 +805,9 @@ are proven:
 3. **Phase 4.3 — canonical preparation model:** implement preparation ownership,
    interactive installer state, completion evidence, normalization record and
    atomic SharedBase promotion.
-4. **Phase 4.4 — Workstation profile/domain:** implement the desktop hardware,
-   `InteractiveWorkstation` lifecycle policy and normalized topology proofs.
+4. **Phase 4.4 — installer preparation executor:** acquire/prove the official
+   ISO, create preparation-owned staging, define/prove the shut-off interactive
+   installer domain, and stop durably at `InstallerReady`.
 5. **Phase 4.5 — first canonical base proof:** perform one authorized installation,
    normalization and image-store promotion with complete evidence.
 6. **Phase 4.6 — persistent instance creation:** create the new Workstation

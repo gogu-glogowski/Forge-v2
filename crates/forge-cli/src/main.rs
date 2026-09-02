@@ -1,10 +1,14 @@
 use forge_core::{
     DoctorReport, DomainSummary, HostState, InstanceName, LibvirtInfo, ProfileId, VmResourcePlan,
 };
+use forge_images::FedoraWorkstationPreparationBackend;
 use forge_provisioning::{BootBackend, RebuildBackend};
 use forge_storage::{DefineBackend, ImagePrepareBackend};
+use sha2::{Digest, Sha256};
 use std::env;
+use std::fs::File;
 use std::io;
+use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -108,6 +112,13 @@ fn main() -> ExitCode {
         ["image", "fetch", "fedora-workstation"] => image_fetch_workstation(),
         ["image", "prepare", "fedora-workstation", "--dry-run"] => {
             image_prepare_workstation_dry_run()
+        }
+        ["image", "prepare", "fedora-workstation"] => image_prepare_workstation(),
+        ["image", "prepare-status", "fedora-workstation"] => image_prepare_workstation_status(),
+        ["image", "prepare-start", "fedora-workstation"] => image_prepare_workstation_start(),
+        ["image", "prepare-continue", "fedora-workstation"] => image_prepare_workstation_continue(),
+        ["image", "prepare-confirm-graphical", "fedora-workstation"] => {
+            image_prepare_workstation_confirm_graphical()
         }
         ["image", "recover", "whonix-workstation", "--dry-run"] => recover_whonix_workstation(true),
         ["image", "recover", "whonix-workstation"] => recover_whonix_workstation(false),
@@ -3557,6 +3568,532 @@ fn image_prepare_workstation_dry_run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn workstation_preparation_state_path() -> Result<std::path::PathBuf, String> {
+    let home = env::var_os("HOME").ok_or_else(|| "HOME is unavailable".to_owned())?;
+    Ok(forge_images::fedora_workstation_preparation_state_path(
+        std::path::Path::new(&home),
+    ))
+}
+
+fn new_preparation_identity() -> Result<forge_images::FedoraWorkstationPreparationId, String> {
+    let value = forge_state::new_generation_id()
+        .strip_prefix("gen-")
+        .ok_or_else(|| "generated identity has unexpected shape".to_owned())?
+        .replace('-', "");
+    forge_images::FedoraWorkstationPreparationId::new(value).map_err(|error| error.to_string())
+}
+
+fn new_domain_uuid() -> Result<String, String> {
+    forge_state::new_generation_id()
+        .strip_prefix("gen-")
+        .map(str::to_owned)
+        .ok_or_else(|| "generated domain UUID has unexpected shape".to_owned())
+}
+
+fn exact_workstation_source(preparation: &forge_images::FedoraWorkstationPreparation) -> bool {
+    let source = workstation_source();
+    preparation.source.release == source.release()
+        && preparation.source.compose == source.compose()
+        && preparation.source.architecture == source.architecture()
+        && preparation.source.filename == source.filename()
+        && preparation.source.iso_sha256 == forge_images::FEDORA_WORKSTATION_ISO_SHA256
+        && preparation.source.iso_bytes == forge_images::FEDORA_WORKSTATION_ISO_BYTES
+        && preparation.source.signing_key_fingerprint == source.signing_key_fingerprint()
+}
+
+#[allow(clippy::too_many_lines)]
+fn image_prepare_workstation() -> ExitCode {
+    let total_started = Instant::now();
+    let result = (|| -> Result<(), String> {
+        let directories = forge_images::default_directories()
+            .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
+        let state_path = workstation_preparation_state_path()?;
+        let mut backend = forge_libvirt::LibvirtDefineBackend::connect_local()
+            .map_err(|error| error.to_string())?;
+        if let Some(mut preparation) =
+            forge_images::read_fedora_workstation_preparation(&state_path)
+                .map_err(|error| error.to_string())?
+        {
+            if !exact_workstation_source(&preparation) {
+                return Err("active preparation has conflicting source provenance".to_owned());
+            }
+            let proof =
+                forge_images::verified_fedora_workstation_iso(&directories, &workstation_source())
+                    .map_err(|error| format!("existing ISO proof is stale: {error}"))?;
+            if proof.metadata().local_path != preparation.source.iso_path
+                || proof.metadata().sha256 != preparation.source.iso_sha256
+                || proof.metadata().byte_size != preparation.source.iso_bytes
+            {
+                return Err("existing ISO proof differs from preparation authority".to_owned());
+            }
+            let disposition =
+                forge_images::execute_to_installer_ready(&mut backend, &mut preparation, |value| {
+                    forge_images::update_fedora_workstation_preparation(&state_path, value)
+                        .map_err(|error| error.to_string())
+                })
+                .map_err(|error| error.to_string())?;
+            println!("Preparation: {disposition:?}");
+            print_workstation_preparation_ready(&preparation);
+            return Ok(());
+        }
+
+        let source = workstation_source();
+        let acquisition_started = Instant::now();
+        let mut fetcher = forge_images::SystemArtifactFetcher;
+        let proof = forge_images::fetch_fedora_workstation_iso(&directories, &source, &mut fetcher)
+            .map_err(|error| error.to_string())?;
+        let acquisition_elapsed = acquisition_started.elapsed();
+        let hash_started = Instant::now();
+        forge_images::revalidate_fedora_workstation_iso_proof(&proof)
+            .map_err(|error| error.to_string())?;
+        let hash_elapsed = hash_started.elapsed();
+
+        let pool = FedoraWorkstationPreparationBackend::inspect_pool(&mut backend, "default")?;
+        if !pool.active {
+            return Err("default storage pool is inactive".to_owned());
+        }
+        let preparation_id = new_preparation_identity()?;
+        let suffix = &preparation_id.as_str()[..8];
+        let staging_name = format!(
+            "forge-stage-fedora-workstation-{}-{}-{suffix}.qcow2",
+            source.release(),
+            source.compose()
+        );
+        let installer_name = format!(
+            "forge-prepare-fedora-workstation-{}-{}-{suffix}",
+            source.release(),
+            source.compose()
+        );
+        let canonical_name = format!(
+            "forge-base-fedora-workstation-{}-{}.qcow2",
+            source.release(),
+            source.compose()
+        );
+        let collisions = forge_images::PreparationCollisions {
+            active_transaction: false,
+            staging_disk: FedoraWorkstationPreparationBackend::inspect_volume(
+                &mut backend,
+                "default",
+                &staging_name,
+            )?
+            .is_some(),
+            installer_domain: backend.inspect_installer_domain(&installer_name)?.is_some(),
+            canonical_base: backend.canonical_base_exists("default", &canonical_name)?,
+        };
+        let plan = forge_images::plan_fedora_workstation_preparation(
+            Some(&proof),
+            preparation_id,
+            &new_domain_uuid()?,
+            &pool.target_path,
+            &pool.target_path,
+            collisions,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut preparation = forge_images::durable_preparation(plan);
+        forge_images::publish_new_fedora_workstation_preparation(&state_path, &preparation)
+            .map_err(|error| error.to_string())?;
+        let execution_started = Instant::now();
+        let disposition =
+            forge_images::execute_to_installer_ready(&mut backend, &mut preparation, |value| {
+                forge_images::update_fedora_workstation_preparation(&state_path, value)
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(|error| error.to_string())?;
+        println!("Preparation: {disposition:?}");
+        println!("ISO acquisition bytes: {}", proof.metadata().byte_size);
+        println!(
+            "ISO acquisition/proof elapsed: {:.3}s",
+            acquisition_elapsed.as_secs_f64()
+        );
+        println!(
+            "ISO identity revalidation bytes: {}",
+            proof.metadata().byte_size
+        );
+        println!(
+            "ISO identity revalidation elapsed: {:.3}s",
+            hash_elapsed.as_secs_f64()
+        );
+        println!(
+            "Staging/domain execution elapsed: {:.3}s",
+            execution_started.elapsed().as_secs_f64()
+        );
+        print_workstation_preparation_ready(&preparation);
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            println!(
+                "Total preparation elapsed: {:.3}s",
+                total_started.elapsed().as_secs_f64()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Fedora Workstation preparation failed: {error}");
+            eprintln!("No automatic cleanup was attempted; inspect prepare-status for recovery.");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn print_workstation_preparation_ready(preparation: &forge_images::FedoraWorkstationPreparation) {
+    println!("Preparation ID: {}", preparation.preparation_id.as_str());
+    println!("Source ISO verified: yes");
+    println!("Source ISO: {}", preparation.source.iso_path.display());
+    println!("Staging disk: {}", preparation.staging.path.display());
+    println!("Installer domain: {}", preparation.installer.name);
+    println!("Current stage: {:?}", preparation.status);
+    println!("Installer domain state: shut off");
+    println!("Canonical base: not prepared");
+    println!("Fedora Workstation installer environment is ready.");
+    println!(
+        "Open the temporary installer domain in virt-manager and complete normal graphical installation."
+    );
+    println!(
+        "After installation and shutdown, run: forge image prepare-continue fedora-workstation"
+    );
+}
+
+fn image_prepare_workstation_status() -> ExitCode {
+    let result = (|| -> Result<(), String> {
+        let state_path = workstation_preparation_state_path()?;
+        let preparation = forge_images::read_fedora_workstation_preparation(&state_path)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "no Fedora Workstation preparation exists".to_owned())?;
+        if !exact_workstation_source(&preparation) {
+            return Err("preparation provenance conflicts with the pinned source".to_owned());
+        }
+        let mut backend = forge_libvirt::LibvirtDefineBackend::connect_local()
+            .map_err(|error| error.to_string())?;
+        let volume = FedoraWorkstationPreparationBackend::inspect_volume(
+            &mut backend,
+            "default",
+            &preparation.staging.volume_name,
+        )?
+        .ok_or_else(|| "staging volume absent; recovery required".to_owned())?;
+        let domain = backend
+            .inspect_installer_domain(&preparation.installer.name)?
+            .ok_or_else(|| "installer domain absent; recovery required".to_owned())?;
+        forge_images::prove_fedora_workstation_installer_topology(&preparation, &domain)
+            .map_err(|error| error.to_string())?;
+        println!("Preparation ID: {}", preparation.preparation_id.as_str());
+        println!("Source ISO verified: yes (durable exact provenance)");
+        println!("Staging disk: {} ({})", volume.path.display(), volume.key);
+        println!("Installer domain: {} ({})", domain.name, domain.uuid);
+        println!("Current stage: {:?}", preparation.status);
+        println!(
+            "Installer domain state: {}",
+            if domain.shutoff {
+                "shut off"
+            } else {
+                "not shut off"
+            }
+        );
+        println!(
+            "Next action: complete graphical Anaconda installation, shut down, then explicitly continue"
+        );
+        println!("Canonical base: not prepared");
+        println!("Mutation: none");
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Fedora Workstation preparation status failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn image_prepare_workstation_start() -> ExitCode {
+    let result = (|| -> Result<(), String> {
+        let directories = forge_images::default_directories()
+            .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
+        let state_path = workstation_preparation_state_path()?;
+        let mut preparation = forge_images::read_fedora_workstation_preparation(&state_path)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "no Fedora Workstation preparation exists".to_owned())?;
+        if preparation.status != forge_images::FedoraWorkstationPreparationStatus::InstallerReady {
+            return Err(format!(
+                "installer start refused from durable stage {:?}",
+                preparation.status
+            ));
+        }
+        if !exact_workstation_source(&preparation) {
+            return Err("preparation provenance conflicts with the pinned source".to_owned());
+        }
+        let source = workstation_source();
+        let forge_images::FedoraWorkstationIsoState::Verified(metadata) =
+            forge_images::inspect_fedora_workstation_iso(&directories, &source)
+                .map_err(|error| error.to_string())?
+        else {
+            return Err("verified Workstation ISO is no longer available".to_owned());
+        };
+        if metadata.local_path != preparation.source.iso_path
+            || metadata.sha256 != preparation.source.iso_sha256
+            || metadata.byte_size != preparation.source.iso_bytes
+        {
+            return Err("ISO provenance differs from preparation authority".to_owned());
+        }
+        let mut backend = forge_libvirt::LibvirtDefineBackend::connect_local()
+            .map_err(|error| error.to_string())?;
+        let disposition =
+            forge_images::execute_to_installer_ready(&mut backend, &mut preparation, |_| Ok(()))
+                .map_err(|error| error.to_string())?;
+        if disposition != forge_images::InstallerReadyDisposition::Resumed {
+            return Err(
+                "installer start requires an existing InstallerReady transaction".to_owned(),
+            );
+        }
+        let suffix = &preparation.preparation_id.as_str()[..8];
+        let runtime_name = format!(
+            "forge-install-fedora-workstation-{}-{}-{suffix}.iso",
+            preparation.source.release, preparation.source.compose
+        );
+        let runtime = if let Some(runtime) = &preparation.execution.runtime_iso {
+            if runtime.volume_name != runtime_name
+                || runtime.preparation_id != preparation.preparation_id
+                || runtime.source_sha256 != preparation.source.iso_sha256
+                || runtime.source_bytes != preparation.source.iso_bytes
+            {
+                return Err("runtime installer ISO provenance conflict".to_owned());
+            }
+            let (volume, bytes, digest) =
+                FedoraWorkstationPreparationBackend::stream_installer_iso_digest(
+                    &mut backend,
+                    "default",
+                    &runtime_name,
+                    preparation.source.iso_bytes,
+                )?;
+            if bytes != preparation.source.iso_bytes || digest != preparation.source.iso_sha256 {
+                return Err("runtime installer ISO streamed digest mismatch".to_owned());
+            }
+            if volume.key != runtime.volume_key
+                || volume.path != runtime.path
+                || volume.capacity_bytes != runtime.destination_bytes
+            {
+                return Err("runtime installer ISO identity drift".to_owned());
+            }
+            volume
+        } else if let Some(existing) = FedoraWorkstationPreparationBackend::inspect_volume(
+            &mut backend,
+            "default",
+            &runtime_name,
+        )? {
+            let (volume, bytes, digest) =
+                FedoraWorkstationPreparationBackend::stream_installer_iso_digest(
+                    &mut backend,
+                    "default",
+                    &runtime_name,
+                    preparation.source.iso_bytes,
+                )?;
+            if volume.key != existing.key
+                || bytes != preparation.source.iso_bytes
+                || digest != preparation.source.iso_sha256
+            {
+                return Err("existing runtime installer ISO proof failed".to_owned());
+            }
+            let runtime = forge_images::LibvirtManagedInstallerIso {
+                preparation_id: preparation.preparation_id.clone(),
+                volume_name: runtime_name.clone(),
+                path: volume.path.clone(),
+                source_filename: preparation.source.filename.clone(),
+                source_sha256: preparation.source.iso_sha256.clone(),
+                source_bytes: preparation.source.iso_bytes,
+                destination_bytes: bytes,
+                destination_sha256: digest,
+                volume_key: volume.key.clone(),
+                role: forge_images::FedoraWorkstationArtifactRole::LibvirtManagedInstallerIso,
+            };
+            preparation.execution.runtime_iso = Some(runtime);
+            forge_images::update_fedora_workstation_preparation(&state_path, &preparation)
+                .map_err(|e| e.to_string())?;
+            volume
+        } else {
+            let volume = FedoraWorkstationPreparationBackend::materialize_installer_iso(
+                &mut backend,
+                "default",
+                &runtime_name,
+                &preparation.source.iso_path,
+                preparation.source.iso_bytes,
+            )?;
+            let mut file = File::open(&volume.path).map_err(|e| e.to_string())?;
+            let mut hash = Sha256::new();
+            let mut bytes = 0u64;
+            let mut buf = vec![0u8; 1024 * 1024];
+            loop {
+                let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
+                }
+                hash.update(&buf[..n]);
+                bytes += n as u64;
+            }
+            let digest = format!("{:x}", hash.finalize());
+            if bytes != preparation.source.iso_bytes || digest != preparation.source.iso_sha256 {
+                return Err("runtime installer ISO byte proof failed".to_owned());
+            }
+            let runtime = forge_images::LibvirtManagedInstallerIso {
+                preparation_id: preparation.preparation_id.clone(),
+                volume_name: runtime_name.clone(),
+                path: volume.path.clone(),
+                source_filename: preparation.source.filename.clone(),
+                source_sha256: preparation.source.iso_sha256.clone(),
+                source_bytes: preparation.source.iso_bytes,
+                destination_bytes: bytes,
+                destination_sha256: digest,
+                volume_key: volume.key.clone(),
+                role: forge_images::FedoraWorkstationArtifactRole::LibvirtManagedInstallerIso,
+            };
+            preparation.execution.runtime_iso = Some(runtime);
+            forge_images::update_fedora_workstation_preparation(&state_path, &preparation)
+                .map_err(|e| e.to_string())?;
+            volume
+        };
+        preparation.installer.iso_path.clone_from(&runtime.path);
+        backend.define_installer_domain(&forge_images::render_fedora_workstation_installer_xml(
+            &preparation,
+        ))?;
+        let domain = backend
+            .inspect_installer_domain(&preparation.installer.name)?
+            .ok_or_else(|| "rebound installer domain disappeared".to_owned())?;
+        let resolved =
+            forge_images::prove_fedora_workstation_installer_topology(&preparation, &domain)
+                .map_err(|e| e.to_string())?;
+        preparation.execution.installer_xml_sha256 = Some(resolved.xml_sha256.clone());
+        preparation.execution.resolved_topology = Some(resolved);
+        forge_images::update_fedora_workstation_preparation(&state_path, &preparation)
+            .map_err(|e| e.to_string())?;
+        backend.start_preparation_domain(&preparation.installer.name)?;
+        if !backend.preparation_domain_running(&preparation.installer.name)? {
+            return Err("installer domain did not reach running state".to_owned());
+        }
+        forge_images::record_installer_started(&mut preparation, true)
+            .map_err(|error| error.to_string())?;
+        forge_images::update_fedora_workstation_preparation(&state_path, &preparation)
+            .map_err(|error| error.to_string())?;
+        println!("Installer domain started: {}", preparation.installer.name);
+        println!("Preparation ID: {}", preparation.preparation_id.as_str());
+        println!("Current stage: {:?}", preparation.status);
+        println!(
+            "Open the domain in virt-manager and perform graphical Fedora Workstation installation onto the existing 80 GiB staging disk."
+        );
+        println!(
+            "Do not reboot into another installer cycle. After Anaconda completes, shut the domain down and report explicit installation completion."
+        );
+        println!(
+            "Next Forge boundary: installation confirmation; no success is inferred from running state."
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Fedora Workstation installer start failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn image_prepare_workstation_continue() -> ExitCode {
+    let result = (|| -> Result<(), String> {
+        let state_path = workstation_preparation_state_path()?;
+        let mut preparation = forge_images::read_fedora_workstation_preparation(&state_path)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "no active preparation".to_owned())?;
+        if !exact_workstation_source(&preparation) {
+            return Err("preparation provenance conflicts with the pinned source".to_owned());
+        }
+        let mut backend = forge_libvirt::LibvirtDefineBackend::connect_local()
+            .map_err(|error| error.to_string())?;
+        let disposition = forge_images::execute_to_installed_disk_running(
+            &mut backend,
+            &mut preparation,
+            true,
+            |value| {
+                forge_images::update_fedora_workstation_preparation(&state_path, value)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        println!("Installed-disk boot: {disposition:?}");
+        println!("Anaconda installation: operator-confirmed complete");
+        println!("Installer ISO: detached (retained as an unattached managed volume)");
+        println!("Installed system: running from preparation staging disk");
+        println!("Graphical Fedora proof: operator confirmation required");
+        println!("Canonical Workstation base: not created");
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Fedora Workstation continuation refused: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn image_prepare_workstation_confirm_graphical() -> ExitCode {
+    let result = (|| -> Result<(), String> {
+        let state_path = workstation_preparation_state_path()?;
+        let mut preparation = forge_images::read_fedora_workstation_preparation(&state_path)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "no active preparation".to_owned())?;
+        if !exact_workstation_source(&preparation) {
+            return Err("preparation provenance conflicts with the pinned source".to_owned());
+        }
+        let mut backend = forge_libvirt::LibvirtDefineBackend::connect_local()
+            .map_err(|error| error.to_string())?;
+        if backend.canonical_base_exists("default", &preparation.canonical.volume_name)? {
+            return Err("canonical Workstation base already exists".to_owned());
+        }
+        let runtime = preparation
+            .execution
+            .runtime_iso
+            .as_ref()
+            .ok_or_else(|| "durable runtime ISO evidence absent".to_owned())?;
+        let retained = FedoraWorkstationPreparationBackend::inspect_volume(
+            &mut backend,
+            "default",
+            &runtime.volume_name,
+        )?
+        .ok_or_else(|| "retained runtime ISO absent".to_owned())?;
+        if retained.name != runtime.volume_name
+            || retained.key != runtime.volume_key
+            || retained.path != runtime.path
+            || retained.capacity_bytes != runtime.destination_bytes
+        {
+            return Err("retained runtime ISO identity drift".to_owned());
+        }
+        let domain = backend
+            .inspect_installer_domain(&preparation.installer.name)?
+            .ok_or_else(|| "preparation domain absent".to_owned())?;
+        let disposition = forge_images::record_graphical_installed_system_confirmation(
+            &mut preparation,
+            &domain,
+            true,
+            true,
+        )
+        .map_err(|error| error.to_string())?;
+        forge_images::update_fedora_workstation_preparation(&state_path, &preparation)
+            .map_err(|error| error.to_string())?;
+        println!("Graphical confirmation: {disposition:?}");
+        println!("Installed system: proven from machine plus operator evidence");
+        println!("GNOME Initial Setup: not completed");
+        println!("Normalization: not started");
+        println!("Domain: left running");
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Fedora Workstation graphical confirmation refused: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn image_inspect() -> ExitCode {
     let Ok(directories) = image_directories() else {
         return ExitCode::from(2);
@@ -5128,6 +5665,10 @@ fn print_usage() {
     eprintln!("  forge image inspect fedora-workstation");
     eprintln!("  forge image fetch fedora-workstation");
     eprintln!("  forge image prepare fedora-workstation --dry-run");
+    eprintln!("  forge image prepare fedora-workstation");
+    eprintln!("  forge image prepare-status fedora-workstation");
+    eprintln!("  forge image prepare-start fedora-workstation");
+    eprintln!("  forge image prepare-continue fedora-workstation");
     eprintln!("  forge image recover whonix-workstation [--dry-run]");
     eprintln!(
         "Legacy Fedora Cloud/NoCloud is retired; compatibility inspection remains available."
