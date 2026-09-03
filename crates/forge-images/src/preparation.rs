@@ -612,6 +612,59 @@ pub const FORGE_PREPARATION_BROKER_PROTOCOL_VERSION: u32 = 1;
 pub enum PreparationBrokerOperation {
     InspectFedoraWorkstationPreparation,
     BootstrapPreparationHelperOffline,
+    ClassifyBootstrapRecoveryReadOnly,
+    CompleteBootstrapRecoveryHostOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BootstrapArtifactClassification {
+    Absent,
+    Exact,
+    PartialOrMismatched,
+    UnreadableOrIndeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BootstrapRecoveryClassification {
+    NothingWritten,
+    HelperExactOnly,
+    ExactPrefix,
+    ExactComplete,
+    PartialOrMismatched,
+    InconsistentSet,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BootstrapResumePlan {
+    ResumeWritingHelper,
+    ResumeWritingGenerator,
+    ResumeWritingBinding,
+    VerifyExistingArtifacts,
+    RecoveryBlockedMismatch,
+    RecoveryBlockedInconsistent,
+    RecoveryBlockedIndeterminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparationBrokerRecoveryResult {
+    pub protocol_version: u32,
+    pub operation: PreparationBrokerOperation,
+    pub operation_id: String,
+    pub preparation_id: FedoraWorkstationPreparationId,
+    pub domain_uuid: String,
+    pub staging_path: PathBuf,
+    pub bootstrap_transaction_id: String,
+    pub helper: BootstrapArtifactClassification,
+    pub generator: BootstrapArtifactClassification,
+    pub binding: BootstrapArtifactClassification,
+    pub classification: BootstrapRecoveryClassification,
+    pub resume_plan: BootstrapResumePlan,
+    pub backend: String,
+    pub read_only: bool,
+    pub clean_close: bool,
+    pub host_metadata_unchanged: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -662,6 +715,10 @@ pub struct PreparationBrokerBootstrapResult {
     pub source_checkpoint: String,
     pub helper_sha256: String,
     pub helper_bytes: u64,
+    pub generator_sha256: String,
+    pub generator_bytes: u64,
+    pub binding_sha256: String,
+    pub binding_bytes: u64,
     pub helper_protocol_version: u32,
     pub supported_operations: Vec<String>,
     pub bootstrap_transaction_id: String,
@@ -782,7 +839,10 @@ pub enum PreparationBrokerResponse {
         diagnostics: PreparationGuestIdentityDiagnostics,
     },
     BootstrapSuccess {
-        result: PreparationBrokerBootstrapResult,
+        result: Box<PreparationBrokerBootstrapResult>,
+    },
+    RecoveryClassificationSuccess {
+        result: PreparationBrokerRecoveryResult,
     },
 }
 
@@ -891,6 +951,26 @@ pub struct PreparationHelperBootstrap {
     pub staging_path: PathBuf,
     pub helper_sha256: String,
     pub helper_bytes: u64,
+    #[serde(default)]
+    pub generator_sha256: String,
+    #[serde(default)]
+    pub generator_bytes: u64,
+    #[serde(default)]
+    pub binding_sha256: String,
+    #[serde(default)]
+    pub binding_bytes: u64,
+    #[serde(default)]
+    pub guest_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub guest_modes: Vec<String>,
+    #[serde(default)]
+    pub guest_selinux_labels: Vec<String>,
+    #[serde(default)]
+    pub structured_verification_proven: bool,
+    #[serde(default)]
+    pub clean_close: bool,
+    #[serde(default)]
+    pub unexpected_paths_modified: bool,
     pub helper_protocol_version: u32,
     pub bootstrap_transaction_id: String,
     pub guest_installation_path: PathBuf,

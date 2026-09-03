@@ -564,6 +564,24 @@ mutated, the real helper and preparation channel remain absent, and normalizatio
 and canonical-base creation remain unauthorized. One real helper injection is
 safe to review only after the Phase 4.6B2 checkpoint; it has not been executed.
 
+The Phase 4.6B3 checkpoint proves the corresponding real offline injection. The
+broker keeps `ProtectSystem=strict`; the only additional systemd writable
+exception is the exact preparation staging qcow2, never its parent directory or
+a caller-selected path. A transaction-bound classifier inspects only the fixed
+helper, generator, and binding paths through the direct read-only backend. It
+classifies absent, exact, mismatched, inconsistent, and indeterminate states and
+derives only deterministic same-transaction resume points; mismatches,
+inconsistent sets, identity drift, and unreadable evidence fail closed without
+overwrite or journal reset.
+
+The original real transaction completed exactly once after byte, digest,
+ownership, mode, SELinux, canonical binding, semantic identity, and exact-path-set
+verification. Its journal is `Completed`, its success ledger contains one entry,
+durable bootstrap evidence is bound to that same transaction, and replay is
+refused. This checkpoint ends offline: the helper is installed but has never
+executed, the preparation VM remains shut off, the channel remains absent, no
+inventory probe or normalization has run, and no canonical base exists.
+
 After the guest checklist and controlled shutdown, a dedicated read-only image
 inspection appliance (not an ad-hoc host mount) verifies OS release/product,
 accounts, first-use state, machine/D-Bus/hostname/network/SSH identity, package

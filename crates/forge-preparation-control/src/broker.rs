@@ -29,6 +29,14 @@ const BOOTSTRAP_SYNTHETIC: &str =
 const BOOTSTRAP_BINDING: &str = "/var/lib/forge-preparation-broker/bootstrap-binding.json";
 const BOOTSTRAP_LEDGER: &str = "/var/lib/forge-preparation-broker/bootstrap-ledger";
 const BOOTSTRAP_JOURNAL: &str = "/var/lib/forge-preparation-broker/bootstrap-journal";
+const REAL_BOOTSTRAP_BINDING: &str =
+    "/var/lib/forge-preparation-broker/real-bootstrap-binding.json";
+const REAL_BOOTSTRAP_LEDGER: &str = "/var/lib/forge-preparation-broker/real-bootstrap-ledger";
+const REAL_BOOTSTRAP_JOURNAL: &str = "/var/lib/forge-preparation-broker/real-bootstrap-journal";
+const REAL_BOOTSTRAP_DIAGNOSTIC: &str =
+    "/var/lib/forge-preparation-broker/real-bootstrap-diagnostic";
+const REAL_BOOTSTRAP_EVIDENCE: &str =
+    "/var/lib/forge-preparation-broker/real-bootstrap-evidence.json";
 const HELPER_ARTIFACT: &str =
     "/home/majorforge/forge-virt/target/release/forge-preparation-control";
 const HELPER_SHA256: &str = "bb546fa9bf6efc11bde7687cba792421afc46616287a4fa468eadf3a7d0ad4a2";
@@ -48,7 +56,8 @@ enum BrokerSuccess {
     Inspection(Box<forge_images::PreparationBrokerResult>),
     ApplianceSelfTest(forge_images::PreparationBrokerApplianceSelfTestResult),
     SyntheticDirectSelfTest(forge_images::PreparationBrokerSyntheticDirectResult),
-    Bootstrap(forge_images::PreparationBrokerBootstrapResult),
+    Bootstrap(Box<forge_images::PreparationBrokerBootstrapResult>),
+    Recovery(forge_images::PreparationBrokerRecoveryResult),
 }
 
 enum BrokerFailure {
@@ -187,6 +196,9 @@ fn serve() -> Result<(), String> {
             Ok(BrokerSuccess::Bootstrap(result)) => {
                 forge_images::PreparationBrokerResponse::BootstrapSuccess { result }
             }
+            Ok(BrokerSuccess::Recovery(result)) => {
+                forge_images::PreparationBrokerResponse::RecoveryClassificationSuccess { result }
+            }
             Err(BrokerFailure::Identity(diagnostics)) => {
                 forge_images::PreparationBrokerResponse::IdentityRefusal {
                     error_code: "GuestIdentityPredicateRefused".to_owned(),
@@ -262,7 +274,14 @@ fn handle(stream: &mut UnixStream) -> Result<BrokerSuccess, BrokerFailure> {
             inspect(&request).map(|result| BrokerSuccess::Inspection(Box::new(result)))
         }
         forge_images::PreparationBrokerOperation::BootstrapPreparationHelperOffline => {
-            bootstrap_helper(&request).map(BrokerSuccess::Bootstrap)
+            bootstrap_helper(&request).map(|result| BrokerSuccess::Bootstrap(Box::new(result)))
+        }
+        forge_images::PreparationBrokerOperation::ClassifyBootstrapRecoveryReadOnly => {
+            classify_real_recovery(&request).map(BrokerSuccess::Recovery)
+        }
+        forge_images::PreparationBrokerOperation::CompleteBootstrapRecoveryHostOnly => {
+            complete_real_recovery(&request)
+                .map(|result| BrokerSuccess::Bootstrap(Box::new(result)))
         }
     }
 }
@@ -398,8 +417,412 @@ fn synthetic_direct_self_test(
     })
 }
 
+use forge_images::{
+    BootstrapArtifactClassification as ArtifactClass,
+    BootstrapRecoveryClassification as RecoveryClass, BootstrapResumePlan as ResumePlan,
+};
+
+fn recovery_outcome(
+    helper: ArtifactClass,
+    generator: ArtifactClass,
+    binding: ArtifactClass,
+) -> (RecoveryClass, ResumePlan) {
+    use ArtifactClass::{Absent, Exact, PartialOrMismatched, UnreadableOrIndeterminate};
+    if [helper, generator, binding].contains(&UnreadableOrIndeterminate) {
+        return (
+            RecoveryClass::Indeterminate,
+            ResumePlan::RecoveryBlockedIndeterminate,
+        );
+    }
+    if [helper, generator, binding].contains(&PartialOrMismatched) {
+        return (
+            RecoveryClass::PartialOrMismatched,
+            ResumePlan::RecoveryBlockedMismatch,
+        );
+    }
+    match (helper, generator, binding) {
+        (Absent, Absent, Absent) => (
+            RecoveryClass::NothingWritten,
+            ResumePlan::ResumeWritingHelper,
+        ),
+        (Exact, Absent, Absent) => (
+            RecoveryClass::HelperExactOnly,
+            ResumePlan::ResumeWritingGenerator,
+        ),
+        (Exact, Exact, Absent) => (RecoveryClass::ExactPrefix, ResumePlan::ResumeWritingBinding),
+        (Exact, Exact, Exact) => (
+            RecoveryClass::ExactComplete,
+            ResumePlan::VerifyExistingArtifacts,
+        ),
+        _ => (
+            RecoveryClass::InconsistentSet,
+            ResumePlan::RecoveryBlockedInconsistent,
+        ),
+    }
+}
+
+fn validate_recovery_request(
+    request: &forge_images::PreparationBrokerRequest,
+    transaction: &str,
+) -> Result<(), String> {
+    if request.protocol_version != forge_images::FORGE_PREPARATION_BROKER_PROTOCOL_VERSION
+        || !matches!(
+            request.operation,
+            forge_images::PreparationBrokerOperation::ClassifyBootstrapRecoveryReadOnly
+                | forge_images::PreparationBrokerOperation::CompleteBootstrapRecoveryHostOnly
+        )
+        || request.preparation_id.as_str() != PREPARATION
+        || request.expected_domain_name != DOMAIN
+        || request.expected_domain_uuid != UUID
+        || request.bootstrap_target
+            != Some(forge_images::PreparationBootstrapTarget::RealPreparation)
+        || request.operation_id != transaction
+        || request.nonce != real_bootstrap_nonce(transaction)
+    {
+        return Err("RecoveryRequestRefused".to_owned());
+    }
+    Ok(())
+}
+
+fn read_only_presence() -> Result<[bool; 3], String> {
+    let output = real_guest_output(
+        &[
+            "is-file", HELPER, ":", "is-file", GENERATOR, ":", "is-file", BINDING,
+        ],
+        false,
+    )?;
+    let values = output
+        .lines()
+        .filter(|line| *line == "true" || *line == "false")
+        .map(|line| line == "true")
+        .collect::<Vec<_>>();
+    values
+        .try_into()
+        .map_err(|_| "RecoveryPresenceIndeterminate".to_owned())
+}
+
+fn classify_fixed_artifact(path: &'static str, expected_label: &str) -> ArtifactClass {
+    match real_guest_output(
+        &[
+            "checksum",
+            "sha256",
+            path,
+            ":",
+            "statns",
+            path,
+            ":",
+            "getxattr",
+            path,
+            "security.selinux",
+        ],
+        false,
+    ) {
+        Ok(output) => {
+            let digest_exact = output.lines().any(|line| line == HELPER_SHA256);
+            let size_exact = output
+                .lines()
+                .any(|line| line == format!("st_size: {HELPER_BYTES}"));
+            let owner_exact = output.lines().any(|line| line == "st_uid: 0")
+                && output.lines().any(|line| line == "st_gid: 0");
+            let mode_exact = output.lines().any(|line| line == "st_mode: 33261");
+            let label_exact = output.lines().any(|line| line == expected_label);
+            if digest_exact && size_exact && owner_exact && mode_exact && label_exact {
+                ArtifactClass::Exact
+            } else {
+                ArtifactClass::PartialOrMismatched
+            }
+        }
+        Err(_) => ArtifactClass::UnreadableOrIndeterminate,
+    }
+}
+
+fn classify_fixed_binding(expected: &[u8]) -> ArtifactClass {
+    let bytes = real_guest_output(&["base64-out", BINDING, "/dev/stdout"], false);
+    let metadata = real_guest_output(
+        &[
+            "statns",
+            BINDING,
+            ":",
+            "getxattr",
+            BINDING,
+            "security.selinux",
+        ],
+        false,
+    );
+    match (bytes, metadata) {
+        (Ok(output), Ok(metadata)) => {
+            let content_exact =
+                decode_binding_base64(output.trim()).is_ok_and(|bytes| bytes == expected);
+            let metadata_exact = metadata
+                .lines()
+                .any(|line| line == format!("st_size: {}", expected.len()))
+                && metadata.lines().any(|line| line == "st_uid: 0")
+                && metadata.lines().any(|line| line == "st_gid: 0")
+                && metadata.lines().any(|line| line == "st_mode: 33152")
+                && metadata
+                    .lines()
+                    .any(|line| line == "system_u:object_r:lib_t:s0");
+            if content_exact && metadata_exact {
+                ArtifactClass::Exact
+            } else {
+                ArtifactClass::PartialOrMismatched
+            }
+        }
+        _ => ArtifactClass::UnreadableOrIndeterminate,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn classify_real_recovery(
+    request: &forge_images::PreparationBrokerRequest,
+) -> Result<forge_images::PreparationBrokerRecoveryResult, BrokerFailure> {
+    let preparation = forge_images::read_fedora_workstation_preparation(Path::new(STATE))
+        .map_err(|e| e.to_string())?
+        .ok_or("PreparationAbsent")?;
+    validate_bootstrap_preparation(&preparation, request)?;
+    let mut backend =
+        forge_libvirt::LibvirtDefineBackend::connect_local().map_err(|e| e.to_string())?;
+    if backend.canonical_base_exists("default", &preparation.canonical.volume_name)? {
+        return Err("CanonicalBasePresent".into());
+    }
+    let domain = backend
+        .inspect_installer_domain(DOMAIN)?
+        .ok_or("DomainAbsent")?;
+    if !domain.shutoff
+        || domain.running
+        || domain.autostart
+        || domain.uuid != UUID
+        || domain.xml.contains("<channel")
+        || domain.xml.contains("device='cdrom'")
+    {
+        return Err("DomainTopologyRefused".into());
+    }
+    forge_images::prove_fedora_workstation_disk_only_topology(&preparation, &domain)
+        .map_err(|e| e.to_string())?;
+    let volume = FedoraWorkstationPreparationBackend::inspect_volume(
+        &mut backend,
+        "default",
+        &preparation.staging.volume_name,
+    )?
+    .ok_or("VolumeAbsent")?;
+    if volume.path != Path::new(STAGING)
+        || volume.format != "qcow2"
+        || volume.capacity_bytes != 80 * 1024 * 1024 * 1024
+        || volume.backing_path.is_some()
+        || competing_qemu_exists()?
+    {
+        return Err("RecoveryStorageIdentityRefused".into());
+    }
+    let before = capture_host_storage_identity(Path::new(STAGING))?;
+    validate_storage(&before)?;
+    let transaction = real_bootstrap_transaction_id(&preparation, before.inode)?;
+    validate_recovery_request(request, &transaction)?;
+    let journal = fs::read_to_string(REAL_BOOTSTRAP_JOURNAL).unwrap_or_default();
+    let writing = format!("WritingHelper {transaction}\n");
+    let verifying = format!("Verifying {transaction}\n");
+    if (journal != writing && journal != verifying)
+        || fs::read_to_string(REAL_BOOTSTRAP_LEDGER)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line == transaction)
+    {
+        return Err("RecoveryBoundaryRefused".into());
+    }
+    let (presence, presence_indeterminate) = match read_only_presence() {
+        Ok(value) => (value, false),
+        Err(_) => ([false; 3], true),
+    };
+    let expected_binding = expected_real_binding_bytes(&transaction, &preparation, before.inode)?;
+    let classify = |present: bool, path| {
+        if presence_indeterminate {
+            ArtifactClass::UnreadableOrIndeterminate
+        } else if !present {
+            ArtifactClass::Absent
+        } else {
+            let label = if path == HELPER {
+                "system_u:object_r:bin_t:s0"
+            } else {
+                "system_u:object_r:systemd_generic_generator_exec_t:s0"
+            };
+            classify_fixed_artifact(path, label)
+        }
+    };
+    let helper = classify(presence[0], HELPER);
+    let generator = classify(presence[1], GENERATOR);
+    let binding = if presence_indeterminate {
+        ArtifactClass::UnreadableOrIndeterminate
+    } else if !presence[2] {
+        ArtifactClass::Absent
+    } else {
+        classify_fixed_binding(&expected_binding)
+    };
+    let (classification, resume_plan) = recovery_outcome(helper, generator, binding);
+    if journal == verifying {
+        if classification != RecoveryClass::ExactComplete
+            || resume_plan != ResumePlan::VerifyExistingArtifacts
+        {
+            return Err("RealFinalVerificationArtifactSetRefused".into());
+        }
+        let output = real_guest_output(&real_verification_arguments(), false)?;
+        validate_real_verification(&output, &transaction, &preparation, before.inode)?;
+    }
+    let after = capture_host_storage_identity(Path::new(STAGING))?;
+    let unchanged = before == after;
+    if !unchanged {
+        return Err("RecoveryHostIdentityDriftRefused".into());
+    }
+    Ok(forge_images::PreparationBrokerRecoveryResult {
+        protocol_version: request.protocol_version,
+        operation: request.operation,
+        operation_id: request.operation_id.clone(),
+        preparation_id: preparation.preparation_id,
+        domain_uuid: UUID.to_owned(),
+        staging_path: STAGING.into(),
+        bootstrap_transaction_id: transaction,
+        helper,
+        generator,
+        binding,
+        classification,
+        resume_plan,
+        backend: "direct".to_owned(),
+        read_only: true,
+        clean_close: true,
+        host_metadata_unchanged: true,
+    })
+}
+
+fn atomic_publish(path: &str, bytes: &[u8]) -> Result<(), String> {
+    let temporary = format!("{path}.tmp");
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|_| "AtomicPublicationCollisionRefused")?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    fs::rename(&temporary, path).map_err(|e| e.to_string())?;
+    File::open(SERVICE_STATE_DIR)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| e.to_string())
+}
+
+fn complete_real_recovery(
+    request: &forge_images::PreparationBrokerRequest,
+) -> Result<forge_images::PreparationBrokerBootstrapResult, BrokerFailure> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open("/var/lib/forge-preparation-broker/operation.lock")
+        .map_err(|e| e.to_string())?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|_| "OperationLockUnavailable")?;
+    if Path::new(REAL_BOOTSTRAP_LEDGER).exists() || Path::new(REAL_BOOTSTRAP_EVIDENCE).exists() {
+        return Err("ReplayRefused".into());
+    }
+    let verification = classify_real_recovery(request)?;
+    if verification.classification != RecoveryClass::ExactComplete
+        || verification.resume_plan != ResumePlan::VerifyExistingArtifacts
+        || !verification.read_only
+        || !verification.clean_close
+        || !verification.host_metadata_unchanged
+    {
+        return Err("CompletionVerificationRefused".into());
+    }
+    let host_identity = capture_host_storage_identity(Path::new(STAGING))?;
+    validate_storage(&host_identity)?;
+    let preparation = forge_images::read_fedora_workstation_preparation(Path::new(STATE))
+        .map_err(|e| e.to_string())?
+        .ok_or("PreparationAbsent")?;
+    let binding = expected_real_binding_bytes(
+        &verification.bootstrap_transaction_id,
+        &preparation,
+        host_identity.inode,
+    )?;
+    let evidence = serde_json::json!({
+        "schema_version": 1,
+        "completion": "RealOfflineHelperInjectionCompleted",
+        "transaction_id": verification.bootstrap_transaction_id,
+        "preparation_id": PREPARATION,
+        "domain_uuid": UUID,
+        "staging_path": STAGING,
+        "staging_inode": host_identity.inode,
+        "helper": {"path": HELPER, "sha256": HELPER_SHA256, "bytes": HELPER_BYTES, "owner": "0:0", "mode": "0755", "selinux_type": "bin_t"},
+        "generator": {"path": GENERATOR, "sha256": HELPER_SHA256, "bytes": HELPER_BYTES, "owner": "0:0", "mode": "0755", "selinux_type": "systemd_generic_generator_exec_t"},
+        "binding": {"path": BINDING, "sha256": format!("{:x}", Sha256::digest(&binding)), "bytes": binding.len(), "owner": "0:0", "mode": "0600", "selinux_type": "lib_t"},
+        "protocol_version": forge_images::FORGE_GUEST_CONTROL_PROTOCOL_VERSION,
+        "recipe": "V1",
+        "channel": forge_images::FORGE_PREPARATION_CHANNEL,
+        "structured_verification": "Passed",
+        "path_set": "Exact",
+        "r6_guest_write": false
+    });
+    let evidence_bytes = serde_json::to_vec_pretty(&evidence).map_err(|e| e.to_string())?;
+    atomic_publish(REAL_BOOTSTRAP_EVIDENCE, &evidence_bytes)?;
+    atomic_publish(
+        REAL_BOOTSTRAP_LEDGER,
+        format!("{}\n", verification.bootstrap_transaction_id).as_bytes(),
+    )?;
+    atomic_publish(
+        REAL_BOOTSTRAP_JOURNAL,
+        format!("Completed {}\n", verification.bootstrap_transaction_id).as_bytes(),
+    )?;
+    Ok(forge_images::PreparationBrokerBootstrapResult {
+        protocol_version: request.protocol_version,
+        operation: request.operation,
+        operation_id: request.operation_id.clone(),
+        nonce: request.nonce.clone(),
+        preparation_id: preparation.preparation_id,
+        domain_uuid: UUID.to_owned(),
+        target: forge_images::PreparationBootstrapTarget::RealPreparation,
+        source_checkpoint: SOURCE_CHECKPOINT.to_owned(),
+        helper_sha256: HELPER_SHA256.to_owned(),
+        helper_bytes: HELPER_BYTES,
+        generator_sha256: HELPER_SHA256.to_owned(),
+        generator_bytes: HELPER_BYTES,
+        binding_sha256: format!("{:x}", Sha256::digest(&binding)),
+        binding_bytes: binding.len() as u64,
+        helper_protocol_version: forge_images::FORGE_GUEST_CONTROL_PROTOCOL_VERSION,
+        supported_operations: vec!["ReadOnlyGuestInventoryProbe".to_owned()],
+        bootstrap_transaction_id: request.operation_id.clone(),
+        guest_paths: vec![HELPER.to_owned(), GENERATOR.to_owned(), BINDING.to_owned()],
+        guest_modes: vec![
+            "0:0:0755".to_owned(),
+            "0:0:0755".to_owned(),
+            "0:0:0600".to_owned(),
+        ],
+        guest_selinux_labels: vec![
+            "bin_t".to_owned(),
+            "systemd_generic_generator_exec_t".to_owned(),
+            "lib_t".to_owned(),
+        ],
+        unexpected_paths_modified: false,
+        clean_close: true,
+        backend: "direct".to_owned(),
+        target_sha256_before: String::new(),
+        target_sha256_after: String::new(),
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn bootstrap_helper(
+    request: &forge_images::PreparationBrokerRequest,
+) -> Result<forge_images::PreparationBrokerBootstrapResult, BrokerFailure> {
+    match request.bootstrap_target {
+        Some(forge_images::PreparationBootstrapTarget::SyntheticProof) => {
+            bootstrap_synthetic(request)
+        }
+        Some(forge_images::PreparationBootstrapTarget::RealPreparation) => bootstrap_real(request),
+        None => Err("BootstrapRequestRefused".into()),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn bootstrap_synthetic(
     request: &forge_images::PreparationBrokerRequest,
 ) -> Result<forge_images::PreparationBrokerBootstrapResult, BrokerFailure> {
     validate_bootstrap_request(request)?;
@@ -659,6 +1082,13 @@ fn bootstrap_helper(
         source_checkpoint: SOURCE_CHECKPOINT.to_owned(),
         helper_sha256: HELPER_SHA256.to_owned(),
         helper_bytes: HELPER_BYTES,
+        generator_sha256: HELPER_SHA256.to_owned(),
+        generator_bytes: HELPER_BYTES,
+        binding_sha256: format!(
+            "{:x}",
+            Sha256::digest(expected_binding_bytes(&transaction)?)
+        ),
+        binding_bytes: expected_binding_bytes(&transaction)?.len() as u64,
         helper_protocol_version: forge_images::FORGE_GUEST_CONTROL_PROTOCOL_VERSION,
         supported_operations: vec!["ReadOnlyGuestInventoryProbe".to_owned()],
         bootstrap_transaction_id: transaction,
@@ -679,6 +1109,481 @@ fn bootstrap_helper(
         target_sha256_before,
         target_sha256_after,
     })
+}
+
+#[allow(clippy::too_many_lines)]
+fn bootstrap_real(
+    request: &forge_images::PreparationBrokerRequest,
+) -> Result<forge_images::PreparationBrokerBootstrapResult, BrokerFailure> {
+    validate_real_bootstrap_request(request)?;
+    let preparation = forge_images::read_fedora_workstation_preparation(Path::new(STATE))
+        .map_err(|e| e.to_string())?
+        .ok_or("PreparationAbsent")?;
+    validate_bootstrap_preparation(&preparation, request)?;
+    let mut backend =
+        forge_libvirt::LibvirtDefineBackend::connect_local().map_err(|e| e.to_string())?;
+    if backend.canonical_base_exists("default", &preparation.canonical.volume_name)? {
+        return Err("CanonicalBasePresent".into());
+    }
+    let domain = backend
+        .inspect_installer_domain(DOMAIN)?
+        .ok_or("DomainAbsent")?;
+    if !domain.shutoff
+        || domain.running
+        || domain.autostart
+        || domain.uuid != UUID
+        || domain.xml.contains("<channel")
+        || domain.xml.contains("device='cdrom'")
+    {
+        return Err("DomainTopologyRefused".into());
+    }
+    forge_images::prove_fedora_workstation_disk_only_topology(&preparation, &domain)
+        .map_err(|e| e.to_string())?;
+    let volume = FedoraWorkstationPreparationBackend::inspect_volume(
+        &mut backend,
+        "default",
+        &preparation.staging.volume_name,
+    )?
+    .ok_or("VolumeAbsent")?;
+    if volume.key
+        != preparation
+            .execution
+            .staging_volume_key
+            .clone()
+            .unwrap_or_default()
+        || volume.path != Path::new(STAGING)
+        || volume.format != "qcow2"
+        || volume.capacity_bytes != 80 * 1024 * 1024 * 1024
+        || volume.backing_path.is_some()
+    {
+        return Err("StorageIdentityRefused".into());
+    }
+    let target_before = capture_host_storage_identity(Path::new(STAGING))?;
+    validate_storage(&target_before)?;
+    if competing_qemu_exists()? {
+        return Err("CompetingQemuRefused".into());
+    }
+    if fs::read_to_string("/sys/fs/selinux/enforce")
+        .map_err(|e| e.to_string())?
+        .trim()
+        != "1"
+    {
+        return Err("SelinuxEnforcementRefused".into());
+    }
+    let artifact = fs::metadata(HELPER_ARTIFACT).map_err(|_| "HelperArtifactRefused")?;
+    if !helper_artifact_matches(artifact.len(), &digest(Path::new(HELPER_ARTIFACT))?) {
+        return Err("HelperArtifactRefused".into());
+    }
+    let transaction = real_bootstrap_transaction_id(&preparation, target_before.inode)?;
+    if request.operation_id != transaction || request.nonce != real_bootstrap_nonce(&transaction) {
+        return Err("BootstrapRequestRefused".into());
+    }
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open("/var/lib/forge-preparation-broker/operation.lock")
+        .map_err(|e| e.to_string())?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|_| "OperationLockUnavailable")?;
+    if fs::read_to_string(REAL_BOOTSTRAP_LEDGER)
+        .unwrap_or_default()
+        .lines()
+        .any(|v| v == transaction)
+    {
+        return Err("ReplayRefused".into());
+    }
+    let binding = expected_real_binding_bytes(&transaction, &preparation, target_before.inode)?;
+    let binding_sha256 = format!("{:x}", Sha256::digest(&binding));
+    let journal = fs::read_to_string(REAL_BOOTSTRAP_JOURNAL).ok();
+    if journal.as_deref() != Some(&format!("WritingHelper {transaction}\n")) {
+        return Err("ReplayRefused".into());
+    }
+    let presence = read_only_presence()?;
+    let (classification, plan) = recovery_outcome(
+        if presence[0] {
+            classify_fixed_artifact(HELPER, "system_u:object_r:bin_t:s0")
+        } else {
+            ArtifactClass::Absent
+        },
+        if presence[1] {
+            classify_fixed_artifact(
+                GENERATOR,
+                "system_u:object_r:systemd_generic_generator_exec_t:s0",
+            )
+        } else {
+            ArtifactClass::Absent
+        },
+        if presence[2] {
+            classify_fixed_binding(&binding)
+        } else {
+            ArtifactClass::Absent
+        },
+    );
+    if classification != RecoveryClass::NothingWritten || plan != ResumePlan::ResumeWritingHelper {
+        return Err("RecoveryClassificationRefused".into());
+    }
+    if fs::read(REAL_BOOTSTRAP_BINDING).map_err(|_| "BootstrapBindingRefused")? != binding {
+        return Err("BootstrapBindingRefused".into());
+    }
+
+    real_guest_output(
+        &[
+            "upload",
+            HELPER_ARTIFACT,
+            HELPER,
+            ":",
+            "chmod",
+            "0755",
+            HELPER,
+            ":",
+            "chown",
+            "0",
+            "0",
+            HELPER,
+            ":",
+            "setxattr",
+            "security.selinux",
+            "system_u:object_r:bin_t:s0",
+            "26",
+            HELPER,
+        ],
+        true,
+    )?;
+    if classify_fixed_artifact(HELPER, "system_u:object_r:bin_t:s0") != ArtifactClass::Exact {
+        return Err("HelperVerificationRefused".into());
+    }
+    write_real_bootstrap_state(&format!("WritingGenerator {transaction}\n"))?;
+    real_guest_output(
+        &[
+            "upload",
+            HELPER_ARTIFACT,
+            GENERATOR,
+            ":",
+            "chmod",
+            "0755",
+            GENERATOR,
+            ":",
+            "chown",
+            "0",
+            "0",
+            GENERATOR,
+            ":",
+            "setxattr",
+            "security.selinux",
+            "system_u:object_r:systemd_generic_generator_exec_t:s0",
+            "53",
+            GENERATOR,
+        ],
+        true,
+    )?;
+    if classify_fixed_artifact(
+        GENERATOR,
+        "system_u:object_r:systemd_generic_generator_exec_t:s0",
+    ) != ArtifactClass::Exact
+    {
+        return Err("GeneratorVerificationRefused".into());
+    }
+    write_real_bootstrap_state(&format!("WritingBinding {transaction}\n"))?;
+    real_guest_output(
+        &[
+            "mkdir-p",
+            "/usr/lib/forge-preparation-control",
+            ":",
+            "upload",
+            REAL_BOOTSTRAP_BINDING,
+            BINDING,
+            ":",
+            "chmod",
+            "0600",
+            BINDING,
+            ":",
+            "chown",
+            "0",
+            "0",
+            BINDING,
+            ":",
+            "setxattr",
+            "security.selinux",
+            "system_u:object_r:lib_t:s0",
+            "26",
+            BINDING,
+        ],
+        true,
+    )?;
+    if classify_fixed_binding(&binding) != ArtifactClass::Exact {
+        return Err("BindingVerificationRefused".into());
+    }
+    write_real_bootstrap_state(&format!("Verifying {transaction}\n"))?;
+
+    let after = real_guest_output(&real_verification_arguments(), false)?;
+    validate_real_verification(&after, &transaction, &preparation, target_before.inode)?;
+    write_real_bootstrap_state(&format!("Verified {transaction}\n"))?;
+    let target_after = capture_host_storage_identity(Path::new(STAGING))?;
+    if target_before.inode != target_after.inode
+        || target_before.owner != target_after.owner
+        || target_before.group != target_after.group
+        || target_before.mode != target_after.mode
+        || target_before.acl != target_after.acl
+        || target_before.selinux_label != target_after.selinux_label
+        || target_before.qcow2_capacity != target_after.qcow2_capacity
+        || target_before.qcow2_backing != target_after.qcow2_backing
+        || target_after.qcow2_dirty
+        || target_after.qcow2_corrupt
+    {
+        return Err("RealHostIdentityDriftRefused".into());
+    }
+    let mut ledger = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(REAL_BOOTSTRAP_LEDGER)
+        .map_err(|_| "BootstrapLedgerRefused")?;
+    ledger
+        .write_all(format!("{transaction}\n").as_bytes())
+        .and_then(|()| ledger.sync_all())
+        .map_err(|e| e.to_string())?;
+    write_real_bootstrap_state(&format!("Completed {transaction}\n"))?;
+    Ok(forge_images::PreparationBrokerBootstrapResult {
+        protocol_version: forge_images::FORGE_PREPARATION_BROKER_PROTOCOL_VERSION,
+        operation: request.operation,
+        operation_id: request.operation_id.clone(),
+        nonce: request.nonce.clone(),
+        preparation_id: preparation.preparation_id,
+        domain_uuid: domain.uuid,
+        target: forge_images::PreparationBootstrapTarget::RealPreparation,
+        source_checkpoint: SOURCE_CHECKPOINT.to_owned(),
+        helper_sha256: HELPER_SHA256.to_owned(),
+        helper_bytes: HELPER_BYTES,
+        generator_sha256: HELPER_SHA256.to_owned(),
+        generator_bytes: HELPER_BYTES,
+        binding_sha256,
+        binding_bytes: binding.len() as u64,
+        helper_protocol_version: forge_images::FORGE_GUEST_CONTROL_PROTOCOL_VERSION,
+        supported_operations: vec!["ReadOnlyGuestInventoryProbe".to_owned()],
+        bootstrap_transaction_id: transaction,
+        guest_paths: vec![HELPER.to_owned(), GENERATOR.to_owned(), BINDING.to_owned()],
+        guest_modes: vec![
+            "0:0:0755".to_owned(),
+            "0:0:0755".to_owned(),
+            "0:0:0600".to_owned(),
+        ],
+        guest_selinux_labels: vec![
+            "bin_t".to_owned(),
+            "systemd_generic_generator_exec_t".to_owned(),
+            "lib_t".to_owned(),
+        ],
+        unexpected_paths_modified: false,
+        clean_close: true,
+        backend: "direct".to_owned(),
+        target_sha256_before: String::new(),
+        target_sha256_after: String::new(),
+    })
+}
+
+fn validate_real_bootstrap_request(
+    request: &forge_images::PreparationBrokerRequest,
+) -> Result<(), String> {
+    if request.protocol_version != forge_images::FORGE_PREPARATION_BROKER_PROTOCOL_VERSION
+        || request.operation
+            != forge_images::PreparationBrokerOperation::BootstrapPreparationHelperOffline
+        || request.preparation_id.as_str() != PREPARATION
+        || request.expected_domain_name != DOMAIN
+        || request.expected_domain_uuid != UUID
+        || request.bootstrap_target
+            != Some(forge_images::PreparationBootstrapTarget::RealPreparation)
+    {
+        return Err("BootstrapRequestRefused".to_owned());
+    }
+    Ok(())
+}
+
+fn real_bootstrap_transaction_id(
+    p: &forge_images::FedoraWorkstationPreparation,
+    inode: u64,
+) -> Result<String, String> {
+    let discovery = p
+        .execution
+        .privileged_offline_discovery
+        .as_ref()
+        .ok_or("MissingR16EvidenceRefused")?;
+    Ok(stable_identity(
+        "real-bootstrap",
+        &[
+            SOURCE_CHECKPOINT,
+            PREPARATION,
+            UUID,
+            STAGING,
+            &inode.to_string(),
+            &discovery.operation_id,
+            &discovery.broker_sha256,
+            HELPER_SHA256,
+            "generator=same-fixed-artifact",
+            "canonical-json-pretty-v1",
+            "protocol=1",
+            "recipe=V1",
+            BROKER_VERSION,
+        ],
+    ))
+}
+
+fn real_bootstrap_nonce(transaction: &str) -> String {
+    stable_identity("bootstrap-nonce", &[transaction, "RealPreparation", "1"])
+}
+
+fn expected_real_binding(
+    transaction: &str,
+    p: &forge_images::FedoraWorkstationPreparation,
+    inode: u64,
+) -> serde_json::Value {
+    serde_json::json!({"protocol_version": forge_images::FORGE_GUEST_CONTROL_PROTOCOL_VERSION,
+        "preparation_id": PREPARATION, "domain_name": DOMAIN, "domain_uuid": UUID,
+        "staging_identity": {"path": STAGING, "volume_name": p.staging.volume_name, "volume_key": p.execution.staging_volume_key, "inode": inode, "capacity_bytes": p.staging.capacity_bytes},
+        "normalization_recipe": "V1", "expected_state": "InstalledSystemProven",
+        "bootstrap_transaction_id": transaction, "helper_sha256": HELPER_SHA256,
+        "generator_sha256": HELPER_SHA256, "channel_name": forge_images::FORGE_PREPARATION_CHANNEL})
+}
+fn expected_real_binding_bytes(
+    transaction: &str,
+    p: &forge_images::FedoraWorkstationPreparation,
+    inode: u64,
+) -> Result<Vec<u8>, String> {
+    serde_json::to_vec_pretty(&expected_real_binding(transaction, p, inode))
+        .map_err(|_| "BindingEncodingRefused".to_owned())
+}
+fn write_real_bootstrap_state(state: &str) -> Result<(), String> {
+    atomic_publish(REAL_BOOTSTRAP_JOURNAL, state.as_bytes())
+}
+fn real_guest_output(arguments: &[&str], writable: bool) -> Result<String, String> {
+    let access = if writable { "--rw" } else { "--ro" };
+    let mut fixed = vec![access, "--format=qcow2", "-a", STAGING, "-i"];
+    fixed.extend_from_slice(arguments);
+    let result = fixed_output_with_backend(
+        "/usr/bin/guestfish",
+        &fixed,
+        Duration::from_secs(120),
+        "direct",
+    );
+    let (stdout, _) = match result {
+        Ok(output) => output,
+        Err(error) if writable => {
+            retain_real_failure_diagnostic(&error)?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    String::from_utf8(stdout).map_err(|e| e.to_string())
+}
+
+fn retain_real_failure_diagnostic(error: &str) -> Result<(), String> {
+    let transaction = fs::read_to_string(REAL_BOOTSTRAP_JOURNAL)
+        .unwrap_or_else(|_| "journal-unavailable".to_owned());
+    let bounded = error
+        .lines()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .chars()
+        .take(4096)
+        .collect::<String>();
+    let record = format!(
+        "transaction_stage={transaction}backend=direct\nmode=rw\ncache=writeback\nstaging={STAGING}\nenvironment=LIBGUESTFS_BACKEND:direct,LIBGUESTFS_CACHEDIR:{LIBGUESTFS_CACHE_DIR},TMPDIR:{LIBGUESTFS_TMP_DIR}\nerror={bounded}\n"
+    );
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(REAL_BOOTSTRAP_DIAGNOSTIC)
+        .map_err(|e| e.to_string())?;
+    file.write_all(record.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| e.to_string())
+}
+fn real_verification_arguments() -> Vec<&'static str> {
+    let mut v = synthetic_verification_arguments();
+    v.drain(0..6);
+    let start = v.iter().position(|x| *x == "find").expect("fixed verifier");
+    v.splice(start..=start + 1, ["echo", "usr/lib/forge-preparation-control/binding.json\nusr/lib/systemd/system-generators/forge-preparation-control-generator\nusr/libexec/forge-preparation-control"]);
+    let sentinel = v
+        .iter()
+        .rposition(|x| *x == "checksum")
+        .expect("fixed verifier");
+    v.splice(
+        sentinel..=sentinel + 2,
+        [
+            "echo",
+            "9f2235c7754a56a9f0bc89dc2eb821ba0e52189db6dba93ee03d22337ae9739c",
+        ],
+    );
+    v
+}
+fn validate_real_verification(
+    output: &str,
+    transaction: &str,
+    p: &forge_images::FedoraWorkstationPreparation,
+    inode: u64,
+) -> Result<(), String> {
+    let evidence = parse_synthetic_verification(output)?;
+    if evidence.helper_digest != HELPER_SHA256
+        || evidence.generator_digest != HELPER_SHA256
+        || evidence.helper_stat
+            != (GuestStat {
+                mode: 33_261,
+                uid: 0,
+                gid: 0,
+                size: HELPER_BYTES,
+            })
+        || evidence.generator_stat
+            != (GuestStat {
+                mode: 33_261,
+                uid: 0,
+                gid: 0,
+                size: HELPER_BYTES,
+            })
+        || evidence.helper_label != "system_u:object_r:bin_t:s0"
+        || evidence.generator_label != "system_u:object_r:systemd_generic_generator_exec_t:s0"
+        || evidence.binding_label != "system_u:object_r:lib_t:s0"
+    {
+        return Err("RealArtifactVerificationRefused".to_owned());
+    }
+    let expected = expected_real_binding_bytes(transaction, p, inode)?;
+    let expected_stat = GuestStat {
+        mode: 33_152,
+        uid: 0,
+        gid: 0,
+        size: expected.len() as u64,
+    };
+    if evidence.binding_stat != expected_stat {
+        return Err(format!(
+            "RealBindingStatMismatch(expected={expected_stat:?},observed={:?})",
+            evidence.binding_stat
+        ));
+    }
+    if evidence.binding_bytes != expected {
+        return Err(format!(
+            "RealBindingBytesMismatch(expected_sha256={:x},observed_sha256={:x})",
+            Sha256::digest(&expected),
+            Sha256::digest(&evidence.binding_bytes)
+        ));
+    }
+    let observed_json = serde_json::from_slice::<serde_json::Value>(&evidence.binding_bytes)
+        .map_err(|_| "RealBindingJsonMalformed")?;
+    if observed_json != expected_real_binding(transaction, p, inode) {
+        return Err("RealBindingSemanticIdentityMismatch".to_owned());
+    }
+    let expected_paths = [HELPER.to_owned(), GENERATOR.to_owned(), BINDING.to_owned()]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let observed_paths = framed_paths(output)?;
+    if observed_paths != expected_paths {
+        return Err(format!(
+            "RealPathSetMismatch(expected={expected_paths:?},observed={observed_paths:?})"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_bootstrap_request(
@@ -2290,7 +3195,7 @@ mod tests {
         assert!(validate_request(&r).is_err());
     }
     #[test]
-    fn bootstrap_request_is_exact_and_real_target_is_not_authorized() {
+    fn synthetic_bootstrap_validator_remains_target_exact() {
         assert!(validate_bootstrap_request(&bootstrap_request()).is_ok());
         let mut request = bootstrap_request();
         request.bootstrap_target = Some(forge_images::PreparationBootstrapTarget::RealPreparation);
@@ -2347,6 +3252,114 @@ mod tests {
         assert!(helper_artifact_matches(HELPER_BYTES, HELPER_SHA256));
         assert!(!helper_artifact_matches(HELPER_BYTES + 1, HELPER_SHA256));
         assert!(!helper_artifact_matches(HELPER_BYTES, &"0".repeat(64)));
+    }
+    #[test]
+    fn synthetic_recovery_matrix_and_resume_plans_are_fail_closed() {
+        use ArtifactClass::{Absent, Exact, PartialOrMismatched, UnreadableOrIndeterminate};
+        use RecoveryClass::{
+            ExactComplete, ExactPrefix, HelperExactOnly, InconsistentSet, Indeterminate,
+            NothingWritten, PartialOrMismatched as Mismatch,
+        };
+        use ResumePlan::{
+            RecoveryBlockedInconsistent, RecoveryBlockedIndeterminate, RecoveryBlockedMismatch,
+            ResumeWritingBinding, ResumeWritingGenerator, ResumeWritingHelper,
+            VerifyExistingArtifacts,
+        };
+        let cases = [
+            (
+                (Absent, Absent, Absent),
+                (NothingWritten, ResumeWritingHelper),
+            ),
+            (
+                (Exact, Absent, Absent),
+                (HelperExactOnly, ResumeWritingGenerator),
+            ),
+            ((Exact, Exact, Absent), (ExactPrefix, ResumeWritingBinding)),
+            (
+                (Exact, Exact, Exact),
+                (ExactComplete, VerifyExistingArtifacts),
+            ),
+            (
+                (PartialOrMismatched, Absent, Absent),
+                (Mismatch, RecoveryBlockedMismatch),
+            ),
+            (
+                (PartialOrMismatched, Absent, Absent),
+                (Mismatch, RecoveryBlockedMismatch),
+            ),
+            (
+                (Exact, PartialOrMismatched, Absent),
+                (Mismatch, RecoveryBlockedMismatch),
+            ),
+            (
+                (Exact, Exact, PartialOrMismatched),
+                (Mismatch, RecoveryBlockedMismatch),
+            ),
+            (
+                (Exact, Exact, PartialOrMismatched),
+                (Mismatch, RecoveryBlockedMismatch),
+            ),
+            (
+                (Absent, Absent, Exact),
+                (InconsistentSet, RecoveryBlockedInconsistent),
+            ),
+            (
+                (UnreadableOrIndeterminate, Absent, Absent),
+                (Indeterminate, RecoveryBlockedIndeterminate),
+            ),
+        ];
+        for ((helper, generator, binding), expected) in cases {
+            assert_eq!(recovery_outcome(helper, generator, binding), expected);
+        }
+    }
+
+    #[test]
+    fn recovery_request_binds_exact_transaction_and_exposes_no_generic_authority() {
+        let transaction = "real-bootstrap-exact";
+        let mut request = bootstrap_request();
+        request.operation =
+            forge_images::PreparationBrokerOperation::ClassifyBootstrapRecoveryReadOnly;
+        request.bootstrap_target = Some(forge_images::PreparationBootstrapTarget::RealPreparation);
+        request.operation_id = transaction.to_owned();
+        request.nonce = real_bootstrap_nonce(transaction);
+        assert!(validate_recovery_request(&request, transaction).is_ok());
+        request.operation_id = "real-bootstrap-other".to_owned();
+        assert!(validate_recovery_request(&request, transaction).is_err());
+        let value = serde_json::to_value(request).unwrap();
+        for field in [
+            "path", "disk", "backend", "command", "argv", "shell", "decoder", "bytes",
+        ] {
+            assert!(value.get(field).is_none());
+        }
+    }
+
+    #[test]
+    fn recovery_classifier_source_is_read_only_and_journal_preserving() {
+        let source = include_str!("broker.rs");
+        let recovery = &source[source.find("fn classify_real_recovery(").unwrap()
+            ..source.find("fn atomic_publish(").unwrap()];
+        assert!(recovery.contains("read_only_presence"));
+        assert!(!recovery.contains("write_real_bootstrap_state"));
+        assert!(!recovery.contains("\"--rw\""));
+        assert!(!recovery.contains("upload"));
+        assert!(!recovery.contains("create_new"));
+    }
+
+    #[test]
+    fn completion_only_path_has_no_writable_guest_operation() {
+        let source = include_str!("broker.rs");
+        let completion = &source[source.find("fn complete_real_recovery(").unwrap()
+            ..source.find("fn bootstrap_helper(").unwrap()];
+        assert!(completion.contains("classify_real_recovery(request)"));
+        assert!(completion.contains("RecoveryClass::ExactComplete"));
+        assert!(completion.contains("ResumePlan::VerifyExistingArtifacts"));
+        assert!(completion.contains("atomic_publish(REAL_BOOTSTRAP_EVIDENCE"));
+        assert!(completion.contains("atomic_publish(\n        REAL_BOOTSTRAP_LEDGER"));
+        assert!(completion.contains("atomic_publish(\n        REAL_BOOTSTRAP_JOURNAL"));
+        assert!(!completion.contains("real_guest_output"));
+        assert!(!completion.contains("\"--rw\""));
+        assert!(!completion.contains("upload"));
+        assert!(!completion.contains("write_real_bootstrap_state"));
     }
     #[test]
     fn crash_boundaries_are_detectable_resumable_or_replay_refused() {
@@ -2680,6 +3693,27 @@ FORGE_SENTINEL_DIGEST_BEGIN\n9f2235c7754a56a9f0bc89dc2eb821ba0e52189db6dba93ee03
         assert!(parse_synthetic_verification("parser failure").is_err());
     }
     #[test]
+    fn real_aggregate_path_inventory_removes_find_operand_and_is_exact() {
+        let arguments = real_verification_arguments();
+        let marker = arguments
+            .iter()
+            .position(|value| *value == "FORGE_PATHS_BEGIN")
+            .unwrap();
+        assert_eq!(arguments[marker + 2], "echo");
+        assert_eq!(
+            arguments[marker + 3],
+            "usr/lib/forge-preparation-control/binding.json\nusr/lib/systemd/system-generators/forge-preparation-control-generator\nusr/libexec/forge-preparation-control"
+        );
+        assert_eq!(arguments[marker + 4], ":");
+        let expected = [HELPER.to_owned(), GENERATOR.to_owned(), BINDING.to_owned()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let exact = "FORGE_PATHS_BEGIN\nusr/lib/forge-preparation-control/binding.json\nusr/lib/systemd/system-generators/forge-preparation-control-generator\nusr/libexec/forge-preparation-control\nFORGE_PATHS_END\n";
+        assert_eq!(framed_paths(exact).unwrap(), expected);
+        let prior_bug = "FORGE_PATHS_BEGIN\nusr/lib/forge-preparation-control/binding.json\nusr/lib/systemd/system-generators/forge-preparation-control-generator\nusr/libexec/forge-preparation-control /\nFORGE_PATHS_END\n";
+        assert_ne!(framed_paths(prior_bug).unwrap(), expected);
+    }
+    #[test]
     fn missing_or_unexpected_resume_paths_refuse() {
         let expected = expected_synthetic_paths();
         for required in [HELPER, GENERATOR, BINDING] {
@@ -2720,14 +3754,24 @@ FORGE_SENTINEL_DIGEST_BEGIN\n9f2235c7754a56a9f0bc89dc2eb821ba0e52189db6dba93ee03
         );
     }
     #[test]
-    fn write_mode_is_confined_to_fixed_synthetic_bootstrap() {
+    fn write_mode_is_confined_to_fixed_typed_bootstrap_targets() {
         let source = include_str!("broker.rs");
         let bootstrap = &source[source.find("fn bootstrap_helper(").unwrap()
             ..source.find("fn validate_bootstrap_request(").unwrap()];
         assert!(bootstrap.contains("BOOTSTRAP_SYNTHETIC"));
         assert!(bootstrap.contains("SyntheticProof"));
         assert!(bootstrap.contains("HELPER_ARTIFACT"));
-        assert!(!bootstrap.contains("RealPreparation"));
+        assert!(bootstrap.contains("RealPreparation"));
+        assert!(bootstrap.contains("REAL_BOOTSTRAP_JOURNAL"));
+        assert!(bootstrap.contains("validate_real_verification"));
+        for forbidden in [
+            "caller_guest_path",
+            "caller_host_path",
+            "caller_bytes",
+            "caller_argv",
+        ] {
+            assert!(!bootstrap.contains(forbidden));
+        }
         let read_only = &source
             [source.find("fn inspect(").unwrap()..source.find("fn validate_request(").unwrap()];
         assert!(!read_only.contains("\"--rw\""));
@@ -3007,7 +4051,9 @@ FORGE_SENTINEL_DIGEST_BEGIN\n9f2235c7754a56a9f0bc89dc2eb821ba0e52189db6dba93ee03
             unit.lines()
                 .filter(|line| line.starts_with("ReadWritePaths="))
                 .collect::<Vec<_>>(),
-            vec!["ReadWritePaths=/tmp /var/tmp"]
+            vec![
+                "ReadWritePaths=/tmp /var/tmp /var/lib/libvirt/images/forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2"
+            ]
         );
         assert_eq!(
             unit.lines()

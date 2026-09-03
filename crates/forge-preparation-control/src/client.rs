@@ -14,6 +14,7 @@ const STAGING: &str =
     "/var/lib/libvirt/images/forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2";
 const SOURCE_CHECKPOINT: &str = "6c4838512e468a1d3c7bb7e21376928dfc7f6b4e";
 const HELPER_SHA256: &str = "bb546fa9bf6efc11bde7687cba792421afc46616287a4fa468eadf3a7d0ad4a2";
+const BINDING_SHA256: &str = "64f3a73901f9770661263bae1bdd3a6b1d100d165e6545345d8c45cf07720115";
 
 fn main() -> ExitCode {
     let arguments = env::args().collect::<Vec<_>>();
@@ -23,8 +24,16 @@ fn main() -> ExitCode {
         Some("direct-self-test") => direct_self_test(),
         Some("inspect") => inspect(),
         Some("bootstrap-synthetic") => bootstrap_synthetic(),
+        Some("bootstrap-real") => bootstrap_real(
+            forge_images::PreparationBrokerOperation::BootstrapPreparationHelperOffline,
+        ),
+        Some("complete-real") => bootstrap_real(
+            forge_images::PreparationBrokerOperation::CompleteBootstrapRecoveryHostOnly,
+        ),
+        Some("probe-real-replay") => probe_real_replay(),
+        Some("classify-real-recovery") => classify_real_recovery(),
         _ => Err(
-            "usage: forge-broker-client self-test|appliance-self-test|direct-self-test|inspect|bootstrap-synthetic"
+            "usage: forge-broker-client self-test|appliance-self-test|direct-self-test|inspect|bootstrap-synthetic|bootstrap-real|classify-real-recovery|complete-real|probe-real-replay"
                 .to_owned(),
         ),
     };
@@ -35,6 +44,263 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn classify_real_recovery() -> Result<(), String> {
+    let home = env::var_os("HOME").ok_or("HOME unavailable")?;
+    let state_path = forge_images::fedora_workstation_preparation_state_path(Path::new(&home));
+    let preparation = forge_images::read_fedora_workstation_preparation(&state_path)
+        .map_err(|e| e.to_string())?
+        .ok_or("preparation absent")?;
+    let discovery = preparation
+        .execution
+        .privileged_offline_discovery
+        .as_ref()
+        .ok_or("R16 evidence absent")?;
+    if preparation.status != forge_images::FedoraWorkstationPreparationStatus::InstalledSystemProven
+        || preparation.preparation_id.as_str() != PREPARATION
+        || preparation.installer.uuid != UUID
+        || preparation.staging.path != Path::new(STAGING)
+        || preparation.execution.helper_bootstrap.is_some()
+        || preparation.execution.preparation_channel.is_some()
+        || discovery.backend != "direct"
+    {
+        return Err("client-side recovery binding refused".to_owned());
+    }
+    let transaction = identity(
+        "real-bootstrap",
+        &[
+            SOURCE_CHECKPOINT,
+            PREPARATION,
+            UUID,
+            STAGING,
+            "445745",
+            &discovery.operation_id,
+            &discovery.broker_sha256,
+            HELPER_SHA256,
+            "generator=same-fixed-artifact",
+            "canonical-json-pretty-v1",
+            "protocol=1",
+            "recipe=V1",
+            "forge-preparation-broker/1",
+        ],
+    );
+    let request = forge_images::PreparationBrokerRequest {
+        protocol_version: forge_images::FORGE_PREPARATION_BROKER_PROTOCOL_VERSION,
+        operation: forge_images::PreparationBrokerOperation::ClassifyBootstrapRecoveryReadOnly,
+        preparation_id: preparation.preparation_id,
+        expected_domain_name: DOMAIN.to_owned(),
+        expected_domain_uuid: UUID.to_owned(),
+        bootstrap_target: Some(forge_images::PreparationBootstrapTarget::RealPreparation),
+        operation_id: transaction.clone(),
+        nonce: identity("bootstrap-nonce", &[&transaction, "RealPreparation", "1"]),
+    };
+    let mut payload = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    payload.push(b'\n');
+    match parse_response(&exchange(&payload)?)? {
+        forge_images::PreparationBrokerResponse::RecoveryClassificationSuccess { result }
+            if result.bootstrap_transaction_id == transaction
+                && result.operation_id == transaction
+                && result.read_only
+                && result.clean_close
+                && result.host_metadata_unchanged =>
+        {
+            println!(
+                "BROKER_REAL_RECOVERY_CLASSIFICATION={}",
+                serde_json::to_string(&result).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        forge_images::PreparationBrokerResponse::Refusal { error_code }
+        | forge_images::PreparationBrokerResponse::InternalError { error_code } => Err(format!(
+            "broker recovery classification failure: {error_code}"
+        )),
+        _ => Err("unexpected recovery classification response".to_owned()),
+    }
+}
+
+fn probe_real_replay() -> Result<(), String> {
+    let home = env::var_os("HOME").ok_or("HOME unavailable")?;
+    let state_path = forge_images::fedora_workstation_preparation_state_path(Path::new(&home));
+    let preparation = forge_images::read_fedora_workstation_preparation(&state_path)
+        .map_err(|e| e.to_string())?
+        .ok_or("preparation absent")?;
+    let discovery = preparation
+        .execution
+        .privileged_offline_discovery
+        .as_ref()
+        .ok_or("R16 evidence absent")?;
+    if preparation.preparation_id.as_str() != PREPARATION
+        || preparation.installer.uuid != UUID
+        || preparation.staging.path != Path::new(STAGING)
+        || preparation.execution.helper_bootstrap.is_none()
+        || preparation.execution.preparation_channel.is_some()
+        || discovery.backend != "direct"
+    {
+        return Err("client-side replay binding refused".to_owned());
+    }
+    let transaction = identity(
+        "real-bootstrap",
+        &[
+            SOURCE_CHECKPOINT,
+            PREPARATION,
+            UUID,
+            STAGING,
+            "445745",
+            &discovery.operation_id,
+            &discovery.broker_sha256,
+            HELPER_SHA256,
+            "generator=same-fixed-artifact",
+            "canonical-json-pretty-v1",
+            "protocol=1",
+            "recipe=V1",
+            "forge-preparation-broker/1",
+        ],
+    );
+    let request = forge_images::PreparationBrokerRequest {
+        protocol_version: forge_images::FORGE_PREPARATION_BROKER_PROTOCOL_VERSION,
+        operation: forge_images::PreparationBrokerOperation::CompleteBootstrapRecoveryHostOnly,
+        preparation_id: preparation.preparation_id,
+        expected_domain_name: DOMAIN.to_owned(),
+        expected_domain_uuid: UUID.to_owned(),
+        bootstrap_target: Some(forge_images::PreparationBootstrapTarget::RealPreparation),
+        operation_id: transaction.clone(),
+        nonce: identity("bootstrap-nonce", &[&transaction, "RealPreparation", "1"]),
+    };
+    let mut payload = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    payload.push(b'\n');
+    match parse_response(&exchange(&payload)?)? {
+        forge_images::PreparationBrokerResponse::Refusal { error_code }
+            if error_code == "ReplayRefused" =>
+        {
+            println!("BROKER_REAL_COMPLETION_REPLAY=ReplayRefused");
+            Ok(())
+        }
+        forge_images::PreparationBrokerResponse::Refusal { error_code }
+        | forge_images::PreparationBrokerResponse::InternalError { error_code } => {
+            Err(format!("unexpected replay refusal: {error_code}"))
+        }
+        _ => Err("completed transaction replay was not refused".to_owned()),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn bootstrap_real(operation: forge_images::PreparationBrokerOperation) -> Result<(), String> {
+    let home = env::var_os("HOME").ok_or("HOME unavailable")?;
+    let state_path = forge_images::fedora_workstation_preparation_state_path(Path::new(&home));
+    let mut preparation = forge_images::read_fedora_workstation_preparation(&state_path)
+        .map_err(|e| e.to_string())?
+        .ok_or("preparation absent")?;
+    let discovery = preparation
+        .execution
+        .privileged_offline_discovery
+        .as_ref()
+        .ok_or("R16 evidence absent")?;
+    if preparation.status != forge_images::FedoraWorkstationPreparationStatus::InstalledSystemProven
+        || preparation.preparation_id.as_str() != PREPARATION
+        || preparation.installer.uuid != UUID
+        || preparation.staging.path != Path::new(STAGING)
+        || preparation.execution.helper_bootstrap.is_some()
+        || preparation.execution.preparation_channel.is_some()
+        || discovery.backend != "direct"
+    {
+        return Err("client-side real bootstrap binding refused".to_owned());
+    }
+    let transaction = identity(
+        "real-bootstrap",
+        &[
+            SOURCE_CHECKPOINT,
+            PREPARATION,
+            UUID,
+            STAGING,
+            "445745",
+            &discovery.operation_id,
+            &discovery.broker_sha256,
+            HELPER_SHA256,
+            "generator=same-fixed-artifact",
+            "canonical-json-pretty-v1",
+            "protocol=1",
+            "recipe=V1",
+            "forge-preparation-broker/1",
+        ],
+    );
+    let nonce = identity("bootstrap-nonce", &[&transaction, "RealPreparation", "1"]);
+    let request = forge_images::PreparationBrokerRequest {
+        protocol_version: forge_images::FORGE_PREPARATION_BROKER_PROTOCOL_VERSION,
+        operation,
+        preparation_id: preparation.preparation_id.clone(),
+        expected_domain_name: DOMAIN.to_owned(),
+        expected_domain_uuid: UUID.to_owned(),
+        bootstrap_target: Some(forge_images::PreparationBootstrapTarget::RealPreparation),
+        operation_id: transaction.clone(),
+        nonce,
+    };
+    let mut payload = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    payload.push(b'\n');
+    let result = match parse_response(&exchange(&payload)?)? {
+        forge_images::PreparationBrokerResponse::BootstrapSuccess { result } => *result,
+        forge_images::PreparationBrokerResponse::Refusal { error_code }
+        | forge_images::PreparationBrokerResponse::InternalError { error_code } => {
+            return Err(format!("broker bootstrap failure: {error_code}"));
+        }
+        _ => return Err("unexpected bootstrap response".to_owned()),
+    };
+    if result.target != forge_images::PreparationBootstrapTarget::RealPreparation
+        || result.operation != operation
+        || result.bootstrap_transaction_id != transaction
+        || result.operation_id != transaction
+        || !result.clean_close
+        || result.unexpected_paths_modified
+        || result.backend != "direct"
+        || result.helper_sha256 != HELPER_SHA256
+        || result.generator_sha256 != HELPER_SHA256
+        || result.binding_sha256 != BINDING_SHA256
+        || result.helper_bytes != 784_624
+        || result.generator_bytes != 784_624
+        || result.binding_bytes != 975
+        || result.guest_paths
+            != [
+                forge_images::FORGE_PREPARATION_HELPER_PATH,
+                forge_images::FORGE_PREPARATION_GENERATOR_PATH,
+                forge_images::FORGE_PREPARATION_BINDING_PATH,
+            ]
+        || result.guest_modes != ["0:0:0755", "0:0:0755", "0:0:0600"]
+        || result.guest_selinux_labels != ["bin_t", "systemd_generic_generator_exec_t", "lib_t"]
+    {
+        return Err("real bootstrap proof refused".to_owned());
+    }
+    preparation.execution.helper_bootstrap = Some(forge_images::PreparationHelperBootstrap {
+        preparation_id: preparation.preparation_id.clone(),
+        domain_uuid: UUID.to_owned(),
+        staging_path: preparation.staging.path.clone(),
+        helper_sha256: result.helper_sha256.clone(),
+        helper_bytes: result.helper_bytes,
+        generator_sha256: result.generator_sha256.clone(),
+        generator_bytes: result.generator_bytes,
+        binding_sha256: result.binding_sha256.clone(),
+        binding_bytes: result.binding_bytes,
+        helper_protocol_version: result.helper_protocol_version,
+        bootstrap_transaction_id: transaction,
+        guest_installation_path: forge_images::FORGE_PREPARATION_HELPER_PATH.into(),
+        persistent_activation_path: forge_images::FORGE_PREPARATION_GENERATOR_PATH.into(),
+        temporary_activation_path: "/run/systemd/system/forge-preparation-control.service".into(),
+        channel_name: forge_images::FORGE_PREPARATION_CHANNEL.to_owned(),
+        expected_state: forge_images::FedoraWorkstationPreparationStatus::InstalledSystemProven,
+        cleanup_inventory: forge_images::guest_channel_cleanup_inventory(),
+        guest_paths: result.guest_paths.iter().map(Into::into).collect(),
+        guest_modes: result.guest_modes.clone(),
+        guest_selinux_labels: result.guest_selinux_labels.clone(),
+        structured_verification_proven: true,
+        clean_close: true,
+        unexpected_paths_modified: false,
+    });
+    forge_images::update_fedora_workstation_preparation(&state_path, &preparation)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "BROKER_BOOTSTRAP_REAL_PROOF={}",
+        serde_json::to_string(&result).map_err(|e| e.to_string())?
+    );
+    Ok(())
 }
 
 fn bootstrap_synthetic() -> Result<(), String> {
@@ -226,6 +492,9 @@ fn inspect() -> Result<(), String> {
         }
         forge_images::PreparationBrokerResponse::BootstrapSuccess { .. } => {
             return Err("unexpected bootstrap response".to_owned());
+        }
+        forge_images::PreparationBrokerResponse::RecoveryClassificationSuccess { .. } => {
+            return Err("unexpected recovery classification response".to_owned());
         }
     };
     let evidence =
