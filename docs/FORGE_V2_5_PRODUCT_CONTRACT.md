@@ -547,6 +547,23 @@ and corrupt state. A clean close publishes one bound
 injection, preparation channel, normalization, promotion or canonical-base
 authority.
 
+Phase 4.6B2 adds exactly one controlled write capability beyond that read-only
+checkpoint: an offline bootstrap transaction whose only accepted target is a
+fixed broker-owned synthetic qcow2. The broker fixes the direct backend, host
+helper provenance, guest helper/generator/binding paths, canonical binding JSON,
+ownership, modes, and SELinux labels; callers cannot supply a shell, argv,
+command, backend, disk path, host path, guest path, decoder, encoding, or
+artifact identity. Verification requires an exact path set, helper and generator
+digests and stats, SELinux labels, and binding bytes transported in structured
+frames through broker-selected base64, strictly decoded and compared byte for
+byte and by SHA-256 before independent JSON semantic verification. A durable
+journal supports verification-only recovery of the same transaction, while a
+create-once success ledger and replay refusal permit exactly one completion.
+This proves only the synthetic write boundary: real Fedora staging has not been
+mutated, the real helper and preparation channel remain absent, and normalization
+and canonical-base creation remain unauthorized. One real helper injection is
+safe to review only after the Phase 4.6B2 checkpoint; it has not been executed.
+
 After the guest checklist and controlled shutdown, a dedicated read-only image
 inspection appliance (not an ad-hoc host mount) verifies OS release/product,
 accounts, first-use state, machine/D-Bus/hostname/network/SSH identity, package

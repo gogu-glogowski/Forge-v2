@@ -10,6 +10,10 @@ const SOCKET: &str = "/run/forge-preparation-broker/broker.sock";
 const PREPARATION: &str = "5d87db391be74e86bd0c7dca042295c3";
 const DOMAIN: &str = "forge-prepare-fedora-workstation-44-1.7-5d87db39";
 const UUID: &str = "ae82467d-10dd-4d33-b6ab-52f67e11e795";
+const STAGING: &str =
+    "/var/lib/libvirt/images/forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2";
+const SOURCE_CHECKPOINT: &str = "6c4838512e468a1d3c7bb7e21376928dfc7f6b4e";
+const HELPER_SHA256: &str = "bb546fa9bf6efc11bde7687cba792421afc46616287a4fa468eadf3a7d0ad4a2";
 
 fn main() -> ExitCode {
     let arguments = env::args().collect::<Vec<_>>();
@@ -18,8 +22,9 @@ fn main() -> ExitCode {
         Some("appliance-self-test") => appliance_self_test(),
         Some("direct-self-test") => direct_self_test(),
         Some("inspect") => inspect(),
+        Some("bootstrap-synthetic") => bootstrap_synthetic(),
         _ => Err(
-            "usage: forge-broker-client self-test|appliance-self-test|direct-self-test|inspect"
+            "usage: forge-broker-client self-test|appliance-self-test|direct-self-test|inspect|bootstrap-synthetic"
                 .to_owned(),
         ),
     };
@@ -29,6 +34,45 @@ fn main() -> ExitCode {
             eprintln!("forge-broker-client: {error}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn bootstrap_synthetic() -> Result<(), String> {
+    let home = env::var_os("HOME").ok_or("HOME unavailable")?;
+    let state_path = forge_images::fedora_workstation_preparation_state_path(Path::new(&home));
+    let preparation = forge_images::read_fedora_workstation_preparation(&state_path)
+        .map_err(|e| e.to_string())?
+        .ok_or("preparation absent")?;
+    let transaction = identity(
+        "bootstrap",
+        &[SOURCE_CHECKPOINT, PREPARATION, UUID, STAGING, HELPER_SHA256],
+    );
+    let nonce = identity("bootstrap-nonce", &[&transaction, "SyntheticProof", "1"]);
+    let request = forge_images::PreparationBrokerRequest {
+        protocol_version: forge_images::FORGE_PREPARATION_BROKER_PROTOCOL_VERSION,
+        operation: forge_images::PreparationBrokerOperation::BootstrapPreparationHelperOffline,
+        preparation_id: preparation.preparation_id,
+        expected_domain_name: DOMAIN.to_owned(),
+        expected_domain_uuid: UUID.to_owned(),
+        bootstrap_target: Some(forge_images::PreparationBootstrapTarget::SyntheticProof),
+        operation_id: transaction,
+        nonce,
+    };
+    let mut payload = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    payload.push(b'\n');
+    match parse_response(&exchange(&payload)?)? {
+        forge_images::PreparationBrokerResponse::BootstrapSuccess { result } => {
+            println!(
+                "BROKER_BOOTSTRAP_SYNTHETIC_PROOF={}",
+                serde_json::to_string(&result).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        forge_images::PreparationBrokerResponse::Refusal { error_code }
+        | forge_images::PreparationBrokerResponse::InternalError { error_code } => {
+            Err(format!("broker bootstrap failure: {error_code}"))
+        }
+        _ => Err("unexpected bootstrap response".to_owned()),
     }
 }
 
@@ -150,6 +194,7 @@ fn inspect() -> Result<(), String> {
         preparation_id: preparation.preparation_id.clone(),
         expected_domain_name: DOMAIN.to_owned(),
         expected_domain_uuid: UUID.to_owned(),
+        bootstrap_target: None,
         operation_id,
         nonce,
     };
@@ -178,6 +223,9 @@ fn inspect() -> Result<(), String> {
                 "broker identity refusal: {error_code}: {}",
                 serde_json::to_string(&diagnostics).map_err(|e| e.to_string())?
             ));
+        }
+        forge_images::PreparationBrokerResponse::BootstrapSuccess { .. } => {
+            return Err("unexpected bootstrap response".to_owned());
         }
     };
     let evidence =

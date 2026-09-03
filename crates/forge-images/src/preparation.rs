@@ -611,6 +611,13 @@ pub const FORGE_PREPARATION_BROKER_PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreparationBrokerOperation {
     InspectFedoraWorkstationPreparation,
+    BootstrapPreparationHelperOffline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PreparationBootstrapTarget {
+    SyntheticProof,
+    RealPreparation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -636,8 +643,36 @@ pub struct PreparationBrokerRequest {
     pub preparation_id: FedoraWorkstationPreparationId,
     pub expected_domain_name: String,
     pub expected_domain_uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_target: Option<PreparationBootstrapTarget>,
     pub operation_id: String,
     pub nonce: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparationBrokerBootstrapResult {
+    pub protocol_version: u32,
+    pub operation: PreparationBrokerOperation,
+    pub operation_id: String,
+    pub nonce: String,
+    pub preparation_id: FedoraWorkstationPreparationId,
+    pub domain_uuid: String,
+    pub target: PreparationBootstrapTarget,
+    pub source_checkpoint: String,
+    pub helper_sha256: String,
+    pub helper_bytes: u64,
+    pub helper_protocol_version: u32,
+    pub supported_operations: Vec<String>,
+    pub bootstrap_transaction_id: String,
+    pub guest_paths: Vec<String>,
+    pub guest_modes: Vec<String>,
+    pub guest_selinux_labels: Vec<String>,
+    pub unexpected_paths_modified: bool,
+    pub clean_close: bool,
+    pub backend: String,
+    pub target_sha256_before: String,
+    pub target_sha256_after: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -746,6 +781,9 @@ pub enum PreparationBrokerResponse {
         error_code: String,
         diagnostics: PreparationGuestIdentityDiagnostics,
     },
+    BootstrapSuccess {
+        result: PreparationBrokerBootstrapResult,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -788,6 +826,7 @@ pub fn prove_privileged_offline_fedora_discovery(
         || request.preparation_id != preparation.preparation_id
         || request.expected_domain_name != preparation.installer.name
         || request.expected_domain_uuid != preparation.installer.uuid
+        || request.bootstrap_target.is_some()
         || request.operation_id.len() < 16
         || request.nonce.len() < 32
         || result.protocol_version != request.protocol_version
@@ -3397,6 +3436,7 @@ mod tests {
             preparation_id: preparation.preparation_id.clone(),
             expected_domain_name: preparation.installer.name.clone(),
             expected_domain_uuid: preparation.installer.uuid.clone(),
+            bootstrap_target: None,
             operation_id: "broker-operation-0001".to_owned(),
             nonce: "broker-nonce-00000000000000000000".to_owned(),
         }
