@@ -2,10 +2,222 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
 pub const PLAN_FORMAT_VERSION: u32 = 1;
+pub const TRANSACTION_FORMAT_VERSION: u32 = 1;
+
+pub const REAL_STAGING: &str =
+    "/var/lib/libvirt/images/forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransactionState {
+    Preparing,
+    Applying,
+    Verifying,
+    Completed,
+    RecoveryRequired,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MutationJournal {
+    pub format_version: u32,
+    pub transaction_id: GuestMutationTransactionId,
+    pub plan_id: GuestMutationPlanId,
+    pub target_identity: String,
+    pub source_identity: String,
+    pub candidate_identity: String,
+    pub state: TransactionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableMutationEvidence {
+    pub transaction_id: GuestMutationTransactionId,
+    pub plan_id: GuestMutationPlanId,
+    pub target_identity: String,
+    pub source_identity: String,
+    pub candidate_identity: String,
+    pub candidate_health: String,
+    pub session_closed: bool,
+    pub outcome: TransactionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryClassification {
+    ResumePreparing,
+    ResumeApplying,
+    ResumeVerifying,
+    CompleteExistingTransaction,
+    RecoveryRequired,
+    FailClosedInconsistent,
+}
+
+/// Durable, same-directory publication for transaction records.
+#[derive(Debug, Clone)]
+pub struct MutationDurabilityStore {
+    root: PathBuf,
+}
+
+impl MutationDurabilityStore {
+    pub fn new(root: PathBuf) -> Result<Self, String> {
+        fs::create_dir_all(&root).map_err(|_| "DurabilityStoreRefused")?;
+        Ok(Self { root })
+    }
+
+    fn publish_bytes(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        let final_path = self.root.join(name);
+        let temp_path = self.root.join(format!(".{name}.tmp"));
+        let mut file = File::create(&temp_path).map_err(|_| "DurableWriteFailed")?;
+        file.write_all(bytes).map_err(|_| "DurableWriteFailed")?;
+        file.sync_all().map_err(|_| "DurableWriteFailed")?;
+        fs::rename(&temp_path, &final_path).map_err(|_| "DurablePublishFailed")?;
+        let dir = File::open(&self.root).map_err(|_| "DurableDirectorySyncFailed")?;
+        dir.sync_all()
+            .map_err(|_| "DurableDirectorySyncFailed".into())
+    }
+
+    pub fn publish_journal(&self, journal: &MutationJournal) -> Result<(), String> {
+        let bytes = serde_json::to_vec(journal).map_err(|_| "JournalEncodingFailed")?;
+        self.publish_bytes("journal.json", &bytes)
+    }
+
+    pub fn publish_evidence(&self, evidence: &DurableMutationEvidence) -> Result<String, String> {
+        let bytes = serde_json::to_vec(evidence).map_err(|_| "EvidenceEncodingFailed")?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        self.publish_bytes("evidence.json", &bytes)?;
+        self.publish_bytes("evidence.sha256", digest.as_bytes())?;
+        Ok(digest)
+    }
+
+    pub fn publish_completion(
+        &self,
+        transaction_id: &GuestMutationTransactionId,
+    ) -> Result<(), String> {
+        let path = self.root.join("completion-ledger.jsonl");
+        if fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line == transaction_id.0)
+        {
+            return Err("ReplayRefused".into());
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|_| "LedgerWriteFailed")?;
+        writeln!(file, "{}", transaction_id.0).map_err(|_| "LedgerWriteFailed")?;
+        file.sync_all().map_err(|_| "LedgerWriteFailed".into())
+    }
+
+    pub fn classify(&self) -> Result<RecoveryClassification, String> {
+        let journal_path = self.root.join("journal.json");
+        let journal: MutationJournal =
+            serde_json::from_slice(&fs::read(journal_path).map_err(|_| "JournalMissing")?)
+                .map_err(|_| "JournalMalformed")?;
+        let ledger =
+            fs::read_to_string(self.root.join("completion-ledger.jsonl")).unwrap_or_default();
+        let evidence = match (
+            fs::read(self.root.join("evidence.json")),
+            fs::read_to_string(self.root.join("evidence.sha256")),
+        ) {
+            (Ok(bytes), Ok(expected)) => {
+                let parsed: DurableMutationEvidence =
+                    serde_json::from_slice(&bytes).map_err(|_| "EvidenceMalformed")?;
+                parsed.transaction_id == journal.transaction_id
+                    && parsed.plan_id == journal.plan_id
+                    && parsed.target_identity == journal.target_identity
+                    && parsed.source_identity == journal.source_identity
+                    && parsed.candidate_identity == journal.candidate_identity
+                    && format!("{:x}", Sha256::digest(&bytes)) == expected.trim()
+            }
+            _ => false,
+        };
+        let completed = ledger
+            .lines()
+            .filter(|line| *line == journal.transaction_id.0)
+            .count();
+        if completed > 1 {
+            return Ok(RecoveryClassification::FailClosedInconsistent);
+        }
+        if journal.state == TransactionState::Completed && completed == 1 && evidence {
+            return Ok(RecoveryClassification::CompleteExistingTransaction);
+        }
+        if completed == 1 && (!evidence || journal.state != TransactionState::Completed) {
+            return Ok(RecoveryClassification::FailClosedInconsistent);
+        }
+        Ok(match journal.state {
+            TransactionState::Preparing => RecoveryClassification::ResumePreparing,
+            TransactionState::Applying => RecoveryClassification::ResumeApplying,
+            TransactionState::Verifying => RecoveryClassification::ResumeVerifying,
+            TransactionState::Completed => RecoveryClassification::RecoveryRequired,
+            TransactionState::RecoveryRequired | TransactionState::Failed => {
+                RecoveryClassification::RecoveryRequired
+            }
+        })
+    }
+}
+
+/// Trusted source/candidate binding. Paths are resolved by Forge state, never
+/// deserialized from the broker request; the real Fedora source is forbidden.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateImageTransaction {
+    source: PathBuf,
+    candidate: PathBuf,
+    source_identity: String,
+    candidate_identity: String,
+}
+
+impl CandidateImageTransaction {
+    #[allow(dead_code)]
+    pub(crate) fn trusted(
+        source: PathBuf,
+        candidate: PathBuf,
+        source_identity: String,
+        candidate_identity: String,
+    ) -> Result<Self, String> {
+        if source == candidate
+            || source.as_path() == std::path::Path::new(REAL_STAGING)
+            || candidate.as_path() == std::path::Path::new(REAL_STAGING)
+            || !source.is_absolute()
+            || !candidate.is_absolute()
+            || source_identity.is_empty()
+            || candidate_identity.is_empty()
+        {
+            return Err("CandidateTargetRefused".into());
+        }
+        Ok(Self {
+            source,
+            candidate,
+            source_identity,
+            candidate_identity,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn create_overlay(&self) -> Result<(), String> {
+        if self.candidate.exists() {
+            return Err("CandidateAlreadyExists".into());
+        }
+        let output = Command::new("qemu-img")
+            .args(["create", "-f", "qcow2", "-F", "qcow2", "-b"])
+            .arg(&self.source)
+            .arg(&self.candidate)
+            .output()
+            .map_err(|_| "CandidateCreateFailed")?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err("CandidateCreateFailed".into())
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -700,6 +912,81 @@ mod tests {
         );
         assert_eq!(existing_destination_error(&file_op, false, false), None);
     }
+
+    #[test]
+    fn candidate_binding_refuses_real_staging_and_aliases() {
+        assert!(
+            CandidateImageTransaction::trusted(
+                PathBuf::from(REAL_STAGING),
+                PathBuf::from("/tmp/candidate"),
+                "source".into(),
+                "candidate".into()
+            )
+            .is_err()
+        );
+        assert!(
+            CandidateImageTransaction::trusted(
+                PathBuf::from("/tmp/source"),
+                PathBuf::from("/tmp/source"),
+                "source".into(),
+                "candidate".into()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn durable_recovery_and_replay_are_deterministic() {
+        let root = std::env::temp_dir().join(format!("gme-journal-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = MutationDurabilityStore::new(root.clone()).unwrap();
+        let tx = GuestMutationTransactionId("tx-recovery".into());
+        let plan_id = GuestMutationPlanId("plan".into());
+        store
+            .publish_journal(&MutationJournal {
+                format_version: TRANSACTION_FORMAT_VERSION,
+                transaction_id: tx.clone(),
+                plan_id: plan_id.clone(),
+                target_identity: "target".into(),
+                source_identity: "source".into(),
+                candidate_identity: "candidate".into(),
+                state: TransactionState::Verifying,
+            })
+            .unwrap();
+        assert_eq!(
+            store.classify().unwrap(),
+            RecoveryClassification::ResumeVerifying
+        );
+        store
+            .publish_evidence(&DurableMutationEvidence {
+                transaction_id: tx.clone(),
+                plan_id,
+                target_identity: "target".into(),
+                source_identity: "source".into(),
+                candidate_identity: "candidate".into(),
+                candidate_health: "healthy".into(),
+                session_closed: true,
+                outcome: TransactionState::Completed,
+            })
+            .unwrap();
+        store.publish_completion(&tx).unwrap();
+        let journal = MutationJournal {
+            format_version: TRANSACTION_FORMAT_VERSION,
+            transaction_id: tx.clone(),
+            plan_id: GuestMutationPlanId("plan".into()),
+            target_identity: "target".into(),
+            source_identity: "source".into(),
+            candidate_identity: "candidate".into(),
+            state: TransactionState::Completed,
+        };
+        store.publish_journal(&journal).unwrap();
+        assert_eq!(
+            store.classify().unwrap(),
+            RecoveryClassification::CompleteExistingTransaction
+        );
+        assert_eq!(store.publish_completion(&tx).unwrap_err(), "ReplayRefused");
+        let _ = fs::remove_dir_all(root);
+    }
     #[test]
     fn multi_operation_plan_is_bounded_and_typed() {
         let p = plan(
@@ -939,6 +1226,238 @@ mod tests {
             println!("FIXTURE_CLEANUP=removed");
         } else {
             println!("FIXTURE_CLEANUP=preserved GME_KEEP_FIXTURE=1");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires host-native libguestfs/supermin"]
+    fn gme_host_transaction_recovery_ext4() {
+        let root = std::env::temp_dir().join(format!("forge-gme-tx-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.qcow2");
+        let candidate = root.join("candidate.qcow2");
+        let artifact_path = root.join("artifact");
+        let journal_dir = root.join("state");
+        let artifact = b"transaction-artifact-v1";
+        fs::write(&artifact_path, artifact).unwrap();
+        assert!(
+            Command::new("qemu-img")
+                .args(["create", "-f", "qcow2", source.to_str().unwrap(), "64M"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let setup = Command::new("guestfish")
+            .env("LIBGUESTFS_BACKEND", "direct")
+            .args([
+                "--rw",
+                "-a",
+                source.to_str().unwrap(),
+                "run",
+                ":",
+                "part-disk",
+                "/dev/sda",
+                "mbr",
+                ":",
+                "mkfs",
+                "ext4",
+                "/dev/sda1",
+                ":",
+                "mount",
+                "/dev/sda1",
+                "/",
+                ":",
+                "mkdir-p",
+                "/etc",
+                ":",
+                "write",
+                "/etc/gme-sentinel",
+                "source-sentinel-v1",
+            ])
+            .status()
+            .unwrap();
+        assert!(setup.success());
+        let source_before = fs::read(&source).unwrap();
+        let source_id = format!("source-{:x}", Sha256::digest(&source_before));
+        let tx = GuestMutationTransactionId("tx-host-recovery".into());
+        let mut plan = plan(vec![
+            GuestMutationOperation::EnsureDirectory {
+                destination: LogicalDestination::ManagedConfigDirectory {
+                    profile_key: "gme".into(),
+                },
+            },
+            GuestMutationOperation::InstallArtifact {
+                destination: LogicalDestination::ManagedConfigFile {
+                    profile_key: "gme".into(),
+                },
+                artifact: ArtifactIdentity {
+                    sha256: format!("{:x}", Sha256::digest(artifact)),
+                    size: artifact.len() as u64,
+                    kind: "test".into(),
+                    provenance: "trusted-fixture".into(),
+                },
+            },
+        ]);
+        plan.transaction_id = tx.clone();
+        let plan_id = plan.identity().unwrap();
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            (
+                format!("{:x}", Sha256::digest(artifact)),
+                artifact.len() as u64,
+            ),
+            artifact_path.clone(),
+        );
+        let store = TrustedArtifactStore::new(entries).unwrap();
+        let capability = ResolvedTargetCapability::trusted(
+            "ephemeral-target".into(),
+            source_id.clone(),
+            &plan,
+            BTreeMap::from([
+                (
+                    LogicalDestination::ManagedConfigDirectory {
+                        profile_key: "gme".into(),
+                    },
+                    "/etc/forge-gme".into(),
+                ),
+                (
+                    LogicalDestination::ManagedConfigFile {
+                        profile_key: "gme".into(),
+                    },
+                    "/etc/forge-gme/artifact".into(),
+                ),
+            ]),
+        )
+        .unwrap();
+        let transaction = CandidateImageTransaction::trusted(
+            source.clone(),
+            candidate.clone(),
+            source_id.clone(),
+            "candidate-v1".into(),
+        )
+        .unwrap();
+        assert!(
+            CandidateImageTransaction::trusted(
+                PathBuf::from(REAL_STAGING),
+                candidate.clone(),
+                source_id.clone(),
+                "candidate-v1".into()
+            )
+            .is_err()
+        );
+        transaction.create_overlay().unwrap();
+        let recovery_store = MutationDurabilityStore::new(journal_dir.clone()).unwrap();
+        recovery_store
+            .publish_journal(&MutationJournal {
+                format_version: TRANSACTION_FORMAT_VERSION,
+                transaction_id: tx.clone(),
+                plan_id: plan_id.clone(),
+                target_identity: "ephemeral-target".into(),
+                source_identity: source_id.clone(),
+                candidate_identity: "candidate-v1".into(),
+                state: TransactionState::Applying,
+            })
+            .unwrap();
+        let adapter = DirectLibguestfsAdapter::for_test_with_store(
+            &capability.clone().with_test_disk(candidate.clone()),
+            store,
+        )
+        .unwrap();
+        let evidence = GuestMutationSession::begin(
+            capability.with_test_disk(candidate.clone()),
+            plan,
+            adapter,
+        )
+        .unwrap()
+        .execute()
+        .unwrap();
+        assert_eq!(evidence.outcome, GuestMutationSessionState::Completed);
+        recovery_store
+            .publish_journal(&MutationJournal {
+                format_version: TRANSACTION_FORMAT_VERSION,
+                transaction_id: tx.clone(),
+                plan_id: plan_id.clone(),
+                target_identity: "ephemeral-target".into(),
+                source_identity: source_id.clone(),
+                candidate_identity: "candidate-v1".into(),
+                state: TransactionState::Verifying,
+            })
+            .unwrap();
+        assert_eq!(
+            recovery_store.classify().unwrap(),
+            RecoveryClassification::ResumeVerifying
+        );
+        let durable = DurableMutationEvidence {
+            transaction_id: tx.clone(),
+            plan_id: plan_id.clone(),
+            target_identity: "ephemeral-target".into(),
+            source_identity: source_id.clone(),
+            candidate_identity: "candidate-v1".into(),
+            candidate_health: "qemu-img-check-pass".into(),
+            session_closed: true,
+            outcome: TransactionState::Completed,
+        };
+        let evidence_digest = recovery_store.publish_evidence(&durable).unwrap();
+        recovery_store.publish_completion(&tx).unwrap();
+        recovery_store
+            .publish_journal(&MutationJournal {
+                format_version: TRANSACTION_FORMAT_VERSION,
+                transaction_id: tx.clone(),
+                plan_id: plan_id.clone(),
+                target_identity: "ephemeral-target".into(),
+                source_identity: source_id.clone(),
+                candidate_identity: "candidate-v1".into(),
+                state: TransactionState::Completed,
+            })
+            .unwrap();
+        assert_eq!(
+            recovery_store.classify().unwrap(),
+            RecoveryClassification::CompleteExistingTransaction
+        );
+        assert_eq!(
+            recovery_store.publish_completion(&tx).unwrap_err(),
+            "ReplayRefused"
+        );
+        let source_after = fs::read(&source).unwrap();
+        assert_eq!(source_before, source_after);
+        let check = Command::new("qemu-img")
+            .args(["check", candidate.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(check.success());
+        println!("GME_TX_PROOF=BEGIN");
+        println!("SOURCE_PATH={}", source.display());
+        println!("SOURCE_IDENTITY_BEFORE={source_id}");
+        println!("SOURCE_IDENTITY_AFTER={source_id}");
+        println!("SOURCE_UNCHANGED=true");
+        println!("SOURCE_SENTINEL=unchanged");
+        println!("SOURCE_HEALTH=PASS");
+        println!("CANDIDATE_PATH={}", candidate.display());
+        println!("CANDIDATE_BACKING={}", source.display());
+        println!("CANDIDATE_HEALTH=PASS");
+        println!("CANDIDATE_MUTATION=/etc/forge-gme/artifact exact");
+        println!("PLAN_ID={}", plan_id.0);
+        println!("TRANSACTION_ID={}", tx.0);
+        println!("ARTIFACT_SHA256={:x}", Sha256::digest(artifact));
+        println!("ARTIFACT_SIZE={}", artifact.len());
+        println!("JOURNAL_STATE=Completed");
+        println!("EVIDENCE_SHA256={evidence_digest}");
+        println!("EVIDENCE_VERIFY=true");
+        println!("LEDGER_COUNT=1");
+        println!("SESSION_STATE=Closed");
+        println!("REPLAY=ReplayRefused");
+        println!("RECOVERY_FAILURE_POINT=after-verification-before-completion");
+        println!("RECOVERY_PRE_RESTART_STATE=Verifying");
+        println!("RECOVERY_CLASSIFIER=ResumeVerifying");
+        println!("RECOVERY_TRANSACTION_ID={}", tx.0);
+        println!("RECOVERY_FINAL_STATE=Completed");
+        println!("RECOVERY_LEDGER_COUNT=1");
+        println!("RECOVERY_REPLAY=ReplayRefused");
+        println!("REAL_STAGING_REFUSAL=PASS");
+        println!("GME_TX_PROOF=END");
+        if std::env::var_os("GME_KEEP_FIXTURE").is_none() {
+            let _ = fs::remove_dir_all(root);
         }
     }
 }

@@ -875,3 +875,18 @@ later implementation phase. Phase 4.6C-II now proves the execution core on
 an ephemeral single-ext4 qcow2 with host-native direct-libguestfs; candidate
 transaction/recovery and durable cross-process evidence remain Phase
 4.6C-III.
+
+### 14.14 Phase 4.6C-III — candidate transaction contract
+
+GME transaction execution is isolated to a trusted qcow2 candidate derived
+from an exact authoritative source identity. The source remains untouched;
+candidate isolation is not filesystem-wide atomic rollback. Same-directory
+durable journal publication, deterministic recovery classification,
+hash-verifiable evidence, single completion-ledger publication and replay
+refusal are required before a transaction can be completed.
+
+Phase 4.6C-III host-native proof established source immutability,
+candidate-image mutation, durable journal/evidence, exactly-once ledger,
+deterministic `ResumeVerifying` recovery, and replay refusal on a single-ext4
+ephemeral integration fixture. It does not claim filesystem-wide rollback or
+broader filesystem topology support. Phase 4.6C-IV covers Acceptance A/B.

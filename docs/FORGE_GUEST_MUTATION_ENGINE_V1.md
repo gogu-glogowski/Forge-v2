@@ -220,3 +220,29 @@ unrelated-sentinel preservation, clean close, session-reuse refusal and image
 health were all proven. Real Fedora staging remained untouched. Broader
 ext4/xfs/btrfs/LVM topology coverage, candidate transaction/recovery and
 durable cross-process evidence remain Phase 4.6C-III work.
+
+## Phase 4.6C-III transaction contract
+
+Mutation is isolated to a trusted qcow2 candidate created from an exact
+source identity; the authoritative source is never opened writable by this
+layer. Candidate isolation is image-level rollback, not filesystem-wide
+atomic rollback: an unsuccessful candidate is discarded or classified for
+recovery, while promotion is a separate explicit state transition.
+
+Journal publication is same-directory temp-write, file `fsync`, atomic rename,
+and parent-directory `fsync`. Recovery uses only the journal, exact identities,
+evidence and completion ledger; guest contents alone never imply completion.
+Completed transactions have one ledger entry and replay is refused. Missing or
+inconsistent journal/evidence/ledger state is fail-closed. Failure injection is
+test-scoped and must leave the source untouched while classifying the candidate
+deterministically.
+
+### Phase 4.6C-III host proof result
+
+Host-native proof demonstrated authoritative source immutability, candidate-only
+mutation, durable journal and hash-verifiable evidence, exactly-one completion
+ledger publication, deterministic `ResumeVerifying` recovery, and replay
+refusal. The proof is limited to a single-ext4-root ephemeral integration
+fixture; it makes no filesystem-wide rollback claim. Real Fedora staging
+remained untouched. Broader filesystem topology and promotion semantics remain
+future work; Phase 4.6C-IV covers Acceptance A/B.
