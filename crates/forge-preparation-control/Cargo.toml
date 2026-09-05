@@ -20,6 +20,10 @@ path = "src/broker.rs"
 name = "forge-broker-client"
 path = "src/client.rs"
 
+[[bin]]
+name = "forge-image-verifier"
+path = "src/image_verifier.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

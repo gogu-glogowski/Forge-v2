@@ -346,6 +346,12 @@ pub enum GraphicalConfirmationDisposition {
     AlreadyPublished,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualInstallationConfirmationDisposition {
+    Confirmed,
+    AlreadyConfirmed,
+}
+
 #[allow(clippy::missing_errors_doc)]
 pub trait FedoraWorkstationPreparationBackend {
     fn inspect_pool(&mut self, name: &str) -> Result<PreparationPoolEvidence, String>;
@@ -395,6 +401,7 @@ pub enum InstallerStartDisposition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstalledDiskBootDisposition {
+    DiskOnlyPrepared,
     Started,
     AlreadyRunning,
 }
@@ -447,6 +454,67 @@ pub fn record_anaconda_installation_completed(
     preparation.status = FedoraWorkstationPreparationStatus::InstallationConfirmed;
     preparation.operator_confirmation_recorded = true;
     Ok(())
+}
+
+/// Records an explicit operator attestation for an installation performed
+/// outside Forge while preserving the fact that `InstallerRunning` was not
+/// observed. This transition performs host-side identity/topology checks only.
+///
+/// # Errors
+/// Refuses missing confirmation, non-`InstallerReady` state, identity or
+/// topology drift, unsafe storage, canonical collisions, or publication failure.
+pub fn confirm_manually_installed_from_installer_ready<B, P>(
+    backend: &mut B,
+    preparation: &mut FedoraWorkstationPreparation,
+    operator_confirmed: bool,
+    mut publish: P,
+) -> Result<ManualInstallationConfirmationDisposition, PreparationError>
+where
+    B: FedoraWorkstationPreparationBackend,
+    P: FnMut(&FedoraWorkstationPreparation) -> Result<(), String>,
+{
+    if preparation.status == FedoraWorkstationPreparationStatus::InstallationConfirmed
+        && preparation.operator_confirmation_recorded
+    {
+        return Ok(ManualInstallationConfirmationDisposition::AlreadyConfirmed);
+    }
+    if preparation.status != FedoraWorkstationPreparationStatus::InstallerReady
+        || !operator_confirmed
+    {
+        return Err(PreparationError::InvalidStateTransition);
+    }
+    let volume = backend
+        .inspect_volume("default", &preparation.staging.volume_name)
+        .map_err(PreparationError::Backend)?
+        .ok_or_else(|| PreparationError::Backend("staging volume absent".into()))?;
+    prove_staging(preparation, &volume)?;
+    if preparation.execution.staging_volume_key.as_deref() != Some(volume.key.as_str()) {
+        return Err(PreparationError::Backend(
+            "durable staging identity drift".into(),
+        ));
+    }
+    if backend
+        .canonical_base_exists("default", &preparation.canonical.volume_name)
+        .map_err(PreparationError::Backend)?
+    {
+        return Err(PreparationError::CanonicalBaseCollision);
+    }
+    let domain = backend
+        .inspect_installer_domain(&preparation.installer.name)
+        .map_err(PreparationError::Backend)?
+        .ok_or_else(|| PreparationError::Backend("installer domain absent".into()))?;
+    if domain.name != preparation.installer.name
+        || domain.uuid != preparation.installer.uuid
+        || !domain.shutoff
+        || domain.running
+    {
+        return Err(PreparationError::InstallationProofFailed);
+    }
+    prove_fedora_workstation_post_install_staging_topology(preparation, &domain)?;
+    preparation.status = FedoraWorkstationPreparationStatus::InstallationConfirmed;
+    preparation.operator_confirmation_recorded = true;
+    publish(preparation).map_err(PreparationError::Backend)?;
+    Ok(ManualInstallationConfirmationDisposition::Confirmed)
 }
 
 #[must_use]
@@ -2524,6 +2592,12 @@ where
         if !domain.shutoff {
             return Err(PreparationError::InstallationProofFailed);
         }
+        let manually_confirmed_attached = preparation.execution.runtime_iso.is_none();
+        if manually_confirmed_attached {
+            let mut attached_preparation = preparation.clone();
+            attached_preparation.status = FedoraWorkstationPreparationStatus::InstallerRunning;
+            prove_fedora_workstation_post_install_staging_topology(&attached_preparation, &domain)?;
+        }
         let authoritative_mac = preparation
             .execution
             .resolved_topology
@@ -2533,7 +2607,13 @@ where
                 PreparationError::Backend("authoritative stable MAC unavailable".into())
             })?;
         let observed_mac = observed_single_domain_mac(&domain)?;
-        if observed_mac == authoritative_mac {
+        if manually_confirmed_attached {
+            // Manual confirmation proves the installer-attached source topology;
+            // the bounded redefine below is what establishes disk-only boot.
+            backend
+                .define_installer_domain(&render_fedora_workstation_disk_only_xml(preparation)?)
+                .map_err(PreparationError::Backend)?;
+        } else if observed_mac == authoritative_mac {
             prove_fedora_workstation_disk_only_topology(preparation, &domain)?;
         } else {
             prove_fedora_workstation_disk_only_mac_recovery_candidate(preparation, &domain)?;
@@ -2546,27 +2626,29 @@ where
             .map_err(PreparationError::Backend)?
             .ok_or_else(|| PreparationError::Backend("redefined domain absent".into()))?;
         let resolved = prove_fedora_workstation_disk_only_topology(preparation, &detached)?;
-        let runtime = preparation.execution.runtime_iso.as_ref().ok_or_else(|| {
-            PreparationError::Backend("durable runtime ISO evidence absent".into())
-        })?;
-        let retained = backend
-            .inspect_volume("default", &runtime.volume_name)
-            .map_err(PreparationError::Backend)?
-            .ok_or_else(|| PreparationError::Backend("retained runtime ISO absent".into()))?;
-        if retained.name != runtime.volume_name
-            || retained.key != runtime.volume_key
-            || retained.path != runtime.path
-            || !matches!(retained.format.as_str(), "raw" | "iso")
-            || retained.capacity_bytes != runtime.destination_bytes
-            || retained.backing_path.is_some()
-        {
-            return Err(PreparationError::Backend(
-                "retained runtime ISO identity drift".into(),
-            ));
+        if let Some(runtime) = preparation.execution.runtime_iso.as_ref() {
+            let retained = backend
+                .inspect_volume("default", &runtime.volume_name)
+                .map_err(PreparationError::Backend)?
+                .ok_or_else(|| PreparationError::Backend("retained runtime ISO absent".into()))?;
+            if retained.name != runtime.volume_name
+                || retained.key != runtime.volume_key
+                || retained.path != runtime.path
+                || !matches!(retained.format.as_str(), "raw" | "iso")
+                || retained.capacity_bytes != runtime.destination_bytes
+                || retained.backing_path.is_some()
+            {
+                return Err(PreparationError::Backend(
+                    "retained runtime ISO identity drift".into(),
+                ));
+            }
         }
         preparation.execution.disk_only_topology = Some(resolved);
         preparation.status = FedoraWorkstationPreparationStatus::InstalledDiskBootPending;
         publish(preparation).map_err(PreparationError::Backend)?;
+        if manually_confirmed_attached {
+            return Ok(InstalledDiskBootDisposition::DiskOnlyPrepared);
+        }
     }
 
     if preparation.status == FedoraWorkstationPreparationStatus::InstalledDiskBootPending {
@@ -4101,6 +4183,72 @@ mod tests {
     }
 
     #[test]
+    fn manual_install_confirmation_is_explicit_idempotent_and_never_fakes_start() {
+        let (_fixture, mut preparation, mut backend) = executor_fixture();
+        execute_to_installer_ready(&mut backend, &mut preparation, |_| Ok(())).unwrap();
+        let mut published = Vec::new();
+        assert_eq!(
+            confirm_manually_installed_from_installer_ready(
+                &mut backend,
+                &mut preparation,
+                true,
+                |value| {
+                    published.push(value.status);
+                    Ok(())
+                },
+            )
+            .unwrap(),
+            ManualInstallationConfirmationDisposition::Confirmed
+        );
+        assert_eq!(
+            preparation.status,
+            FedoraWorkstationPreparationStatus::InstallationConfirmed
+        );
+        assert!(preparation.operator_confirmation_recorded);
+        assert_eq!(
+            published,
+            [FedoraWorkstationPreparationStatus::InstallationConfirmed]
+        );
+        assert!(!preparation.execution.installed_disk_start_recorded);
+        assert_eq!(
+            confirm_manually_installed_from_installer_ready(
+                &mut backend,
+                &mut preparation,
+                true,
+                |_| panic!("replay must not publish"),
+            )
+            .unwrap(),
+            ManualInstallationConfirmationDisposition::AlreadyConfirmed
+        );
+    }
+
+    #[test]
+    fn manual_install_confirmation_requires_explicit_attestation_and_shutoff_identity() {
+        let (_fixture, mut preparation, mut backend) = executor_fixture();
+        execute_to_installer_ready(&mut backend, &mut preparation, |_| Ok(())).unwrap();
+        assert_eq!(
+            confirm_manually_installed_from_installer_ready(
+                &mut backend,
+                &mut preparation,
+                false,
+                |_| panic!("unconfirmed operation must not publish"),
+            ),
+            Err(PreparationError::InvalidStateTransition)
+        );
+        backend.domain.as_mut().unwrap().shutoff = false;
+        backend.domain.as_mut().unwrap().running = true;
+        assert_eq!(
+            confirm_manually_installed_from_installer_ready(
+                &mut backend,
+                &mut preparation,
+                true,
+                |_| panic!("running domain must not publish"),
+            ),
+            Err(PreparationError::InstallationProofFailed)
+        );
+    }
+
+    #[test]
     fn installer_xml_has_desktop_topology_and_no_legacy_provisioning() {
         let (_fixture, preparation, _backend) = executor_fixture();
         let xml = render_fedora_workstation_installer_xml(&preparation);
@@ -4480,6 +4628,69 @@ mod tests {
     }
 
     #[test]
+    fn manually_confirmed_installer_attached_topology_transitions_to_disk_only_without_starting() {
+        let (_fixture, mut preparation, mut backend) = executor_fixture();
+        execute_to_installer_ready(&mut backend, &mut preparation, |_| Ok(())).unwrap();
+        preparation.status = FedoraWorkstationPreparationStatus::InstallationConfirmed;
+        preparation.operator_confirmation_recorded = true;
+
+        let original_uuid = preparation.installer.uuid.clone();
+        let original_staging = preparation.staging.path.clone();
+        assert!(preparation.execution.runtime_iso.is_none());
+        assert!(
+            backend
+                .domain
+                .as_ref()
+                .unwrap()
+                .xml
+                .contains("<boot dev='cdrom'/>")
+        );
+
+        assert_eq!(
+            execute_to_installed_disk_running(&mut backend, &mut preparation, true, |_| Ok(()))
+                .unwrap(),
+            InstalledDiskBootDisposition::DiskOnlyPrepared
+        );
+        assert_eq!(backend.start_calls, 0);
+        assert_eq!(
+            preparation.status,
+            FedoraWorkstationPreparationStatus::InstalledDiskBootPending
+        );
+        assert_eq!(preparation.installer.uuid, original_uuid);
+        assert_eq!(preparation.staging.path, original_staging);
+        let xml = &backend.domain.as_ref().unwrap().xml;
+        assert!(xml.contains("<boot dev='hd'/>"));
+        assert!(!xml.contains("<boot dev='cdrom'/>"));
+        assert!(!xml.contains("device='cdrom'"));
+        assert!(xml.contains(&preparation.staging.path.to_string_lossy().to_string()));
+        assert!(preparation.execution.disk_only_topology.is_some());
+    }
+
+    #[test]
+    fn manually_confirmed_wrong_installer_iso_fails_before_redefine() {
+        let (_fixture, mut preparation, mut backend) = executor_fixture();
+        execute_to_installer_ready(&mut backend, &mut preparation, |_| Ok(())).unwrap();
+        preparation.status = FedoraWorkstationPreparationStatus::InstallationConfirmed;
+        preparation.operator_confirmation_recorded = true;
+        backend.domain.as_mut().unwrap().xml = backend
+            .domain
+            .as_ref()
+            .unwrap()
+            .xml
+            .replace(&preparation.source.filename, "wrong.iso");
+        let before = backend.domain.as_ref().unwrap().xml.clone();
+        let result =
+            execute_to_installed_disk_running(&mut backend, &mut preparation, true, |_| Ok(()));
+        assert!(result.is_err());
+        assert_eq!(backend.domain.as_ref().unwrap().xml, before);
+        assert_eq!(
+            preparation.status,
+            FedoraWorkstationPreparationStatus::InstallationConfirmed
+        );
+        assert!(preparation.execution.disk_only_topology.is_none());
+    }
+
+    #[test]
     fn disk_only_render_requires_authoritative_mac_and_proof_rejects_replacement() {
         let (_fixture, mut preparation, mut backend) = executor_fixture();
         assert!(render_fedora_workstation_disk_only_xml(&preparation).is_err());
@@ -4653,6 +4864,33 @@ mod tests {
             record_graphical_installed_system_confirmation(&mut preparation, &running, true, true)
                 .unwrap(),
             GraphicalConfirmationDisposition::AlreadyPublished
+        );
+    }
+
+    #[test]
+    fn graphical_confirmation_accepts_manual_path_without_runtime_iso_evidence() {
+        let (_fixture, mut preparation, mut backend) = executor_fixture();
+        execute_to_installer_ready(&mut backend, &mut preparation, |_| Ok(())).unwrap();
+        preparation.status = FedoraWorkstationPreparationStatus::InstallationConfirmed;
+        preparation.operator_confirmation_recorded = true;
+        execute_to_installed_disk_running(&mut backend, &mut preparation, true, |_| Ok(()))
+            .unwrap();
+        execute_to_installed_disk_running(&mut backend, &mut preparation, true, |_| Ok(()))
+            .unwrap();
+        let running = backend.domain.clone().unwrap();
+        assert_eq!(
+            preparation.status,
+            FedoraWorkstationPreparationStatus::AwaitingGraphicalBootConfirmation
+        );
+        assert!(preparation.execution.runtime_iso.is_none());
+        assert_eq!(
+            record_graphical_installed_system_confirmation(&mut preparation, &running, true, false)
+                .unwrap(),
+            GraphicalConfirmationDisposition::Published
+        );
+        assert_eq!(
+            preparation.status,
+            FedoraWorkstationPreparationStatus::InstalledSystemProven
         );
     }
 

@@ -10,6 +10,26 @@ V2.5 is primarily:
 
 > usability + automation + fast reuse of trusted bases
 
+## V2.5 scope decision after GME closeout
+
+V2.5 owns acquisition/import of supported upstream media and images,
+cryptographic and provenance verification, trusted base preparation,
+immutable/versioned base generations, persistent create, clone, Fresh,
+Disposable, VM lifecycle, and safe ownership, retention and deletion.
+
+V2.5 does not include a generic offline Guest Mutation Engine, automatic guest
+bootstrap or user creation, credentials, guest personalization, guest
+configuration management, automatic package updates inside guests, automatic
+updates of existing VMs, in-place distribution migration, or in-place mutation
+of canonical bases. A new distro release or compose is a new base generation;
+existing bases and VMs may coexist until explicitly removed.
+
+Fresh remains VM lifecycle/reset semantics. It is not a distro or package
+update operation. Canonical bases remain clean pre-user images: Fedora Initial
+Setup is not completed in the canonical base. The intended lifecycle is
+verified installation -> clean pre-user canonical base -> `forge create` ->
+boot -> human Fedora Initial Setup and user personalization.
+
 ## 1. V2 invariants that must not regress
 
 All V2.5 design and implementation must preserve these foundations:
@@ -388,10 +408,50 @@ The interactive installer must leave no personal or universal account in the
 canonical base. The preferred flow stops before per-user GNOME Initial Setup; if
 a temporary builder account is unavoidable, normalization must remove it and
 prove its home, credentials, authorization, and secrets absent before promotion.
+
+### 14.3A Phase 4.7 — operator-assisted Fedora canonical base
+
+Phase 4.7 is intentionally smaller than the earlier generic mutation design.
+It uses the verified, installed Fedora Workstation staging image and requires
+operator-assisted guest steps only where preparation-only residue or clean
+pre-user state cannot be proven from existing durable evidence. Forge does not
+provide generic guest filesystem mutation, guest bootstrap, SSH/QGA execution,
+or automatic account creation for this phase.
+
+The proposed sequence is:
+
+1. verify preparation identity, provenance, exact staging ownership and health;
+2. with the preparation domain shut off, perform any explicitly documented
+   operator-only Fedora cleanup needed to establish clean pre-user state;
+3. verify installer media is detached, the domain is shut off, and the staging
+   image is healthy and provenance-bound;
+4. publish/register one immutable canonical base using the existing image-store
+   ownership and collision-intolerant publication semantics; and
+5. create a VM from that base, boot it, and leave Fedora Initial Setup and user
+   creation to the human operator.
+
+The canonical base must not contain a personal account, credentials or completed
+Fedora Initial Setup. Preparation-only artifacts injected by prior experiments
+must not be removed automatically; if their state cannot be proven without a
+guest-side operator step, Phase 4.7 stops and reports that requirement.
 Root remains locked. Each new instance lets its user choose a local account and
 credentials through the normal graphical first-use experience. Forge does not
 store plaintext passwords, embed a universal default password, or inherit the
 legacy `forge` user.
+
+Phase 4.7 starts a new preparation generation from the pinned verified ISO. The
+historical preparation record `5d87db391be74e86bd0c7dca042295c3`, its staging
+disk, and all GME candidates remain untouched and are never selected as the new
+input. A generation-specific durable record and active pointer keep restart and
+idempotency bound to the new preparation identity. The unknown legacy file
+`forge-base-fedora-44.qcow2` is not a Workstation base and cannot become
+authoritative by filename.
+
+Protected libvirt staging is verified through the separate, narrowly typed
+`forge-image-verifier` PolicyKit boundary. The unprivileged CLI supplies only
+the preparation identity; the verifier derives the expected Fedora staging
+volume name and performs read-only `qemu-img info` and `qemu-img check` checks.
+It is not a GME operation and accepts no arbitrary path, command, or argv.
 
 ### 14.4 Canonical-base normalization
 

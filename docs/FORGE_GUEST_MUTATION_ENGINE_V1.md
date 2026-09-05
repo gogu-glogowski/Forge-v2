@@ -275,3 +275,25 @@ refusal. The proof is limited to a single-ext4-root ephemeral integration
 fixture; it makes no filesystem-wide rollback claim. Real Fedora staging
 remained untouched. Broader filesystem topology and promotion semantics remain
 future work; Phase 4.6C-IV covers Acceptance A/B.
+
+## GME experiment closeout (V2.5)
+
+The GME V1 foundation remains retained: its synthetic/ephemeral execution,
+transaction, evidence, ledger and replay protections passed their defined
+acceptance proofs. Real Fedora helper migration was not completed, and no
+authoritative Fedora staging image was promoted through GME. The preserved
+experimental candidate is not canonical and requires explicit operator
+cleanup under its broker policy.
+
+The R7–R15 work showed that a generic secure offline guest-mutation path and
+manual Fedora/Btrfs topology handling are disproportionate to the remaining
+V2.5 requirement. Automatic virt-customize/libguestfs inspection was
+investigated, but the agent sandbox could not provide reliable appliance
+inspection and the available host output did not establish bounded V2.5
+proof. GME is therefore deferred from the V2.5 critical path, not rejected
+as a concept.
+
+Future GME work should use one authoritative inspection/layout model rather
+than duplicated hardcoded mount logic, and should test Fedora/Btrfs,
+Debian/ext4, Ubuntu/LVM and openSUSE/Btrfs layouts. A future Forge 3.0 or
+separate GME project is possible work, without a fixed release commitment.

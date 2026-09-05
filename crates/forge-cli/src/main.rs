@@ -7,8 +7,7 @@ use forge_storage::{DefineBackend, ImagePrepareBackend};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::File;
-use std::io;
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -117,6 +116,9 @@ fn main() -> ExitCode {
         ["image", "prepare-status", "fedora-workstation"] => image_prepare_workstation_status(),
         ["image", "prepare-start", "fedora-workstation"] => image_prepare_workstation_start(),
         ["image", "prepare-continue", "fedora-workstation"] => image_prepare_workstation_continue(),
+        ["image", "prepare-confirm-installed", "fedora-workstation"] => {
+            image_prepare_workstation_confirm_installed()
+        }
         ["image", "prepare-confirm-graphical", "fedora-workstation"] => {
             image_prepare_workstation_confirm_graphical()
         }
@@ -3554,10 +3556,7 @@ fn image_prepare_workstation_dry_run() -> ExitCode {
     println!("Cloud-init: none");
     println!("SSH requirement: none");
     println!("QGA requirement: none");
-    println!(
-        "Normalization: {} (hybrid controlled in-guest plus offline final proof)",
-        forge_images::FEDORA_WORKSTATION_NORMALIZATION_RECIPE
-    );
+    println!("Normalization: none (operator-assisted installation gate only)");
     println!("Promotion: exact copy/import to image-store-owned protected SharedBase");
     println!(
         "Canonical base: forge-base-fedora-workstation-{}-{}.qcow2 (not created)",
@@ -3570,9 +3569,38 @@ fn image_prepare_workstation_dry_run() -> ExitCode {
 
 fn workstation_preparation_state_path() -> Result<std::path::PathBuf, String> {
     let home = env::var_os("HOME").ok_or_else(|| "HOME is unavailable".to_owned())?;
-    Ok(forge_images::fedora_workstation_preparation_state_path(
-        std::path::Path::new(&home),
-    ))
+    let home = std::path::Path::new(&home);
+    let legacy = forge_images::fedora_workstation_preparation_state_path(home);
+    let pointer = legacy.with_file_name("fedora-workstation-44-1.7.active");
+    match std::fs::read_to_string(&pointer) {
+        Ok(value) => {
+            let path = std::path::PathBuf::from(value.trim());
+            if path.is_absolute() && path.starts_with(legacy.parent().unwrap_or(home)) {
+                Ok(path)
+            } else {
+                Err("active Fedora preparation pointer is unsafe".to_owned())
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(legacy),
+        Err(error) => Err(format!(
+            "cannot read active Fedora preparation pointer: {error}"
+        )),
+    }
+}
+
+fn publish_workstation_active_pointer(path: &std::path::Path) -> Result<(), String> {
+    let state = workstation_preparation_state_path()?;
+    let pointer = state
+        .parent()
+        .ok_or_else(|| "preparation state has no parent".to_owned())?
+        .join("fedora-workstation-44-1.7.active");
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&pointer)
+        .map_err(|error| format!("cannot publish active preparation pointer: {error}"))?;
+    writeln!(file, "{}", path.display()).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())
 }
 
 fn new_preparation_identity() -> Result<forge_images::FedoraWorkstationPreparationId, String> {
@@ -3607,34 +3635,48 @@ fn image_prepare_workstation() -> ExitCode {
     let result = (|| -> Result<(), String> {
         let directories = forge_images::default_directories()
             .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
-        let state_path = workstation_preparation_state_path()?;
+        let mut state_path = workstation_preparation_state_path()?;
         let mut backend = forge_libvirt::LibvirtDefineBackend::connect_local()
             .map_err(|error| error.to_string())?;
         if let Some(mut preparation) =
             forge_images::read_fedora_workstation_preparation(&state_path)
                 .map_err(|error| error.to_string())?
         {
-            if !exact_workstation_source(&preparation) {
-                return Err("active preparation has conflicting source provenance".to_owned());
-            }
-            let proof =
-                forge_images::verified_fedora_workstation_iso(&directories, &workstation_source())
-                    .map_err(|error| format!("existing ISO proof is stale: {error}"))?;
-            if proof.metadata().local_path != preparation.source.iso_path
-                || proof.metadata().sha256 != preparation.source.iso_sha256
-                || proof.metadata().byte_size != preparation.source.iso_bytes
-            {
-                return Err("existing ISO proof differs from preparation authority".to_owned());
-            }
-            let disposition =
-                forge_images::execute_to_installer_ready(&mut backend, &mut preparation, |value| {
-                    forge_images::update_fedora_workstation_preparation(&state_path, value)
-                        .map_err(|error| error.to_string())
-                })
+            if preparation.preparation_id.as_str() == "5d87db391be74e86bd0c7dca042295c3" {
+                let fresh = new_preparation_identity()?;
+                let parent = state_path
+                    .parent()
+                    .ok_or_else(|| "preparation state has no parent".to_owned())?;
+                state_path =
+                    parent.join(format!("fedora-workstation-44-1.7-{}.json", fresh.as_str()));
+            } else {
+                if !exact_workstation_source(&preparation) {
+                    return Err("active preparation has conflicting source provenance".to_owned());
+                }
+                let proof = forge_images::verified_fedora_workstation_iso(
+                    &directories,
+                    &workstation_source(),
+                )
+                .map_err(|error| format!("existing ISO proof is stale: {error}"))?;
+                if proof.metadata().local_path != preparation.source.iso_path
+                    || proof.metadata().sha256 != preparation.source.iso_sha256
+                    || proof.metadata().byte_size != preparation.source.iso_bytes
+                {
+                    return Err("existing ISO proof differs from preparation authority".to_owned());
+                }
+                let disposition = forge_images::execute_to_installer_ready(
+                    &mut backend,
+                    &mut preparation,
+                    |value| {
+                        forge_images::update_fedora_workstation_preparation(&state_path, value)
+                            .map_err(|error| error.to_string())
+                    },
+                )
                 .map_err(|error| error.to_string())?;
-            println!("Preparation: {disposition:?}");
-            print_workstation_preparation_ready(&preparation);
-            return Ok(());
+                println!("Preparation: {disposition:?}");
+                print_workstation_preparation_ready(&preparation);
+                return Ok(());
+            }
         }
 
         let source = workstation_source();
@@ -3692,6 +3734,11 @@ fn image_prepare_workstation() -> ExitCode {
         let mut preparation = forge_images::durable_preparation(plan);
         forge_images::publish_new_fedora_workstation_preparation(&state_path, &preparation)
             .map_err(|error| error.to_string())?;
+        if state_path.file_name().and_then(|name| name.to_str())
+            != Some("fedora-workstation-44-1.7.json")
+        {
+            publish_workstation_active_pointer(&state_path)?;
+        }
         let execution_started = Instant::now();
         let disposition =
             forge_images::execute_to_installer_ready(&mut backend, &mut preparation, |value| {
@@ -4034,6 +4081,82 @@ fn image_prepare_workstation_continue() -> ExitCode {
     }
 }
 
+fn image_prepare_workstation_confirm_installed() -> ExitCode {
+    let result = (|| -> Result<(), String> {
+        let directories = forge_images::default_directories()
+            .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
+        let state_path = workstation_preparation_state_path()?;
+        let mut preparation = forge_images::read_fedora_workstation_preparation(&state_path)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "no active preparation".to_owned())?;
+        if preparation.preparation_id.as_str() != "4ad083f66d9d4dd0a834250ddef9826d" {
+            return Err("active preparation is not the requested 4ad083f6 generation".to_owned());
+        }
+        if !exact_workstation_source(&preparation) {
+            return Err("preparation provenance conflicts with the pinned source".to_owned());
+        }
+        let proof =
+            forge_images::verified_fedora_workstation_iso(&directories, &workstation_source())
+                .map_err(|error| format!("existing ISO proof is stale: {error}"))?;
+        if proof.metadata().local_path != preparation.source.iso_path
+            || proof.metadata().sha256 != preparation.source.iso_sha256
+            || proof.metadata().byte_size != preparation.source.iso_bytes
+        {
+            return Err("ISO provenance differs from preparation authority".to_owned());
+        }
+        let mut backend = forge_libvirt::LibvirtDefineBackend::connect_local()
+            .map_err(|error| error.to_string())?;
+        let volume = FedoraWorkstationPreparationBackend::inspect_volume(
+            &mut backend,
+            "default",
+            &preparation.staging.volume_name,
+        )?
+        .ok_or_else(|| "staging volume absent".to_owned())?;
+        if volume.format != "qcow2"
+            || volume.capacity_bytes != forge_images::FEDORA_WORKSTATION_STAGING_CAPACITY_BYTES
+            || volume.backing_path.is_some()
+        {
+            return Err("staging storage shape is unsafe".to_owned());
+        }
+        let check = std::process::Command::new("pkexec")
+            .args(["/usr/libexec/forge-image-verifier", "--preparation-id"])
+            .arg(preparation.preparation_id.as_str())
+            .output()
+            .map_err(|error| format!("privileged staging verifier failed to run: {error}"))?;
+        if !check.status.success() {
+            return Err(format!(
+                "privileged staging verification failed: {}",
+                String::from_utf8_lossy(&check.stderr).trim()
+            ));
+        }
+        let disposition = forge_images::confirm_manually_installed_from_installer_ready(
+            &mut backend,
+            &mut preparation,
+            true,
+            |value| {
+                forge_images::update_fedora_workstation_preparation(&state_path, value)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        println!("Manual installation confirmation: {disposition:?}");
+        println!("Operator attestation: graphical Fedora Workstation installation completed");
+        println!("Fedora Initial Setup: NOT completed");
+        println!("Personal user: NOT intentionally created by Forge");
+        println!("Forge InstallerRunning observation: none (history preserved)");
+        println!("Current stage: {:?}", preparation.status);
+        println!("Canonical base: not created");
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Fedora Workstation manual installation confirmation refused: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn image_prepare_workstation_confirm_graphical() -> ExitCode {
     let result = (|| -> Result<(), String> {
         let state_path = workstation_preparation_state_path()?;
@@ -4048,23 +4171,20 @@ fn image_prepare_workstation_confirm_graphical() -> ExitCode {
         if backend.canonical_base_exists("default", &preparation.canonical.volume_name)? {
             return Err("canonical Workstation base already exists".to_owned());
         }
-        let runtime = preparation
-            .execution
-            .runtime_iso
-            .as_ref()
-            .ok_or_else(|| "durable runtime ISO evidence absent".to_owned())?;
-        let retained = FedoraWorkstationPreparationBackend::inspect_volume(
-            &mut backend,
-            "default",
-            &runtime.volume_name,
-        )?
-        .ok_or_else(|| "retained runtime ISO absent".to_owned())?;
-        if retained.name != runtime.volume_name
-            || retained.key != runtime.volume_key
-            || retained.path != runtime.path
-            || retained.capacity_bytes != runtime.destination_bytes
-        {
-            return Err("retained runtime ISO identity drift".to_owned());
+        if let Some(runtime) = preparation.execution.runtime_iso.as_ref() {
+            let retained = FedoraWorkstationPreparationBackend::inspect_volume(
+                &mut backend,
+                "default",
+                &runtime.volume_name,
+            )?
+            .ok_or_else(|| "retained runtime ISO absent".to_owned())?;
+            if retained.name != runtime.volume_name
+                || retained.key != runtime.volume_key
+                || retained.path != runtime.path
+                || retained.capacity_bytes != runtime.destination_bytes
+            {
+                return Err("retained runtime ISO identity drift".to_owned());
+            }
         }
         let domain = backend
             .inspect_installer_domain(&preparation.installer.name)?
