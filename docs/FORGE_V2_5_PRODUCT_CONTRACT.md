@@ -860,3 +860,18 @@ are proven:
 No phase may use implementation convenience to reintroduce Cloud Base, NoCloud,
 cloud-init, universal credentials, mandatory SSH/QGA, implicit release upgrades,
 or silent mutation of the legacy host object.
+
+### 14.13 Phase 4.6C — Guest Mutation Engine architecture decision
+
+Forge guest mutation is standardized as a reusable, Linux-oriented
+`GuestMutationSession`/`GuestMutationPlan` facility inside the existing
+`forge-preparation-broker`. Requests reference trusted plan and transaction
+identities only; qcow2 paths, guest paths, bytes, commands and backend choices
+are resolved internally from Forge state and profile policy. The engine uses a
+bounded direct-libguestfs session, typed logical destinations, content-addressed
+artifacts, explicit pre/postconditions, durable journal/evidence/ledger and
+fail-closed recovery. Fedora normalization will compile to this plan model in a
+later implementation phase. Phase 4.6C-II now proves the execution core on
+an ephemeral single-ext4 qcow2 with host-native direct-libguestfs; candidate
+transaction/recovery and durable cross-process evidence remain Phase
+4.6C-III.

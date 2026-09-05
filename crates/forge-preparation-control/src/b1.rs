@@ -18,6 +18,12 @@ const EXPECTED_DOMAIN: &str = "forge-prepare-fedora-workstation-44-1.7-5d87db39"
 const EXPECTED_UUID: &str = "ae82467d-10dd-4d33-b6ab-52f67e11e795";
 const EXPECTED_STAGING: &str =
     "/var/lib/libvirt/images/forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2";
+const EXPECTED_TRANSACTION: &str =
+    "real-bootstrap-6fafe662069c4f8cd2560e099e77951a45fd0d9db75e9f8966794e305e4791d0";
+const EXPECTED_HELPER_SHA256: &str =
+    "bb546fa9bf6efc11bde7687cba792421afc46616287a4fa468eadf3a7d0ad4a2";
+const EXPECTED_BINDING_SHA256: &str =
+    "64f3a73901f9770661263bae1bdd3a6b1d100d165e6545345d8c45cf07720115";
 
 #[derive(Serialize)]
 struct BootstrapBinding<'a> {
@@ -39,6 +45,8 @@ struct Handshake {
     domain_uuid: String,
     bootstrap_transaction_id: String,
     helper_sha256: String,
+    recipe: String,
+    channel_name: String,
 }
 
 fn main() -> ExitCode {
@@ -46,8 +54,9 @@ fn main() -> ExitCode {
     let result = match arguments.as_slice().get(1).map(String::as_str) {
         Some("discover") => read_only_recovery(),
         Some("execute") => execute(),
+        Some("b4") => b4_execute(),
         _ => {
-            eprintln!("usage: forge-b1 discover|execute");
+            eprintln!("usage: forge-b1 discover|execute|b4");
             return ExitCode::from(2);
         }
     };
@@ -58,6 +67,184 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn b4_execute() -> Result<(), String> {
+    require_kernel_selinux()?;
+    let home = env::var_os("HOME").ok_or("HOME unavailable")?;
+    let state_path = forge_images::fedora_workstation_preparation_state_path(Path::new(&home));
+    let mut preparation = forge_images::read_fedora_workstation_preparation(&state_path)
+        .map_err(|e| e.to_string())?
+        .ok_or("preparation absent")?;
+    validate_binding(&preparation)?;
+    let bootstrap = preparation
+        .execution
+        .helper_bootstrap
+        .as_ref()
+        .ok_or("B3 bootstrap evidence absent")?;
+    if bootstrap.bootstrap_transaction_id != EXPECTED_TRANSACTION
+        || bootstrap.helper_sha256 != EXPECTED_HELPER_SHA256
+        || bootstrap.helper_bytes != 784_624
+        || bootstrap.generator_sha256 != EXPECTED_HELPER_SHA256
+        || bootstrap.generator_bytes != 784_624
+        || bootstrap.binding_sha256 != EXPECTED_BINDING_SHA256
+        || bootstrap.binding_bytes != 975
+        || !bootstrap.structured_verification_proven
+        || !bootstrap.clean_close
+        || bootstrap.unexpected_paths_modified
+        || bootstrap.channel_name != CHANNEL
+        || preparation.execution.preparation_channel.is_some()
+        || preparation.execution.read_only_guest_inventory.is_some()
+    {
+        return Err("B3 evidence or B4 boundary drift".to_owned());
+    }
+
+    let mut backend =
+        forge_libvirt::LibvirtDefineBackend::connect_local().map_err(|e| e.to_string())?;
+    if backend.canonical_base_exists("default", &preparation.canonical.volume_name)? {
+        return Err("canonical base exists".to_owned());
+    }
+    let domain = backend
+        .inspect_installer_domain(EXPECTED_DOMAIN)?
+        .ok_or("preparation domain absent")?;
+    if !domain.shutoff
+        || domain.running
+        || domain.autostart
+        || domain.uuid != EXPECTED_UUID
+        || domain.xml.contains("<channel")
+        || domain.xml.contains("device='cdrom'")
+    {
+        return Err("offline domain prevalidation refused".to_owned());
+    }
+    let proven = forge_images::prove_fedora_workstation_disk_only_topology(&preparation, &domain)
+        .map_err(|e| e.to_string())?;
+    if preparation.execution.disk_only_topology.as_ref() != Some(&proven) {
+        return Err("disk-only topology evidence drift".to_owned());
+    }
+    let volume = FedoraWorkstationPreparationBackend::inspect_volume(
+        &mut backend,
+        "default",
+        &preparation.staging.volume_name,
+    )?
+    .ok_or("staging volume absent")?;
+    if volume.path != Path::new(EXPECTED_STAGING)
+        || volume.format != "qcow2"
+        || volume.capacity_bytes != 80 * 1024 * 1024 * 1024
+        || volume.backing_path.is_some()
+    {
+        return Err("staging volume drift".to_owned());
+    }
+
+    let operation_id = identity(
+        "inventory",
+        &[
+            EXPECTED_PREPARATION,
+            EXPECTED_TRANSACTION,
+            &now()?.to_string(),
+        ],
+    );
+    let nonce = identity("nonce", &[EXPECTED_UUID, &operation_id, CHANNEL]);
+    let request = forge_images::create_read_only_guest_inventory_request(
+        &preparation,
+        &operation_id,
+        &nonce,
+        true,
+        true,
+    )
+    .map_err(|e| e.to_string())?;
+    let request_bytes = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+
+    backend.attach_preparation_control_channel(EXPECTED_DOMAIN)?;
+    let channel_xml = backend.preparation_domain_xml(EXPECTED_DOMAIN)?;
+    prove_channel_xml(&channel_xml)?;
+    preparation.execution.preparation_channel = Some(forge_images::PreparationChannelEvidence {
+        preparation_id: preparation.preparation_id.clone(),
+        domain_uuid: preparation.installer.uuid.clone(),
+        staging_path: preparation.staging.path.clone(),
+        bootstrap_transaction_id: EXPECTED_TRANSACTION.to_owned(),
+        protocol_version: forge_images::FORGE_GUEST_CONTROL_PROTOCOL_VERSION,
+        channel_name: CHANNEL.to_owned(),
+        host_endpoint: format!("libvirt-stream:qemu:///system/{EXPECTED_DOMAIN}/{CHANNEL}"),
+    });
+    forge_images::update_fedora_workstation_preparation(&state_path, &preparation)
+        .map_err(|e| e.to_string())?;
+    println!("CHANNEL_EVIDENCE=published");
+
+    backend.start_preparation_domain(EXPECTED_DOMAIN)?;
+    if !backend.preparation_domain_running(EXPECTED_DOMAIN)? {
+        return Err("single boot did not reach running".to_owned());
+    }
+    println!("BOOT=running");
+
+    let online_result = (|| -> Result<_, String> {
+        let (handshake_json, result_json, replay_json) =
+            backend.preparation_control_exchange_with_replay(EXPECTED_DOMAIN, &request_bytes)?;
+        let handshake: Handshake =
+            serde_json::from_str(&handshake_json).map_err(|e| e.to_string())?;
+        if handshake.kind != "Handshake"
+            || handshake.protocol_version != 1
+            || handshake.preparation_id != EXPECTED_PREPARATION
+            || handshake.domain_uuid != EXPECTED_UUID
+            || handshake.bootstrap_transaction_id != EXPECTED_TRANSACTION
+            || handshake.helper_sha256 != EXPECTED_HELPER_SHA256
+            || handshake.recipe != "V1"
+            || handshake.channel_name != CHANNEL
+        {
+            return Err("typed handshake mismatch".to_owned());
+        }
+        let result: forge_images::GuestControlResult =
+            serde_json::from_str(&result_json).map_err(|e| e.to_string())?;
+        let guest_sequence = result.guest_sequence;
+        let evidence = forge_images::prove_read_only_guest_inventory(
+            &preparation,
+            &request,
+            result,
+            forge_images::GuestOperationLedgerState::SentAwaitingResult,
+        )
+        .map_err(|e| e.to_string())?;
+        let replay: forge_images::GuestControlResult =
+            serde_json::from_str(&replay_json).map_err(|e| e.to_string())?;
+        if replay.protocol_version != request.protocol_version
+            || replay.binding != request.binding
+            || replay.operation != request.operation
+            || replay.operation_id != operation_id
+            || replay.nonce != nonce
+            || replay.completion != forge_images::GuestControlCompletion::Failed
+            || replay.inventory.is_some()
+            || replay.error_code.as_deref() != Some("ReplayRefused")
+            || replay.guest_sequence != guest_sequence
+        {
+            return Err("typed replay refusal mismatch".to_owned());
+        }
+        Ok((guest_sequence, evidence.inventory().clone()))
+    })();
+
+    let shutdown_result = backend.shutdown_preparation_domain(EXPECTED_DOMAIN);
+    let (guest_sequence, inventory) = match (online_result, shutdown_result) {
+        (Ok(value), Ok(())) => value,
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+        (Err(primary), Err(shutdown)) => {
+            return Err(format!("{primary}; clean shutdown also failed: {shutdown}"));
+        }
+    };
+    preparation.execution.read_only_guest_inventory =
+        Some(forge_images::PublishedReadOnlyGuestInventory {
+            operation_id,
+            nonce,
+            guest_sequence,
+            inventory: inventory.clone(),
+        });
+    forge_images::update_fedora_workstation_preparation(&state_path, &preparation)
+        .map_err(|e| e.to_string())?;
+    println!("REPLAY=ReplayRefused");
+    println!("SHUTDOWN=clean");
+    println!("INVENTORY_EVIDENCE=published");
+    println!(
+        "INVENTORY={}",
+        serde_json::to_string(&inventory).map_err(|e| e.to_string())?
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -626,8 +813,12 @@ fn prove_injection(staging: &Path, digest: &str, bytes: u64) -> Result<(), Strin
 
 fn prove_channel_xml(xml: &str) -> Result<(), String> {
     if xml.matches("<channel").count() != 1
-        || !xml.contains(CHANNEL)
+        || !xml.contains(&format!("<uuid>{EXPECTED_UUID}</uuid>"))
+        || !xml.contains(&format!("<target type='virtio' name='{CHANNEL}'"))
+        || xml.matches("controller type='virtio-serial'").count() != 1
         || xml.contains("org.qemu.guest_agent.0")
+        || xml.contains("<filesystem")
+        || xml.contains("<hostdev")
         || xml.matches("device='disk'").count() != 1
         || xml.contains("device='cdrom'")
         || !xml.contains(EXPECTED_STAGING)
@@ -689,7 +880,7 @@ mod tests {
     #[test]
     fn channel_topology_requires_one_fixed_non_qga_channel() {
         let xml = format!(
-            "<domain><devices><disk device='disk'><source file='{EXPECTED_STAGING}'/></disk><interface><mac address='52:54:00:28:d0:55'/></interface><channel><target name='{CHANNEL}'/></channel></devices></domain>"
+            "<domain><uuid>{EXPECTED_UUID}</uuid><devices><disk device='disk'><source file='{EXPECTED_STAGING}'/></disk><interface><mac address='52:54:00:28:d0:55'/></interface><controller type='virtio-serial'/><channel><target type='virtio' name='{CHANNEL}'/></channel></devices></domain>"
         );
         assert!(prove_channel_xml(&xml).is_ok());
         assert!(prove_channel_xml(&xml.replace("</devices>", "<channel/></devices>")).is_err());

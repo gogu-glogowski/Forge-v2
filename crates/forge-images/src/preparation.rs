@@ -612,6 +612,7 @@ pub const FORGE_PREPARATION_BROKER_PROTOCOL_VERSION: u32 = 1;
 pub enum PreparationBrokerOperation {
     InspectFedoraWorkstationPreparation,
     BootstrapPreparationHelperOffline,
+    ReplacePreparationHelper,
     ClassifyBootstrapRecoveryReadOnly,
     CompleteBootstrapRecoveryHostOnly,
 }

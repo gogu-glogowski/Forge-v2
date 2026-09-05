@@ -13,6 +13,7 @@ members = [
     "crates/forge-libvirt",
     "crates/forge-cli",
     "crates/forge-preparation-control",
+    "crates/forge-guest-mutation",
 ]
 resolver = "2"
 

@@ -9,6 +9,8 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod helper_replacement;
+
 const SOCKET_DIR: &str = "/run/forge-preparation-broker";
 const SOCKET: &str = "/run/forge-preparation-broker/broker.sock";
 const LEDGER_DIR: &str = "/var/lib/forge-preparation-broker";
@@ -63,6 +65,60 @@ enum BrokerSuccess {
 enum BrokerFailure {
     Code(String),
     Identity(Box<forge_images::PreparationGuestIdentityDiagnostics>),
+}
+
+/// Private capability for one validated preparation disk; no protocol caller can construct it.
+#[allow(dead_code)]
+struct ResolvedPreparationDiskCapability {
+    qcow2_path: std::path::PathBuf,
+    replacement: helper_replacement::ReplacementTransaction,
+}
+
+impl ResolvedPreparationDiskCapability {
+    #[allow(dead_code)]
+    fn guestfish_replace(&self, new_helper: &Path) -> Result<(), String> {
+        if self.qcow2_path == Path::new(STAGING) {
+            return Err("RealReplacementRequiresR3Authorization".to_owned());
+        }
+        let artifact = fs::read(new_helper).map_err(|e| e.to_string())?;
+        let digest = format!("{:x}", Sha256::digest(&artifact));
+        if digest != self.replacement.new_helper_sha256
+            || artifact.len() as u64 != self.replacement.new_helper_bytes
+        {
+            return Err("NewHelperIdentityRefused".to_owned());
+        }
+        let args = [
+            "--rw",
+            "--format=qcow2",
+            "-a",
+            self.qcow2_path.to_str().ok_or("TargetPathRefused")?,
+            "run",
+            ":",
+            "mount",
+            "/dev/sda1",
+            "/",
+            ":",
+            "upload",
+            new_helper.to_str().ok_or("ArtifactPathRefused")?,
+            HELPER,
+            ":",
+            "chmod",
+            "0755",
+            HELPER,
+            ":",
+            "chown",
+            "0",
+            "0",
+            HELPER,
+        ];
+        fixed_output_with_backend(
+            "/usr/bin/guestfish",
+            &args,
+            Duration::from_secs(120),
+            "direct",
+        )?;
+        Ok(())
+    }
 }
 
 impl From<String> for BrokerFailure {
@@ -276,6 +332,11 @@ fn handle(stream: &mut UnixStream) -> Result<BrokerSuccess, BrokerFailure> {
         forge_images::PreparationBrokerOperation::BootstrapPreparationHelperOffline => {
             bootstrap_helper(&request).map(|result| BrokerSuccess::Bootstrap(Box::new(result)))
         }
+        forge_images::PreparationBrokerOperation::ReplacePreparationHelper => {
+            resolve_replacement_target(&request)
+                .map(|result| BrokerSuccess::Bootstrap(Box::new(result)))
+                .map_err(BrokerFailure::Code)
+        }
         forge_images::PreparationBrokerOperation::ClassifyBootstrapRecoveryReadOnly => {
             classify_real_recovery(&request).map(BrokerSuccess::Recovery)
         }
@@ -284,6 +345,67 @@ fn handle(stream: &mut UnixStream) -> Result<BrokerSuccess, BrokerFailure> {
                 .map(|result| BrokerSuccess::Bootstrap(Box::new(result)))
         }
     }
+}
+
+fn resolve_replacement_target(
+    request: &forge_images::PreparationBrokerRequest,
+) -> Result<forge_images::PreparationBrokerBootstrapResult, String> {
+    if request.protocol_version != forge_images::FORGE_PREPARATION_BROKER_PROTOCOL_VERSION
+        || request.operation != forge_images::PreparationBrokerOperation::ReplacePreparationHelper
+        || request.preparation_id.as_str() != PREPARATION
+        || request.expected_domain_name != DOMAIN
+        || request.expected_domain_uuid != UUID
+        || request.bootstrap_target
+            != Some(forge_images::PreparationBootstrapTarget::SyntheticProof)
+    {
+        return Err("ReplacementRequestRefused".to_owned());
+    }
+    let transaction = stable_identity("replace-helper", &[PREPARATION, DOMAIN, UUID, STAGING]);
+    if request.operation_id != transaction
+        || request.nonce != stable_identity("replace-helper-nonce", &[&transaction])
+    {
+        return Err("ReplacementTransactionRefused".to_owned());
+    }
+    let preparation = forge_images::read_fedora_workstation_preparation(Path::new(STATE))
+        .map_err(|e| e.to_string())?
+        .ok_or("PreparationAbsent")?;
+    if preparation.status != forge_images::FedoraWorkstationPreparationStatus::InstalledSystemProven
+        || preparation.preparation_id.as_str() != PREPARATION
+        || preparation.installer.name != DOMAIN
+        || preparation.installer.uuid != UUID
+        || preparation.staging.path != Path::new(STAGING)
+        || preparation.execution.preparation_channel.is_some()
+        || preparation.execution.read_only_guest_inventory.is_some()
+    {
+        return Err("ReplacementPreparationIdentityRefused".to_owned());
+    }
+    // Target paths and artifact identities are fixed constants, not request fields.
+    let replacement = helper_replacement::ReplacementTransaction {
+        preparation_id: PREPARATION.to_owned(),
+        domain_name: DOMAIN.to_owned(),
+        domain_uuid: UUID.to_owned(),
+        staging_identity: STAGING.to_owned(),
+        remediation_transaction_id: transaction.clone(),
+        protocol_version: forge_images::FORGE_GUEST_CONTROL_PROTOCOL_VERSION,
+        normalization_recipe: "V1".to_owned(),
+        canonical_binding_sha256: preparation
+            .execution
+            .helper_bootstrap
+            .as_ref()
+            .map(|e| e.binding_sha256.clone())
+            .ok_or("ReplacementBindingEvidenceRefused")?,
+        generator_sha256: HELPER_SHA256.to_owned(),
+        old_helper_sha256: HELPER_SHA256.to_owned(),
+        old_helper_bytes: HELPER_BYTES,
+        new_helper_sha256: "cfc6ee47afa64767e6eb93594235f203e89fd76ca4ce851548ce02d3545b16a5"
+            .to_owned(),
+        new_helper_bytes: 802_896,
+    };
+    let _trusted_target = ResolvedPreparationDiskCapability {
+        qcow2_path: Path::new(STAGING).to_owned(),
+        replacement,
+    };
+    Err("ReplacementDryRunTargetResolved".to_owned())
 }
 
 fn is_refusal(error: &str) -> bool {

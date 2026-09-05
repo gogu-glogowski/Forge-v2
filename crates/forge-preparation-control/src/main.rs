@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, ExitCode};
@@ -15,18 +15,33 @@ const UNIT: &str = "/run/systemd/system/forge-preparation-control.service";
 const GENERATOR_NAME: &str = "forge-preparation-control-generator";
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Binding {
     protocol_version: u32,
     preparation_id: String,
     domain_name: String,
     domain_uuid: String,
-    staging_path: String,
+    staging_identity: StagingIdentity,
+    normalization_recipe: String,
     expected_state: String,
     bootstrap_transaction_id: String,
     helper_sha256: String,
+    generator_sha256: String,
+    channel_name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StagingIdentity {
+    path: String,
+    volume_name: String,
+    volume_key: String,
+    inode: u64,
+    capacity_bytes: u64,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct Request {
     protocol_version: u32,
     binding: RequestBinding,
@@ -35,12 +50,14 @@ struct Request {
     nonce: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct RequestBinding {
     preparation_id: String,
     domain_name: String,
     domain_uuid: String,
     staging_path: String,
+    recipe: String,
     expected_state: String,
 }
 
@@ -52,6 +69,8 @@ struct Handshake<'a> {
     domain_uuid: &'a str,
     bootstrap_transaction_id: &'a str,
     helper_sha256: &'a str,
+    recipe: &'a str,
+    channel_name: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,12 +81,12 @@ struct ResultEnvelope<'a> {
     operation_id: &'a str,
     nonce: &'a str,
     completion: &'static str,
-    inventory: Inventory,
+    inventory: Option<&'a Inventory>,
     error_code: Option<&'static str>,
     guest_sequence: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ResultBinding<'a> {
     preparation_id: &'a str,
     domain_name: &'a str,
@@ -163,14 +182,8 @@ fn generator() -> ExitCode {
 }
 
 fn serve() -> Result<(), String> {
-    let binding: Binding =
-        serde_json::from_slice(&fs::read(RUN_BINDING).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-    if binding.protocol_version != PROTOCOL_VERSION
-        || binding.expected_state != "InstalledSystemProven"
-    {
-        return Err("binding refused".to_owned());
-    }
+    let binding = parse_binding_bytes(&fs::read(RUN_BINDING).map_err(|e| e.to_string())?)?;
+    validate_binding(&binding)?;
     let actual_digest = executable_digest()?;
     if actual_digest != binding.helper_sha256 {
         return Err("helper digest mismatch".to_owned());
@@ -189,12 +202,12 @@ fn serve() -> Result<(), String> {
             domain_uuid: &binding.domain_uuid,
             bootstrap_transaction_id: &binding.bootstrap_transaction_id,
             helper_sha256: &actual_digest,
+            recipe: &binding.normalization_recipe,
+            channel_name: &binding.channel_name,
         },
     )?;
-    let mut line = String::new();
-    BufReader::new(channel.try_clone().map_err(|e| e.to_string())?)
-        .read_line(&mut line)
-        .map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(channel.try_clone().map_err(|e| e.to_string())?);
+    let line = read_bounded_request(&mut reader)?;
     let request: Request = serde_json::from_str(&line).map_err(|e| e.to_string())?;
     validate_request(&binding, &request)?;
     let inventory = collect_inventory()?;
@@ -206,7 +219,7 @@ fn serve() -> Result<(), String> {
                 preparation_id: &binding.preparation_id,
                 domain_name: &binding.domain_name,
                 domain_uuid: &binding.domain_uuid,
-                staging_path: &binding.staging_path,
+                staging_path: &binding.staging_identity.path,
                 recipe: "V1",
                 expected_state: "InstalledSystemProven",
             },
@@ -214,11 +227,75 @@ fn serve() -> Result<(), String> {
             operation_id: &request.operation_id,
             nonce: &request.nonce,
             completion: "Completed",
-            inventory,
+            inventory: Some(&inventory),
             error_code: None,
             guest_sequence: 1,
         },
+    )?;
+    let replay_line = read_bounded_request(&mut reader)?;
+    let replay: Request = serde_json::from_str(&replay_line).map_err(|e| e.to_string())?;
+    if replay != request {
+        return Err("second request was not an exact replay".to_owned());
+    }
+    write_json(
+        &mut channel,
+        &ResultEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            binding: ResultBinding {
+                preparation_id: &binding.preparation_id,
+                domain_name: &binding.domain_name,
+                domain_uuid: &binding.domain_uuid,
+                staging_path: &binding.staging_identity.path,
+                recipe: "V1",
+                expected_state: "InstalledSystemProven",
+            },
+            operation: "ReadOnlyGuestInventoryProbe",
+            operation_id: &request.operation_id,
+            nonce: &request.nonce,
+            completion: "Failed",
+            inventory: None,
+            error_code: Some("ReplayRefused"),
+            guest_sequence: 1,
+        },
     )
+}
+
+fn parse_binding_bytes(bytes: &[u8]) -> Result<Binding, String> {
+    serde_json::from_slice(bytes).map_err(|e| format!("binding JSON refused: {e}"))
+}
+
+fn validate_binding(binding: &Binding) -> Result<(), String> {
+    if binding.protocol_version != PROTOCOL_VERSION
+        || binding.preparation_id != "5d87db391be74e86bd0c7dca042295c3"
+        || binding.domain_name != "forge-prepare-fedora-workstation-44-1.7-5d87db39"
+        || binding.domain_uuid != "ae82467d-10dd-4d33-b6ab-52f67e11e795"
+        || binding.staging_identity.path
+            != "/var/lib/libvirt/images/forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2"
+        || binding.staging_identity.volume_name
+            != "forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2"
+        || binding.staging_identity.volume_key != binding.staging_identity.path
+        || binding.staging_identity.inode != 445_745
+        || binding.staging_identity.capacity_bytes != 80 * 1024 * 1024 * 1024
+        || binding.normalization_recipe != "V1"
+        || binding.expected_state != "InstalledSystemProven"
+        || binding.generator_sha256 != binding.helper_sha256
+        || binding.channel_name != "org.majorforge.preparation.0"
+    {
+        return Err("binding refused".to_owned());
+    }
+    Ok(())
+}
+
+fn read_bounded_request(reader: &mut BufReader<File>) -> Result<String, String> {
+    let mut line = String::new();
+    reader
+        .take(64 * 1024)
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
+    if line.is_empty() || line.len() >= 64 * 1024 || !line.ends_with('\n') {
+        return Err("bounded request frame refused".to_owned());
+    }
+    Ok(line)
 }
 
 fn validate_request(binding: &Binding, request: &Request) -> Result<(), String> {
@@ -229,7 +306,8 @@ fn validate_request(binding: &Binding, request: &Request) -> Result<(), String> 
         || request.binding.preparation_id != binding.preparation_id
         || request.binding.domain_name != binding.domain_name
         || request.binding.domain_uuid != binding.domain_uuid
-        || request.binding.staging_path != binding.staging_path
+        || request.binding.staging_path != binding.staging_identity.path
+        || request.binding.recipe != "V1"
         || request.binding.expected_state != "InstalledSystemProven"
     {
         return Err("request refused".to_owned());
@@ -417,12 +495,23 @@ mod tests {
             preparation_id: "5d87db391be74e86bd0c7dca042295c3".to_owned(),
             domain_name: "forge-prepare-fedora-workstation-44-1.7-5d87db39".to_owned(),
             domain_uuid: "ae82467d-10dd-4d33-b6ab-52f67e11e795".to_owned(),
-            staging_path:
-                "/var/lib/libvirt/images/forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2"
-                    .to_owned(),
+            staging_identity: StagingIdentity {
+                path:
+                    "/var/lib/libvirt/images/forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2"
+                        .to_owned(),
+                volume_name: "forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2".to_owned(),
+                volume_key:
+                    "/var/lib/libvirt/images/forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2"
+                        .to_owned(),
+                inode: 445_745,
+                capacity_bytes: 80 * 1024 * 1024 * 1024,
+            },
+            normalization_recipe: "V1".to_owned(),
             expected_state: "InstalledSystemProven".to_owned(),
             bootstrap_transaction_id: "bootstrap-test".to_owned(),
             helper_sha256: "a".repeat(64),
+            generator_sha256: "a".repeat(64),
+            channel_name: "org.majorforge.preparation.0".to_owned(),
         }
     }
 
@@ -434,7 +523,8 @@ mod tests {
                 preparation_id: binding.preparation_id,
                 domain_name: binding.domain_name,
                 domain_uuid: binding.domain_uuid,
-                staging_path: binding.staging_path,
+                staging_path: binding.staging_identity.path,
+                recipe: "V1".to_owned(),
                 expected_state: binding.expected_state,
             },
             operation: "ReadOnlyGuestInventoryProbe".to_owned(),
@@ -462,6 +552,73 @@ mod tests {
         values.push(value);
         for value in values {
             assert!(validate_request(&binding(), &value).is_err());
+        }
+    }
+
+    #[test]
+    fn producer_canonical_binding_bytes_are_accepted_by_helper() {
+        // This is the broker's expected_real_binding serialization contract:
+        // serde_json::to_vec_pretty over the nested canonical object.
+        let producer_value = serde_json::json!({
+            "protocol_version": 1,
+            "preparation_id": "5d87db391be74e86bd0c7dca042295c3",
+            "domain_name": "forge-prepare-fedora-workstation-44-1.7-5d87db39",
+            "domain_uuid": "ae82467d-10dd-4d33-b6ab-52f67e11e795",
+            "staging_identity": {
+                "path": "/var/lib/libvirt/images/forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2",
+                "volume_name": "forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2",
+                "volume_key": "/var/lib/libvirt/images/forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2",
+                "inode": 445_745,
+                "capacity_bytes": 80u64 * 1024 * 1024 * 1024
+            },
+            "normalization_recipe": "V1",
+            "expected_state": "InstalledSystemProven",
+            "bootstrap_transaction_id": "bootstrap-test",
+            "helper_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generator_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "channel_name": "org.majorforge.preparation.0"
+        });
+        let canonical_bytes = serde_json::to_vec_pretty(&producer_value).unwrap();
+        let parsed = parse_binding_bytes(&canonical_bytes).unwrap();
+        assert!(validate_binding(&parsed).is_ok());
+    }
+
+    #[test]
+    fn binding_contract_rejects_legacy_unknown_and_identity_mismatches() {
+        let canonical = serde_json::to_value(binding()).unwrap();
+        let mut cases = Vec::new();
+        let mut legacy = canonical.clone();
+        legacy.as_object_mut().unwrap().remove("staging_identity");
+        legacy.as_object_mut().unwrap().insert(
+            "staging_path".to_owned(),
+            serde_json::Value::String("/var/lib/libvirt/images/legacy.qcow2".to_owned()),
+        );
+        cases.push(serde_json::to_vec(&legacy).unwrap());
+        let mut unknown = canonical.clone();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".to_owned(), serde_json::Value::Bool(true));
+        cases.push(serde_json::to_vec(&unknown).unwrap());
+        for field in [
+            "preparation_id",
+            "domain_uuid",
+            "normalization_recipe",
+            "channel_name",
+        ] {
+            let mut mismatch = canonical.clone();
+            mismatch
+                .as_object_mut()
+                .unwrap()
+                .get_mut(field)
+                .unwrap()
+                .clone_from(&serde_json::Value::String("wrong".to_owned()));
+            cases.push(serde_json::to_vec(&mismatch).unwrap());
+        }
+        cases.push(b"not-json".to_vec());
+        for bytes in cases {
+            let result = parse_binding_bytes(&bytes).and_then(|value| validate_binding(&value));
+            assert!(result.is_err(), "accepted malformed binding: {bytes:?}");
         }
     }
 }

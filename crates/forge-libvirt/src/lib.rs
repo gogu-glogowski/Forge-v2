@@ -266,6 +266,53 @@ impl LibvirtDefineBackend {
         Ok((handshake, result))
     }
 
+    /// Performs the fixed inventory request followed by one byte-identical replay probe.
+    ///
+    /// # Errors
+    /// Returns transport failures or bounded message-size violations.
+    pub fn preparation_control_exchange_with_replay(
+        &self,
+        name: &str,
+        request: &[u8],
+    ) -> Result<(String, String, String), String> {
+        let domain = Domain::lookup_by_name(&self.connection, name).map_err(|e| e.to_string())?;
+        let stream = Stream::new(&self.connection, 0).map_err(|e| e.to_string())?;
+        domain
+            .open_channel(Some("org.majorforge.preparation.0"), &stream, 0)
+            .map_err(|e| e.to_string())?;
+        let handshake = receive_line(&stream)?;
+        let mut payload = request.to_vec();
+        payload.push(b'\n');
+        send_all(&stream, &payload)?;
+        let result = receive_line(&stream)?;
+        send_all(&stream, &payload)?;
+        let replay = receive_line(&stream)?;
+        stream.finish().map_err(|e| e.to_string())?;
+        Ok((handshake, result, replay))
+    }
+
+    /// Requests standard ACPI shutdown and waits boundedly for shutoff.
+    ///
+    /// # Errors
+    /// Returns lookup, shutdown, state-query, or timeout failures. It never force-stops.
+    pub fn shutdown_preparation_domain(&self, name: &str) -> Result<(), String> {
+        let domain = Domain::lookup_by_name(&self.connection, name).map_err(|e| e.to_string())?;
+        domain.shutdown().map_err(|e| e.to_string())?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let (state, _) = domain.get_state().map_err(|e| e.to_string())?;
+            if map_domain_state(state).map_err(|e| e.to_string())? == forge_core::VmState::Shutoff {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(
+                    "preparation ACPI shutdown timed out; force-stop not authorized".to_owned(),
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
     fn pool(&self, name: &str) -> Result<StoragePool, forge_storage::StorageError> {
         StoragePool::lookup_by_name(&self.connection, name).map_err(storage_backend_error)
     }
@@ -548,6 +595,14 @@ fn receive_line(stream: &Stream) -> Result<String, String> {
         }
     }
     Err("preparation channel message exceeded one MiB".to_owned())
+}
+
+fn send_all(stream: &Stream, payload: &[u8]) -> Result<(), String> {
+    let mut sent = 0;
+    while sent < payload.len() {
+        sent += stream.send(&payload[sent..]).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Produces a define-over-existing document by changing only the exact old disk source.
