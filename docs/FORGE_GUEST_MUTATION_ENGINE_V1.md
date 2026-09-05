@@ -237,6 +237,35 @@ inconsistent journal/evidence/ledger state is fail-closed. Failure injection is
 test-scoped and must leave the source untouched while classifying the candidate
 deterministically.
 
+## Phase 4.6C-IV acceptance harness
+
+Acceptance A covers exact B3-helper-to-corrected-helper migration while
+preserving generator, binding and sentinels. Acceptance B covers an eleven-
+operation multi-artifact plan in one bounded session. Both use fresh
+single-ext4-root ephemeral qcow2 fixtures, candidate isolation, durable
+journal/evidence/ledger publication and replay refusal. Host-native execution
+is required before recording PASS; the agent sandbox only validates that the
+ignored harnesses compile.
+
+Phase 4.6C-IV-R1 authority hardening closes arbitrary guest-path and staging
+alias escape hatches. Public capability construction derives fixed guest paths
+from typed logical destinations; low-level destination injection is test-only.
+Source health is checked with the existing `qemu-img check` boundary. Both
+acceptance harnesses exercise production staging refusal before overlay
+creation, compare the candidate sentinel and preserved files, and verify every
+Acceptance B artifact by reading and hashing the candidate through the
+production adapter verification path. Corrupt, missing, wrong-size, and wrong-
+object-type cases are fail-closed by tests. This phase is ready for host rerun;
+it does not authorize Fedora mutation, VM boot, channels, helper execution,
+inventory, or normalization.
+
+The proven topology remains a single ext4 root. xfs, Btrfs, LVM, metadata
+enforcement (not exercised in Acceptance B), and richer post-install
+automation remain future work. Full automatic post-install/user bootstrap is
+not a V2.5 requirement: first-user setup remains a human/OS step. Any broader
+automation belongs to a future major Forge version, without committing to a
+fixed Forge 3.0 release.
+
 ### Phase 4.6C-III host proof result
 
 Host-native proof demonstrated authoritative source immutability, candidate-only

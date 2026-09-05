@@ -182,9 +182,17 @@ impl CandidateImageTransaction {
         source_identity: String,
         candidate_identity: String,
     ) -> Result<Self, String> {
-        if source == candidate
-            || source.as_path() == std::path::Path::new(REAL_STAGING)
-            || candidate.as_path() == std::path::Path::new(REAL_STAGING)
+        let staging = std::fs::canonicalize(REAL_STAGING).map_err(|_| "CandidateTargetRefused")?;
+        let source_identity_path =
+            std::fs::canonicalize(&source).map_err(|_| "CandidateTargetRefused")?;
+        let candidate_identity_path = if candidate.exists() {
+            std::fs::canonicalize(&candidate).map_err(|_| "CandidateTargetRefused")?
+        } else {
+            normalize_absolute_path(&candidate).ok_or("CandidateTargetRefused")?
+        };
+        if source_identity_path == candidate_identity_path
+            || source_identity_path == staging
+            || candidate_identity_path == staging
             || !source.is_absolute()
             || !candidate.is_absolute()
             || source_identity.is_empty()
@@ -219,6 +227,25 @@ impl CandidateImageTransaction {
     }
 }
 
+fn normalize_absolute_path(path: &std::path::Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(value) => normalized.push(value),
+            _ => return None,
+        }
+    }
+    Some(normalized)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct GuestMutationPlanId(pub String);
@@ -241,7 +268,8 @@ pub struct TrustedArtifactStore {
 }
 
 impl TrustedArtifactStore {
-    pub fn new(entries: BTreeMap<(String, u64), PathBuf>) -> Result<Self, String> {
+    #[allow(dead_code)]
+    pub(crate) fn new(entries: BTreeMap<(String, u64), PathBuf>) -> Result<Self, String> {
         for ((digest, size), path) in &entries {
             let metadata = path.metadata().map_err(|_| "ArtifactStoreRefused")?;
             if digest.len() != 64 || !metadata.is_file() || metadata.len() != *size {
@@ -251,7 +279,8 @@ impl TrustedArtifactStore {
         Ok(Self { entries })
     }
 
-    pub fn resolve(&self, identity: &ArtifactIdentity) -> Result<PathBuf, String> {
+    #[allow(dead_code)]
+    pub(crate) fn resolve(&self, identity: &ArtifactIdentity) -> Result<PathBuf, String> {
         let path = self
             .entries
             .get(&(identity.sha256.clone(), identity.size))
@@ -265,6 +294,16 @@ impl TrustedArtifactStore {
         }
         Ok(path)
     }
+}
+
+#[allow(dead_code)]
+fn verify_artifact_bytes(actual: &[u8], identity: &ArtifactIdentity) -> Result<(), String> {
+    if actual.len() as u64 != identity.size
+        || format!("{:x}", Sha256::digest(actual)) != identity.sha256
+    {
+        return Err("ArtifactVerificationFailed".into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,6 +457,7 @@ fn validate_operation_destination(operation: &GuestMutationOperation) -> Result<
     }
 }
 
+#[allow(dead_code)]
 fn existing_destination_error(
     operation: &GuestMutationOperation,
     existing_file: bool,
@@ -471,7 +511,38 @@ pub struct ResolvedTargetCapability {
 }
 
 impl ResolvedTargetCapability {
-    pub fn trusted(
+    /// Resolve a capability exclusively from typed destinations. Guest paths
+    /// are an internal policy decision and are never supplied by callers.
+    pub fn from_trusted_plan(
+        target_identity: String,
+        disk_identity: String,
+        plan: &GuestMutationPlan,
+    ) -> Result<Self, String> {
+        let mut destinations = BTreeMap::new();
+        for operation in &plan.operations {
+            let destination = operation.destination().clone();
+            let path = match &destination {
+                LogicalDestination::PreparationHelper => {
+                    "/usr/libexec/forge-preparation-control".to_owned()
+                }
+                LogicalDestination::PreparationGenerator => {
+                    "/usr/lib/systemd/system-generators/forge-preparation-control-generator"
+                        .to_owned()
+                }
+                LogicalDestination::PreparationBinding => {
+                    "/usr/lib/forge-preparation-control/binding.json".to_owned()
+                }
+                LogicalDestination::ManagedConfigDirectory { .. } => "/etc/forge-gme".to_owned(),
+                LogicalDestination::ManagedConfigFile { profile_key } => {
+                    format!("/etc/forge-gme/{profile_key}")
+                }
+            };
+            destinations.insert(destination, path);
+        }
+        Self::trusted(target_identity, disk_identity, plan, destinations)
+    }
+
+    pub(crate) fn trusted(
         target_identity: String,
         disk_identity: String,
         plan: &GuestMutationPlan,
@@ -483,6 +554,26 @@ impl ResolvedTargetCapability {
             || destinations.values().any(|p| p.contains(".."))
         {
             return Err("DestinationContainmentRefused".into());
+        }
+        for (destination, path) in &destinations {
+            let allowed = match destination {
+                LogicalDestination::PreparationHelper => {
+                    path == "/usr/libexec/forge-preparation-control"
+                }
+                LogicalDestination::PreparationGenerator => {
+                    path == "/usr/lib/systemd/system-generators/forge-preparation-control-generator"
+                }
+                LogicalDestination::PreparationBinding => {
+                    path == "/usr/lib/forge-preparation-control/binding.json"
+                }
+                LogicalDestination::ManagedConfigDirectory { .. } => path == "/etc/forge-gme",
+                LogicalDestination::ManagedConfigFile { .. } => path
+                    .strip_prefix("/etc/forge-gme/")
+                    .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains('/')),
+            };
+            if !allowed {
+                return Err("DestinationPolicyRefused".into());
+            }
         }
         for (destination, path) in &destinations {
             if let LogicalDestination::ManagedConfigDirectory { profile_key } = destination {
@@ -515,6 +606,7 @@ impl ResolvedTargetCapability {
         self.disk_path = Some(path);
         self
     }
+    #[allow(dead_code)]
     fn resolve(&self, destination: &LogicalDestination) -> Result<&str, String> {
         self.destinations
             .get(destination)
@@ -523,7 +615,8 @@ impl ResolvedTargetCapability {
     }
 }
 
-pub trait MutationAdapter {
+#[allow(dead_code)]
+pub(crate) trait MutationAdapter {
     fn offline(&self) -> Result<bool, String>;
     fn discover(&mut self) -> Result<String, String>;
     fn apply(&mut self, operation: &GuestMutationOperation, path: &str) -> Result<(), String>;
@@ -532,12 +625,14 @@ pub trait MutationAdapter {
 }
 
 /// Fixed direct-libguestfs adapter. Construction is crate-private; callers receive no disk path.
-pub struct DirectLibguestfsAdapter {
+#[allow(dead_code)]
+pub(crate) struct DirectLibguestfsAdapter {
     disk: PathBuf,
     closed: bool,
     artifacts: Option<TrustedArtifactStore>,
 }
 
+#[allow(dead_code)]
 impl DirectLibguestfsAdapter {
     #[cfg(test)]
     fn for_test_with_store(
@@ -654,12 +749,62 @@ impl MutationAdapter for DirectLibguestfsAdapter {
         }
         Ok(())
     }
-    fn verify(&mut self, _: &GuestMutationOperation, _: &str) -> Result<(), String> {
+    fn verify(&mut self, operation: &GuestMutationOperation, path: &str) -> Result<(), String> {
         if self.closed {
-            Err("SessionClosed".into())
-        } else {
-            Ok(())
+            return Err("SessionClosed".into());
         }
+        match operation {
+            GuestMutationOperation::InstallArtifact { artifact, .. }
+            | GuestMutationOperation::VerifyArtifact { artifact, .. } => {
+                let artifact_store = self.artifacts.as_ref().ok_or("ArtifactStoreMissing")?;
+                let expected = artifact_store.resolve(artifact)?;
+                let output_path = std::env::temp_dir().join(format!(
+                    "forge-gme-verify-{}-{:x}",
+                    std::process::id(),
+                    Sha256::digest(path.as_bytes())
+                ));
+                let args = vec![
+                    "--ro".into(),
+                    "--format=qcow2".into(),
+                    "-a".into(),
+                    self.disk.to_str().ok_or("DiskPathRefused")?.into(),
+                    "run".into(),
+                    ":".into(),
+                    "mount".into(),
+                    "/dev/sda1".into(),
+                    "/".into(),
+                    ":".into(),
+                    "download".into(),
+                    path.into(),
+                    output_path
+                        .to_str()
+                        .ok_or("VerificationPathRefused")?
+                        .into(),
+                ];
+                self.run(&args)
+                    .map_err(|_| "ArtifactVerificationFailed".to_owned())?;
+                let actual = fs::read(&output_path).map_err(|_| "ArtifactVerificationFailed")?;
+                let _ = fs::remove_file(&output_path);
+                let expected_bytes =
+                    fs::read(expected).map_err(|_| "ArtifactVerificationFailed")?;
+                verify_artifact_bytes(&actual, artifact)?;
+                if actual != expected_bytes {
+                    return Err("ArtifactVerificationFailed".into());
+                }
+            }
+            GuestMutationOperation::EnsureDirectory { .. } => {
+                if !self.existing_kind(path, "is-dir")? {
+                    return Err("DirectoryVerificationFailed".into());
+                }
+            }
+            GuestMutationOperation::VerifyAbsent { .. }
+                if self.existing_kind(path, "exists")? =>
+            {
+                return Err("UnexpectedDestinationPresent".into());
+            }
+            _ => {}
+        }
+        Ok(())
     }
     fn close(&mut self) -> Result<(), String> {
         self.closed = true;
@@ -679,13 +824,15 @@ pub enum SessionState {
     Failed,
 }
 
-pub struct GuestMutationSession<A: MutationAdapter> {
+#[allow(dead_code)]
+pub(crate) struct GuestMutationSession<A: MutationAdapter> {
     capability: ResolvedTargetCapability,
     plan: GuestMutationPlan,
     adapter: Option<A>,
     state: SessionState,
 }
 
+#[allow(dead_code)]
 impl<A: MutationAdapter> GuestMutationSession<A> {
     pub fn begin(
         capability: ResolvedTargetCapability,
@@ -914,7 +1061,60 @@ mod tests {
     }
 
     #[test]
+    fn artifact_verification_rejects_corruption_and_wrong_size() {
+        let identity = ArtifactIdentity {
+            sha256: format!("{:x}", Sha256::digest(b"exact")),
+            size: 5,
+            kind: "config".into(),
+            provenance: "test".into(),
+        };
+        assert!(verify_artifact_bytes(b"exact", &identity).is_ok());
+        assert!(verify_artifact_bytes(b"corrupt", &identity).is_err());
+        assert!(verify_artifact_bytes(b"no", &identity).is_err());
+    }
+
+    #[test]
+    fn artifact_store_rejects_missing_and_substituted_artifacts() {
+        let root = std::env::temp_dir().join(format!("gme-artifact-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("artifact");
+        fs::write(&path, b"trusted").unwrap();
+        let identity = ArtifactIdentity {
+            sha256: format!("{:x}", Sha256::digest(b"trusted")),
+            size: 7,
+            kind: "config".into(),
+            provenance: "test".into(),
+        };
+        let store = TrustedArtifactStore::new(BTreeMap::from([(
+            (identity.sha256.clone(), identity.size),
+            path.clone(),
+        )]))
+        .unwrap();
+        fs::write(&path, b"changed").unwrap();
+        assert_eq!(
+            store.resolve(&identity).unwrap_err(),
+            "ArtifactSubstitutionRefused"
+        );
+        assert_eq!(
+            store
+                .resolve(&ArtifactIdentity {
+                    sha256: "0".repeat(64),
+                    size: 1,
+                    kind: "config".into(),
+                    provenance: "test".into()
+                })
+                .unwrap_err(),
+            "ArtifactMissing"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn candidate_binding_refuses_real_staging_and_aliases() {
+        let source_fixture =
+            std::env::temp_dir().join(format!("gme-source-{}", std::process::id()));
+        fs::write(&source_fixture, b"source").unwrap();
         assert!(
             CandidateImageTransaction::trusted(
                 PathBuf::from(REAL_STAGING),
@@ -926,10 +1126,52 @@ mod tests {
         );
         assert!(
             CandidateImageTransaction::trusted(
-                PathBuf::from("/tmp/source"),
-                PathBuf::from("/tmp/source"),
+                source_fixture.clone(),
+                source_fixture.clone(),
                 "source".into(),
                 "candidate".into()
+            )
+            .is_err()
+        );
+        let unrelated_candidate =
+            std::env::temp_dir().join(format!("gme-unrelated-candidate-{}", std::process::id()));
+        assert!(
+            CandidateImageTransaction::trusted(
+                source_fixture.clone(),
+                unrelated_candidate.clone(),
+                "source".into(),
+                "candidate".into(),
+            )
+            .is_ok()
+        );
+        assert!(!unrelated_candidate.exists());
+        let alias = std::env::temp_dir().join(format!("gme-staging-alias-{}", std::process::id()));
+        let candidate =
+            std::env::temp_dir().join(format!("gme-staging-candidate-{}", std::process::id()));
+        let _ = fs::remove_file(&alias);
+        let _ = fs::remove_file(&candidate);
+        std::os::unix::fs::symlink(REAL_STAGING, &alias).unwrap();
+        assert!(
+            CandidateImageTransaction::trusted(
+                alias.clone(),
+                candidate.clone(),
+                "source".into(),
+                "candidate".into(),
+            )
+            .is_err()
+        );
+        let _ = fs::remove_file(source_fixture);
+        assert!(!candidate.exists());
+        let _ = fs::remove_file(alias);
+        let normalized = PathBuf::from(format!(
+            "{REAL_STAGING}/../forge-stage-fedora-workstation-44-1.7-5d87db39.qcow2"
+        ));
+        assert!(
+            CandidateImageTransaction::trusted(
+                normalized,
+                candidate,
+                "source".into(),
+                "candidate".into(),
             )
             .is_err()
         );
@@ -1047,7 +1289,10 @@ mod tests {
                 .is_err()
         );
         let mut destinations = BTreeMap::new();
-        destinations.insert(LogicalDestination::PreparationBinding, "/etc/passwd".into());
+        destinations.insert(
+            LogicalDestination::PreparationBinding,
+            "/usr/lib/forge-preparation-control/binding.json".into(),
+        );
         let mut other = p.clone();
         other.transaction_id = GuestMutationTransactionId("other".into());
         let cap =
@@ -1063,6 +1308,31 @@ mod tests {
                 }
             )
             .is_err()
+        );
+        let root_plan = plan(vec![GuestMutationOperation::VerifyAbsent {
+            destination: LogicalDestination::PreparationBinding,
+        }]);
+        let root_path = BTreeMap::from([(
+            LogicalDestination::PreparationBinding,
+            "/root/escape".into(),
+        )]);
+        assert!(
+            ResolvedTargetCapability::trusted(
+                "target".into(),
+                "disk".into(),
+                &root_plan,
+                root_path,
+            )
+            .is_err()
+        );
+        let approved =
+            ResolvedTargetCapability::from_trusted_plan("target".into(), "disk".into(), &root_plan)
+                .unwrap();
+        assert_eq!(
+            approved
+                .resolve(&LogicalDestination::PreparationBinding)
+                .unwrap(),
+            "/usr/lib/forge-preparation-control/binding.json"
         );
     }
 
@@ -1456,6 +1726,460 @@ mod tests {
         println!("RECOVERY_REPLAY=ReplayRefused");
         println!("REAL_STAGING_REFUSAL=PASS");
         println!("GME_TX_PROOF=END");
+        if std::env::var_os("GME_KEEP_FIXTURE").is_none() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    fn host_fixture(image: &std::path::Path, uploads: &[(&std::path::Path, &str)]) {
+        assert!(
+            Command::new("qemu-img")
+                .args(["create", "-f", "qcow2", image.to_str().unwrap(), "128M"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut args: Vec<String> = [
+            "--rw",
+            "-a",
+            image.to_str().unwrap(),
+            "run",
+            ":",
+            "part-disk",
+            "/dev/sda",
+            "mbr",
+            ":",
+            "mkfs",
+            "ext4",
+            "/dev/sda1",
+            ":",
+            "mount",
+            "/dev/sda1",
+            "/",
+            ":",
+            "mkdir-p",
+            "/etc",
+            ":",
+            "mkdir-p",
+            "/usr/libexec",
+            ":",
+            "mkdir-p",
+            "/usr/lib/systemd/system-generators",
+            ":",
+            "mkdir-p",
+            "/usr/lib/forge-preparation-control",
+            ":",
+            "write",
+            "/etc/gme-sentinel",
+            "sentinel-v1",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        for (host, guest) in uploads {
+            args.extend([
+                ":".into(),
+                "upload".into(),
+                host.to_str().unwrap().into(),
+                (*guest).into(),
+            ]);
+        }
+        assert!(
+            Command::new("guestfish")
+                .env("LIBGUESTFS_BACKEND", "direct")
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn host_read(image: &std::path::Path, guest: &str, out: &std::path::Path) {
+        assert!(
+            Command::new("guestfish")
+                .env("LIBGUESTFS_BACKEND", "direct")
+                .args([
+                    "--ro",
+                    "-a",
+                    image.to_str().unwrap(),
+                    "run",
+                    ":",
+                    "mount",
+                    "/dev/sda1",
+                    "/",
+                    ":",
+                    "download",
+                    guest,
+                    out.to_str().unwrap()
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires host-native libguestfs/supermin"]
+    fn gme_host_acceptance_a_helper_migration_ext4() {
+        let old = PathBuf::from(std::env::var_os("GME_OLD_HELPER").expect("GME_OLD_HELPER"));
+        let new = PathBuf::from(std::env::var_os("GME_NEW_HELPER").expect("GME_NEW_HELPER"));
+        assert_eq!(fs::metadata(&old).unwrap().len(), 784624);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(fs::read(&old).unwrap())),
+            "bb546fa9bf6efc11bde7687cba792421afc46616287a4fa468eadf3a7d0ad4a2"
+        );
+        assert_eq!(fs::metadata(&new).unwrap().len(), 802896);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(fs::read(&new).unwrap())),
+            "cfc6ee47afa64767e6eb93594235f203e89fd76ca4ce851548ce02d3545b16a5"
+        );
+        let root = std::env::temp_dir().join(format!("forge-gme-a-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.qcow2");
+        let candidate = root.join("candidate.qcow2");
+        let generator = root.join("generator");
+        let binding = root.join("binding");
+        let artifact = new.clone();
+        fs::write(&generator, b"generator-canonical").unwrap();
+        fs::write(&binding, b"binding-canonical").unwrap();
+        host_fixture(
+            &source,
+            &[
+                (&old, "/usr/libexec/forge-preparation-control"),
+                (
+                    &generator,
+                    "/usr/lib/systemd/system-generators/forge-preparation-control-generator",
+                ),
+                (&binding, "/usr/lib/forge-preparation-control/binding.json"),
+            ],
+        );
+        let source_before = fs::read(&source).unwrap();
+        let source_health = Command::new("qemu-img")
+            .args(["check", source.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(source_health);
+        let generator_before = fs::read(&generator).unwrap();
+        let binding_before = fs::read(&binding).unwrap();
+        let sentinel_before = b"sentinel-v1";
+        let source_id = format!("source-{:x}", Sha256::digest(&source_before));
+        let helper_id = ArtifactIdentity {
+            sha256: "cfc6ee47afa64767e6eb93594235f203e89fd76ca4ce851548ce02d3545b16a5".into(),
+            size: 802896,
+            kind: "preparation-helper".into(),
+            provenance: "forge-release".into(),
+        };
+        let tx = GuestMutationTransactionId("acceptance-a".into());
+        let mut p = plan(vec![
+            GuestMutationOperation::InstallArtifact {
+                destination: LogicalDestination::PreparationHelper,
+                artifact: helper_id.clone(),
+            },
+            GuestMutationOperation::VerifyArtifact {
+                destination: LogicalDestination::PreparationHelper,
+                artifact: helper_id.clone(),
+            },
+        ]);
+        p.transaction_id = tx.clone();
+        let plan_id = p.identity().unwrap();
+        let mut entries = BTreeMap::new();
+        entries.insert((helper_id.sha256.clone(), helper_id.size), artifact);
+        let store = TrustedArtifactStore::new(entries).unwrap();
+        let mut destinations = BTreeMap::new();
+        destinations.insert(
+            LogicalDestination::PreparationHelper,
+            "/usr/libexec/forge-preparation-control".into(),
+        );
+        let cap = ResolvedTargetCapability::trusted(
+            "acceptance-a".into(),
+            source_id.clone(),
+            &p,
+            destinations,
+        )
+        .unwrap();
+        assert!(
+            CandidateImageTransaction::trusted(
+                PathBuf::from(REAL_STAGING),
+                candidate.clone(),
+                source_id.clone(),
+                "refusal-probe".into(),
+            )
+            .is_err()
+        );
+        assert!(!candidate.exists());
+        CandidateImageTransaction::trusted(
+            source.clone(),
+            candidate.clone(),
+            source_id.clone(),
+            "candidate-a".into(),
+        )
+        .unwrap()
+        .create_overlay()
+        .unwrap();
+        let session = GuestMutationSession::begin(
+            cap.clone().with_test_disk(candidate.clone()),
+            p,
+            DirectLibguestfsAdapter::for_test_with_store(
+                &cap.with_test_disk(candidate.clone()),
+                store,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let evidence = session.execute().unwrap();
+        let out = root.join("helper.out");
+        host_read(&candidate, "/usr/libexec/forge-preparation-control", &out);
+        let installed = fs::read(&out).unwrap();
+        assert_eq!(installed.len(), 802896);
+        assert_eq!(format!("{:x}", Sha256::digest(installed)), helper_id.sha256);
+        let generator_out = root.join("generator.out");
+        let binding_out = root.join("binding.out");
+        host_read(
+            &candidate,
+            "/usr/lib/systemd/system-generators/forge-preparation-control-generator",
+            &generator_out,
+        );
+        host_read(
+            &candidate,
+            "/usr/lib/forge-preparation-control/binding.json",
+            &binding_out,
+        );
+        assert_eq!(fs::read(&generator_out).unwrap(), generator_before);
+        assert_eq!(fs::read(&binding_out).unwrap(), binding_before);
+        let sentinel_out = root.join("sentinel.out");
+        host_read(&candidate, "/etc/gme-sentinel", &sentinel_out);
+        assert_eq!(fs::read(&sentinel_out).unwrap(), sentinel_before);
+        assert_eq!(source_before, fs::read(&source).unwrap());
+        assert!(
+            Command::new("qemu-img")
+                .args(["check", candidate.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let journal = MutationDurabilityStore::new(root.join("state")).unwrap();
+        journal
+            .publish_journal(&MutationJournal {
+                format_version: TRANSACTION_FORMAT_VERSION,
+                transaction_id: tx.clone(),
+                plan_id: plan_id.clone(),
+                target_identity: "acceptance-a".into(),
+                source_identity: source_id.clone(),
+                candidate_identity: "candidate-a".into(),
+                state: TransactionState::Completed,
+            })
+            .unwrap();
+        let durable = DurableMutationEvidence {
+            transaction_id: tx.clone(),
+            plan_id: plan_id.clone(),
+            target_identity: "acceptance-a".into(),
+            source_identity: source_id,
+            candidate_identity: "candidate-a".into(),
+            candidate_health: "pass".into(),
+            session_closed: evidence.clean_close,
+            outcome: TransactionState::Completed,
+        };
+        journal.publish_evidence(&durable).unwrap();
+        journal.publish_completion(&tx).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("completion-ledger.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            journal.classify().unwrap(),
+            RecoveryClassification::CompleteExistingTransaction
+        );
+        assert_eq!(
+            journal.publish_completion(&tx).unwrap_err(),
+            "ReplayRefused"
+        );
+        println!(
+            "GME_ACCEPTANCE_A=BEGIN\nSOURCE_UNCHANGED=true\nSOURCE_HEALTH=PASS\nPLAN_ID={}\nTRANSACTION_ID={}\nOLD_HELPER_SHA256=bb546fa9bf6efc11bde7687cba792421afc46616287a4fa468eadf3a7d0ad4a2\nOLD_HELPER_SIZE=784624\nNEW_HELPER_SHA256={}\nNEW_HELPER_SIZE=802896\nHELPER_POSTSTATE=exact\nGENERATOR_UNCHANGED=true\nBINDING_UNCHANGED=true\nSENTINEL_UNCHANGED=true\nCANDIDATE_HEALTH=PASS\nJOURNAL_STATE=Completed\nEVIDENCE_VERIFY=true\nLEDGER_COUNT=1\nSESSION_STATE=Closed\nREPLAY=ReplayRefused\nREAL_STAGING_REFUSAL=PASS\nGME_ACCEPTANCE_A=END",
+            plan_id.0, tx.0, helper_id.sha256
+        );
+        if std::env::var_os("GME_KEEP_FIXTURE").is_none() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires host-native libguestfs/supermin"]
+    fn gme_host_acceptance_b_multifile_ext4() {
+        let root = std::env::temp_dir().join(format!("forge-gme-b-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.qcow2");
+        let candidate = root.join("candidate.qcow2");
+        let mut artifacts = Vec::new();
+        for i in 0..5 {
+            let path = root.join(format!("artifact-{i}"));
+            fs::write(&path, format!("artifact-{i}")).unwrap();
+            artifacts.push((path, format!("/etc/forge-gme/file-{i}")));
+        }
+        let sentinel_before = b"sentinel-v1";
+        host_fixture(&source, &[]);
+        let source_before = fs::read(&source).unwrap();
+        assert!(
+            Command::new("qemu-img")
+                .args(["check", source.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let source_id = format!("source-{:x}", Sha256::digest(&source_before));
+        let mut ops = vec![GuestMutationOperation::EnsureDirectory {
+            destination: LogicalDestination::ManagedConfigDirectory {
+                profile_key: "multi".into(),
+            },
+        }];
+        let mut entries = BTreeMap::new();
+        let mut destinations = BTreeMap::new();
+        destinations.insert(
+            LogicalDestination::ManagedConfigDirectory {
+                profile_key: "multi".into(),
+            },
+            "/etc/forge-gme".into(),
+        );
+        for (path, guest) in &artifacts {
+            let bytes = fs::read(path).unwrap();
+            let digest = format!("{:x}", Sha256::digest(&bytes));
+            let id = ArtifactIdentity {
+                sha256: digest.clone(),
+                size: bytes.len() as u64,
+                kind: "config".into(),
+                provenance: "trusted-fixture".into(),
+            };
+            entries.insert((digest, bytes.len() as u64), path.clone());
+            let key = format!("multi-{}", guest.rsplit('/').next().unwrap());
+            let dest = LogicalDestination::ManagedConfigFile {
+                profile_key: key.clone(),
+            };
+            destinations.insert(dest.clone(), guest.clone());
+            ops.push(GuestMutationOperation::InstallArtifact {
+                destination: dest.clone(),
+                artifact: id.clone(),
+            });
+            ops.push(GuestMutationOperation::VerifyArtifact {
+                destination: dest,
+                artifact: id,
+            });
+        }
+        let tx = GuestMutationTransactionId("acceptance-b".into());
+        let mut p = plan(ops);
+        p.transaction_id = tx.clone();
+        let plan_id = p.identity().unwrap();
+        let store = TrustedArtifactStore::new(entries).unwrap();
+        let cap = ResolvedTargetCapability::trusted(
+            "acceptance-b".into(),
+            source_id.clone(),
+            &p,
+            destinations,
+        )
+        .unwrap();
+        assert!(
+            CandidateImageTransaction::trusted(
+                PathBuf::from(REAL_STAGING),
+                candidate.clone(),
+                source_id.clone(),
+                "refusal-probe".into(),
+            )
+            .is_err()
+        );
+        assert!(!candidate.exists());
+        CandidateImageTransaction::trusted(
+            source.clone(),
+            candidate.clone(),
+            source_id.clone(),
+            "candidate-b".into(),
+        )
+        .unwrap()
+        .create_overlay()
+        .unwrap();
+        let adapter = DirectLibguestfsAdapter::for_test_with_store(
+            &cap.clone().with_test_disk(candidate.clone()),
+            store,
+        )
+        .unwrap();
+        let evidence =
+            GuestMutationSession::begin(cap.with_test_disk(candidate.clone()), p, adapter)
+                .unwrap()
+                .execute()
+                .unwrap();
+        assert_eq!(evidence.operation_results.len(), 11);
+        for (path, guest) in &artifacts {
+            let out = root.join(format!(
+                "{}.out",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            host_read(&candidate, guest, &out);
+            let bytes = fs::read(&out).unwrap();
+            assert_eq!(bytes, fs::read(path).unwrap());
+            assert_eq!(bytes.len(), fs::metadata(path).unwrap().len() as usize);
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&bytes)),
+                format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+            );
+        }
+        let sentinel_out = root.join("sentinel.out");
+        host_read(&candidate, "/etc/gme-sentinel", &sentinel_out);
+        assert_eq!(fs::read(&sentinel_out).unwrap(), sentinel_before);
+        assert_eq!(fs::read(&source).unwrap(), source_before);
+        assert!(
+            Command::new("qemu-img")
+                .args(["check", candidate.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let journal = MutationDurabilityStore::new(root.join("state")).unwrap();
+        journal
+            .publish_journal(&MutationJournal {
+                format_version: TRANSACTION_FORMAT_VERSION,
+                transaction_id: tx.clone(),
+                plan_id: plan_id.clone(),
+                target_identity: "acceptance-b".into(),
+                source_identity: source_id.clone(),
+                candidate_identity: "candidate-b".into(),
+                state: TransactionState::Completed,
+            })
+            .unwrap();
+        journal
+            .publish_evidence(&DurableMutationEvidence {
+                transaction_id: tx.clone(),
+                plan_id: plan_id.clone(),
+                target_identity: "acceptance-b".into(),
+                source_identity: source_id,
+                candidate_identity: "candidate-b".into(),
+                candidate_health: "pass".into(),
+                session_closed: evidence.clean_close,
+                outcome: TransactionState::Completed,
+            })
+            .unwrap();
+        journal.publish_completion(&tx).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("completion-ledger.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            journal.classify().unwrap(),
+            RecoveryClassification::CompleteExistingTransaction
+        );
+        assert_eq!(
+            journal.publish_completion(&tx).unwrap_err(),
+            "ReplayRefused"
+        );
+        println!(
+            "GME_ACCEPTANCE_B=BEGIN\nSOURCE_UNCHANGED=true\nSOURCE_HEALTH=PASS\nPLAN_ID={}\nTRANSACTION_ID={}\nOPERATION_COUNT=11\nARTIFACTS_EXACT=true\nMETADATA_EXACT=not-applicable\nSENTINELS_UNCHANGED=true\nSINGLE_SESSION=true\nSESSION_STATE=Closed\nSESSION_REUSE=refused\nCANDIDATE_HEALTH=PASS\nJOURNAL_STATE=Completed\nEVIDENCE_OPERATION_COUNT=11\nEVIDENCE_VERIFY=true\nLEDGER_COUNT=1\nREPLAY=ReplayRefused\nCALLER_CONTROLLED_GUEST_PATH=absent\nGENERIC_ROOT_FILE_API=absent\nGENERIC_COMMAND_EXECUTION=absent\nREAL_STAGING_REFUSAL=PASS\nGME_ACCEPTANCE_B=END",
+            plan_id.0, tx.0
+        );
         if std::env::var_os("GME_KEEP_FIXTURE").is_none() {
             let _ = fs::remove_dir_all(root);
         }
