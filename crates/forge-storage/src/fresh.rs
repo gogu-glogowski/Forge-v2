@@ -886,6 +886,7 @@ mod tests {
                 manifest_file: format!("{generation}.json"),
             }],
             cleanup_progress: vec![],
+            delete_state: None,
         };
         let manifest = GenerationManifest {
             schema_version: forge_state::SCHEMA_VERSION,

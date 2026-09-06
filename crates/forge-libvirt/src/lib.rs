@@ -157,6 +157,83 @@ pub fn sorted_domains(mut domains: Vec<DomainSummary>) -> Vec<DomainSummary> {
     domains
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactDomainIdentity {
+    pub name: String,
+    pub uuid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainDeleteObservation {
+    ExactPresent {
+        identity: ExactDomainIdentity,
+        state: VmState,
+        persistent: bool,
+    },
+    Absent,
+    Conflict(String),
+}
+
+/// Applies the destructive undefine policy to a synthetic observation. The
+/// policy is kept separate from the libvirt adapter so it can be tested
+/// without touching a host domain.
+pub fn authorize_domain_undefine(
+    expected: &ExactDomainIdentity,
+    observed: &DomainDeleteObservation,
+) -> Result<(), String> {
+    match observed {
+        DomainDeleteObservation::ExactPresent {
+            identity,
+            state,
+            persistent,
+        } if identity == expected && *persistent && *state == VmState::Shutoff => Ok(()),
+        DomainDeleteObservation::ExactPresent { state, .. } if *state != VmState::Shutoff => {
+            Err("domain undefine requires the exact domain to be shutoff".to_owned())
+        }
+        DomainDeleteObservation::ExactPresent {
+            persistent: false, ..
+        } => Err("domain undefine requires a persistent exact domain".to_owned()),
+        DomainDeleteObservation::ExactPresent { .. } => {
+            Err("domain identity changed before undefine".to_owned())
+        }
+        DomainDeleteObservation::Absent => Err("exact domain is already absent".to_owned()),
+        DomainDeleteObservation::Conflict(reason) => {
+            Err(format!("domain undefine refused: {reason}"))
+        }
+    }
+}
+
+/// Classifies a complete libvirt domain listing against one exact expected
+/// identity. Name-only or UUID-only matches are conflicts, never absence.
+#[must_use]
+pub fn classify_domain_delete_observation(
+    expected: &ExactDomainIdentity,
+    domains: &[DomainSummary],
+) -> DomainDeleteObservation {
+    let name_matches = domains
+        .iter()
+        .filter(|domain| domain.name == expected.name)
+        .collect::<Vec<_>>();
+    let uuid_matches = domains
+        .iter()
+        .filter(|domain| domain.uuid == expected.uuid)
+        .collect::<Vec<_>>();
+    if name_matches.len() == 1 && uuid_matches.len() == 1 && name_matches[0] == uuid_matches[0] {
+        let summary = name_matches[0];
+        return DomainDeleteObservation::ExactPresent {
+            identity: expected.clone(),
+            state: summary.state,
+            persistent: summary.persistent,
+        };
+    }
+    if !name_matches.is_empty() || !uuid_matches.is_empty() {
+        return DomainDeleteObservation::Conflict(
+            "domain name and UUID do not identify one exact domain".to_owned(),
+        );
+    }
+    DomainDeleteObservation::Absent
+}
+
 #[must_use]
 pub fn format_version(version: u32) -> String {
     let major = version / 1_000_000;
@@ -207,6 +284,56 @@ impl LibvirtDefineBackend {
         let (state, _) = domain.get_state().map_err(|error| error.to_string())?;
         Ok(map_domain_state(state).map_err(|error| error.to_string())?
             == forge_core::VmState::Running)
+    }
+
+    /// Observes a domain for a future exact deletion operation. Listing all
+    /// domains lets this distinguish absence from name or UUID reuse.
+    pub fn observe_domain_for_delete(
+        &self,
+        expected: &ExactDomainIdentity,
+    ) -> Result<DomainDeleteObservation, String> {
+        let domains = self
+            .connection
+            .list_all_domains(0)
+            .map_err(|error| error.to_string())?;
+        let summaries = domains
+            .iter()
+            .map(domain_summary)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(classify_domain_delete_observation(expected, &summaries))
+    }
+
+    /// Re-observes and undefines one exact stopped persistent domain. No
+    /// destroy operation, storage deletion, or undefine flags are used.
+    pub fn undefine_domain_exact(&self, expected: &ExactDomainIdentity) -> Result<(), String> {
+        let observed = self.observe_domain_for_delete(expected)?;
+        authorize_domain_undefine(expected, &observed)?;
+        let domain = Domain::lookup_by_uuid_string(&self.connection, &expected.uuid)
+            .map_err(|error| error.to_string())?;
+        let identity = ExactDomainIdentity {
+            name: domain.get_name().map_err(|error| error.to_string())?,
+            uuid: domain
+                .get_uuid_string()
+                .map_err(|error| error.to_string())?,
+        };
+        let (raw_state, _) = domain.get_state().map_err(|error| error.to_string())?;
+        let immediate = DomainDeleteObservation::ExactPresent {
+            identity,
+            state: map_domain_state(raw_state).map_err(|error| error.to_string())?,
+            persistent: domain.is_persistent().map_err(|error| error.to_string())?,
+        };
+        authorize_domain_undefine(expected, &immediate)?;
+        domain.undefine().map_err(|error| error.to_string())?;
+        match self.observe_domain_for_delete(expected)? {
+            DomainDeleteObservation::Absent => Ok(()),
+            DomainDeleteObservation::ExactPresent { .. } => {
+                Err("exact domain remains after undefine".to_owned())
+            }
+            DomainDeleteObservation::Conflict(reason) => {
+                Err(format!("domain identity changed after undefine: {reason}"))
+            }
+        }
     }
 
     fn pool(&self, name: &str) -> Result<StoragePool, forge_storage::StorageError> {
@@ -2750,6 +2877,69 @@ mod tests {
             state: VmState::Shutoff,
             persistent: true,
         }
+    }
+
+    fn expected() -> ExactDomainIdentity {
+        ExactDomainIdentity {
+            name: "fedora-lab".into(),
+            uuid: "domain-uuid".into(),
+        }
+    }
+
+    fn exact_present(state: VmState) -> DomainDeleteObservation {
+        DomainDeleteObservation::ExactPresent {
+            identity: expected(),
+            state,
+            persistent: true,
+        }
+    }
+
+    #[test]
+    fn exact_domain_undefine_policy_accepts_only_stopped_exact_identity() {
+        assert!(authorize_domain_undefine(&expected(), &exact_present(VmState::Shutoff)).is_ok());
+        assert!(authorize_domain_undefine(&expected(), &exact_present(VmState::Running)).is_err());
+        assert!(
+            authorize_domain_undefine(
+                &expected(),
+                &DomainDeleteObservation::ExactPresent {
+                    identity: expected(),
+                    state: VmState::Shutoff,
+                    persistent: false,
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn domain_delete_observation_distinguishes_absence_and_conflict() {
+        assert!(matches!(
+            classify_domain_delete_observation(&expected(), &[]),
+            DomainDeleteObservation::Absent
+        ));
+        assert!(matches!(
+            classify_domain_delete_observation(
+                &expected(),
+                &[domain("fedora-lab", "different-uuid")]
+            ),
+            DomainDeleteObservation::Conflict(_)
+        ));
+        assert!(matches!(
+            classify_domain_delete_observation(
+                &expected(),
+                &[domain("different-name", "domain-uuid")]
+            ),
+            DomainDeleteObservation::Conflict(_)
+        ));
+        assert!(matches!(
+            classify_domain_delete_observation(&expected(), &[domain("fedora-lab", "domain-uuid")]),
+            DomainDeleteObservation::ExactPresent { .. }
+        ));
+    }
+
+    #[test]
+    fn domain_absence_cannot_be_used_as_undefine_authorization() {
+        assert!(authorize_domain_undefine(&expected(), &DomainDeleteObservation::Absent).is_err());
     }
 
     #[test]

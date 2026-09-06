@@ -414,6 +414,7 @@ mod tests {
                     manifest_file: "manifest.json".to_owned(),
                 }],
                 cleanup_progress: vec![],
+                delete_state: None,
             })
         }
         fn rollback_before_ownership(

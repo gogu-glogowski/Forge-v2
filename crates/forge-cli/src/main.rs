@@ -6028,6 +6028,7 @@ mod tests {
                 manifest_file: "generations/gen-test.json".to_owned(),
             }],
             cleanup_progress: vec![],
+            delete_state: None,
         };
         let active = forge_state::GenerationManifest {
             schema_version: forge_state::SCHEMA_VERSION,

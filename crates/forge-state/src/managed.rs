@@ -61,6 +61,61 @@ pub struct GenerationIndex {
     pub generations: Vec<GenerationEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cleanup_progress: Vec<CleanupProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_state: Option<DeleteState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteDomainProgress {
+    UndefinePending,
+    Absent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteResourceProgress {
+    DeletePending,
+    Absent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteResourcePlan {
+    pub generation_id: String,
+    pub resource: ManagedResource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeletePlan {
+    pub domain_name: String,
+    pub domain_uuid: String,
+    pub storage_pool_name: String,
+    pub storage_pool_uuid: String,
+    pub generation_id: String,
+    pub resources: Vec<DeleteResourcePlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteInProgress {
+    pub plan: DeletePlan,
+    pub domain: DeleteDomainProgress,
+    pub resources: Vec<DeleteResourceProgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteTombstone {
+    pub plan: DeletePlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum DeleteState {
+    Deleting(DeleteInProgress),
+    Deleted(DeleteTombstone),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +370,297 @@ pub fn execute_cleanup_candidate<B: CleanupBackend>(
         next_index,
         deleted,
     })
+}
+
+/// Builds the first-version VM deletion plan. Only one consistent Active
+/// generation is eligible; retained, preparing, failed, or ambiguous state is
+/// deliberately outside this contract.
+///
+/// # Errors
+/// Refuses every state that cannot prove one exact VM and its disposable
+/// resources from durable state plus the current libvirt observation.
+pub fn plan_instance_delete(
+    index: &GenerationIndex,
+    manifests: &[GenerationManifest],
+    observed: &ObservedGeneration,
+    reconciliation: ManagedReconciliationStatus,
+) -> Result<DeletePlan, StateError> {
+    validate_index(index)?;
+    if reconciliation != ManagedReconciliationStatus::Consistent {
+        return Err(StateError::InvalidObservedState(
+            "delete requires Consistent managed reconciliation".to_owned(),
+        ));
+    }
+    if index.delete_state.is_some() {
+        return Err(StateError::InvalidObservedState(
+            "delete already has durable state; resume that exact plan".to_owned(),
+        ));
+    }
+    if !index.cleanup_progress.is_empty() {
+        return Err(StateError::InvalidObservedState(
+            "delete is refused while retained cleanup progress exists".to_owned(),
+        ));
+    }
+    if index.generations.iter().any(|entry| {
+        matches!(
+            entry.status,
+            GenerationStatus::Retained | GenerationStatus::Preparing | GenerationStatus::Failed
+        )
+    }) {
+        return Err(StateError::InvalidObservedState(
+            "delete requires one Active generation without retained, preparing, or failed generations"
+                .to_owned(),
+        ));
+    }
+    let active = manifests
+        .iter()
+        .find(|manifest| manifest.generation_id == index.active_generation_id)
+        .ok_or_else(|| {
+            StateError::InvalidObservedState("Active generation manifest is missing".to_owned())
+        })?;
+    if active.status != GenerationStatus::Active
+        || !generation_identity_matches_exact(active, observed)
+        || observed.unmanaged_resources.len() != 0
+    {
+        return Err(StateError::InvalidObservedState(
+            "delete ownership or active libvirt identity is not exact".to_owned(),
+        ));
+    }
+    let mut resources = Vec::new();
+    for expected in &active.resources {
+        if expected.role == ResourceRole::SharedBase {
+            continue;
+        }
+        let actual = observed
+            .resources
+            .iter()
+            .find(|resource| resource.role == expected.role)
+            .ok_or_else(|| {
+                StateError::InvalidObservedState(format!(
+                    "delete resource {:?} is missing from libvirt evidence",
+                    expected.role
+                ))
+            })?;
+        if actual
+            .referenced_by_domains
+            .iter()
+            .any(|domain| domain != &active.domain_name)
+            || !actual.backing_for_volumes.is_empty()
+        {
+            return Err(StateError::InvalidObservedState(format!(
+                "delete resource {:?} has an external reference",
+                expected.role
+            )));
+        }
+        resources.push(DeleteResourcePlan {
+            generation_id: active.generation_id.clone(),
+            resource: expected.clone(),
+        });
+    }
+    if resources.is_empty() {
+        return Err(StateError::InvalidObservedState(
+            "delete plan has no disposable VM-owned resources".to_owned(),
+        ));
+    }
+    resources.sort_by_key(|item| {
+        let role_order = match item.resource.role {
+            ResourceRole::NoCloudSeed => 0,
+            ResourceRole::WritableOverlay => 1,
+            ResourceRole::SharedBase => 2,
+        };
+        (role_order, item.resource.path.clone())
+    });
+    let plan = DeletePlan {
+        domain_name: active.domain_name.clone(),
+        domain_uuid: active.domain_uuid.clone(),
+        storage_pool_name: active.storage_pool_name.clone(),
+        storage_pool_uuid: active.storage_pool_uuid.clone(),
+        generation_id: active.generation_id.clone(),
+        resources,
+    };
+    validate_delete_plan(index, &plan)?;
+    Ok(plan)
+}
+
+fn validate_delete_plan(index: &GenerationIndex, plan: &DeletePlan) -> Result<(), StateError> {
+    if plan.domain_name.is_empty()
+        || plan.domain_uuid.is_empty()
+        || plan.storage_pool_name.is_empty()
+        || plan.storage_pool_uuid.is_empty()
+        || plan.generation_id.is_empty()
+        || plan.resources.is_empty()
+    {
+        return Err(StateError::InvalidObservedState(
+            "delete plan has incomplete exact identity".to_owned(),
+        ));
+    }
+    if index.domain_name != plan.domain_name
+        || index.domain_uuid != plan.domain_uuid
+        || index.active_generation_id != plan.generation_id
+    {
+        return Err(StateError::InvalidObservedState(
+            "delete plan does not match the durable Active identity".to_owned(),
+        ));
+    }
+    let mut identities = BTreeSet::new();
+    for item in &plan.resources {
+        if item.generation_id != plan.generation_id
+            || item.resource.role == ResourceRole::SharedBase
+            || !identities.insert((item.resource.volume_key.clone(), item.resource.path.clone()))
+        {
+            return Err(StateError::InvalidObservedState(
+                "delete plan contains an invalid or duplicate resource".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn same_delete_plan_identity(left: &DeletePlan, right: &DeletePlan) -> bool {
+    left.domain_name == right.domain_name
+        && left.domain_uuid == right.domain_uuid
+        && left.storage_pool_name == right.storage_pool_name
+        && left.storage_pool_uuid == right.storage_pool_uuid
+        && left.generation_id == right.generation_id
+        && left.resources.len() == right.resources.len()
+        && left
+            .resources
+            .iter()
+            .zip(&right.resources)
+            .all(|(left, right)| {
+                left.generation_id == right.generation_id && left.resource == right.resource
+            })
+}
+
+/// Publishes deletion intent before any domain or storage mutation.
+pub fn begin_instance_delete(
+    index: &GenerationIndex,
+    plan: &DeletePlan,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    validate_delete_plan(index, plan)?;
+    if index.delete_state.is_some() {
+        return Err(StateError::InvalidObservedState(
+            "delete intent already exists".to_owned(),
+        ));
+    }
+    let mut next = index.clone();
+    next.delete_state = Some(DeleteState::Deleting(DeleteInProgress {
+        plan: plan.clone(),
+        domain: DeleteDomainProgress::UndefinePending,
+        resources: vec![DeleteResourceProgress::DeletePending; plan.resources.len()],
+    }));
+    validate_index(&next)?;
+    Ok(next)
+}
+
+/// Records exact domain absence after the caller has re-observed the exact
+/// domain identity. This cannot be called before durable delete intent.
+pub fn record_delete_domain_absent(
+    index: &GenerationIndex,
+    plan: &DeletePlan,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    let Some(DeleteState::Deleting(progress)) = &index.delete_state else {
+        return Err(StateError::InvalidObservedState(
+            "domain delete checkpoint requires durable delete intent".to_owned(),
+        ));
+    };
+    if !same_delete_plan_identity(&progress.plan, plan)
+        || progress.domain != DeleteDomainProgress::UndefinePending
+    {
+        return Err(StateError::InvalidObservedState(
+            "domain delete checkpoint does not match the immutable plan".to_owned(),
+        ));
+    }
+    let mut next = index.clone();
+    if let Some(DeleteState::Deleting(progress)) = &mut next.delete_state {
+        progress.domain = DeleteDomainProgress::Absent;
+    }
+    validate_index(&next)?;
+    Ok(next)
+}
+
+/// Records exact absence of one planned volume after immediate identity
+/// revalidation. A missing volume is accepted only after the durable plan
+/// exists and the caller has proved its exact absence.
+pub fn record_delete_resource_absent(
+    index: &GenerationIndex,
+    plan: &DeletePlan,
+    resource: &ManagedResource,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    let Some(DeleteState::Deleting(progress)) = &index.delete_state else {
+        return Err(StateError::InvalidObservedState(
+            "resource checkpoint requires durable delete intent".to_owned(),
+        ));
+    };
+    if !same_delete_plan_identity(&progress.plan, plan)
+        || progress.domain != DeleteDomainProgress::Absent
+    {
+        return Err(StateError::InvalidObservedState(
+            "resource checkpoint requires a completed domain checkpoint".to_owned(),
+        ));
+    }
+    let mut next = index.clone();
+    let Some(DeleteState::Deleting(progress)) = &mut next.delete_state else {
+        unreachable!();
+    };
+    let item = progress
+        .plan
+        .resources
+        .iter_mut()
+        .position(|item| item.resource == *resource)
+        .ok_or_else(|| {
+            StateError::InvalidObservedState(
+                "resource is not part of the immutable delete plan".to_owned(),
+            )
+        })?;
+    if progress.resources[item] != DeleteResourceProgress::DeletePending {
+        return Err(StateError::InvalidObservedState(
+            "resource already has a delete checkpoint".to_owned(),
+        ));
+    }
+    progress.resources[item] = DeleteResourceProgress::Absent;
+    validate_index(&next)?;
+    Ok(next)
+}
+
+/// Publishes the final tombstone only after the domain and every exact
+/// disposable resource have been checkpointed absent.
+pub fn complete_instance_delete(
+    index: &GenerationIndex,
+    plan: &DeletePlan,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    let Some(DeleteState::Deleting(progress)) = &index.delete_state else {
+        return Err(StateError::InvalidObservedState(
+            "delete completion requires durable delete intent".to_owned(),
+        ));
+    };
+    if !same_delete_plan_identity(&progress.plan, plan)
+        || progress.domain != DeleteDomainProgress::Absent
+    {
+        return Err(StateError::InvalidObservedState(
+            "delete completion is missing the domain checkpoint".to_owned(),
+        ));
+    }
+    if progress
+        .resources
+        .iter()
+        .any(|progress| *progress != DeleteResourceProgress::Absent)
+    {
+        return Err(StateError::InvalidObservedState(
+            "delete completion is missing a resource checkpoint".to_owned(),
+        ));
+    }
+    let mut next = index.clone();
+    let completed_plan = progress.plan.clone();
+    next.delete_state = Some(DeleteState::Deleted(DeleteTombstone {
+        plan: completed_plan,
+    }));
+    validate_index(&next)?;
+    Ok(next)
 }
 
 fn begin_flat_cleanup(
@@ -777,6 +1123,7 @@ pub fn activate_initial_generation(
             manifest_file: format!("generations/{}.json", manifest.generation_id),
         }],
         cleanup_progress: Vec::new(),
+        delete_state: None,
     };
     write_index_atomic(&layout.index, &index)?;
     Ok(index)
@@ -805,6 +1152,7 @@ pub fn plan_migration(
             manifest_file: format!("generations/{}.json", manifest.generation_id),
         }],
         cleanup_progress: Vec::new(),
+        delete_state: None,
     };
     validate_index(&index)?;
     Ok(MigrationPlan {
@@ -1154,6 +1502,21 @@ pub fn validate_index(index: &GenerationIndex) -> Result<(), StateError> {
             ));
         }
     }
+    if let Some(delete_state) = &index.delete_state {
+        match delete_state {
+            DeleteState::Deleting(progress) => {
+                validate_delete_plan(index, &progress.plan)?;
+                if progress.resources.len() != progress.plan.resources.len() {
+                    return Err(StateError::InvalidObservedState(
+                        "delete progress does not match the immutable plan".to_owned(),
+                    ));
+                }
+            }
+            DeleteState::Deleted(tombstone) => {
+                validate_delete_plan(index, &tombstone.plan)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1163,6 +1526,11 @@ pub fn validate_index(index: &GenerationIndex) -> Result<(), StateError> {
 /// Returns a typed refusal for an invalid index or any durable Preparing generation.
 pub fn require_normal_lifecycle(index: &GenerationIndex) -> Result<(), StateError> {
     validate_index(index)?;
+    if index.delete_state.is_some() {
+        return Err(StateError::InvalidObservedState(
+            "normal lifecycle refused: VM deletion is in progress or completed".to_owned(),
+        ));
+    }
     if index
         .generations
         .iter()
@@ -1638,8 +2006,112 @@ mod tests {
                 manifest_file: "generations/old.json".into(),
             }],
             cleanup_progress: Vec::new(),
+            delete_state: None,
         }
     }
+
+    fn delete_fixture() -> (
+        GenerationIndex,
+        GenerationManifest,
+        ObservedGeneration,
+        DeletePlan,
+    ) {
+        let index = index();
+        let manifest = manifest("old", GenerationStatus::Active);
+        let observed = observed("old");
+        let plan = plan_instance_delete(
+            &index,
+            std::slice::from_ref(&manifest),
+            &observed,
+            ManagedReconciliationStatus::Consistent,
+        )
+        .unwrap();
+        (index, manifest, observed, plan)
+    }
+
+    #[test]
+    fn delete_plan_contains_only_exact_disposable_active_resources() {
+        let (_, _, _, plan) = delete_fixture();
+        assert_eq!(plan.resources.len(), 2);
+        assert!(
+            plan.resources
+                .iter()
+                .all(|item| item.resource.role != ResourceRole::SharedBase)
+        );
+        assert!(plan.resources.iter().all(|item| {
+            item.generation_id == plan.generation_id
+                && item.resource.role != ResourceRole::SharedBase
+        }));
+    }
+
+    #[test]
+    fn delete_plan_refuses_non_active_generation_states_and_conflicts() {
+        let (index, manifest, observed, _) = delete_fixture();
+        for status in [
+            GenerationStatus::Retained,
+            GenerationStatus::Preparing,
+            GenerationStatus::Failed,
+        ] {
+            let mut blocked = index.clone();
+            blocked.generations.push(GenerationEntry {
+                generation_id: format!("{status:?}"),
+                status,
+                manifest_file: "x".into(),
+            });
+            assert!(
+                plan_instance_delete(
+                    &blocked,
+                    std::slice::from_ref(&manifest),
+                    &observed,
+                    ManagedReconciliationStatus::Consistent,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            plan_instance_delete(
+                &index,
+                std::slice::from_ref(&manifest),
+                &observed,
+                ManagedReconciliationStatus::Conflict,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn delete_checkpoints_require_order_and_immutable_plan() {
+        let (index, _, _, plan) = delete_fixture();
+        assert!(record_delete_domain_absent(&index, &plan).is_err());
+        let intent = begin_instance_delete(&index, &plan).unwrap();
+        assert!(complete_instance_delete(&intent, &plan).is_err());
+        let after_domain = record_delete_domain_absent(&intent, &plan).unwrap();
+        assert!(complete_instance_delete(&after_domain, &plan).is_err());
+        let first = &plan.resources[0].resource;
+        let after_first = record_delete_resource_absent(&after_domain, &plan, first).unwrap();
+        assert!(complete_instance_delete(&after_first, &plan).is_err());
+        let second = &plan.resources[1].resource;
+        let completed = record_delete_resource_absent(&after_first, &plan, second).unwrap();
+        let tombstone = complete_instance_delete(&completed, &plan).unwrap();
+        assert!(matches!(
+            tombstone.delete_state,
+            Some(DeleteState::Deleted(_))
+        ));
+        assert!(begin_instance_delete(&tombstone, &plan).is_err());
+
+        let mut changed = plan.clone();
+        changed.domain_uuid = "different".into();
+        assert!(record_delete_domain_absent(&intent, &changed).is_err());
+    }
+
+    #[test]
+    fn old_index_json_without_delete_state_remains_readable() {
+        let mut value = serde_json::to_value(index()).unwrap();
+        value.as_object_mut().unwrap().remove("delete_state");
+        let parsed: GenerationIndex = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.delete_state, None);
+    }
+
     fn observed(id: &str) -> ObservedGeneration {
         let manifest = manifest(id, GenerationStatus::Preparing);
         ObservedGeneration {
@@ -1691,6 +2163,7 @@ mod tests {
                 },
             ],
             cleanup_progress: Vec::new(),
+            delete_state: None,
         }
     }
     fn recovery_manifests() -> Vec<GenerationManifest> {
@@ -2067,6 +2540,7 @@ mod tests {
                 },
             ],
             cleanup_progress: Vec::new(),
+            delete_state: None,
         }
     }
     #[test]
