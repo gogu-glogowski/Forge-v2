@@ -2,11 +2,14 @@
 
 > **Little Qubes-style virtualization for Fedora — policy-driven, reproducible and auditable.**
 
+> [!CAUTION]
+> **Installation notice:** Forge V2.0 is an early development release and is no longer recommended for new installations. Deeper clean-host testing identified issues that are being corrected in Forge V2.5. For safety and a reproducible Fedora installation path, please wait for the V2.5 release, which is currently undergoing final clean-host acceptance testing.
+
 Forge is a Rust-based management layer for isolated KVM/QEMU/libvirt virtual machines on a Fedora host.  
 The project grew from a simple host-readiness checker into a lifecycle, image, storage, state and topology manager for a small security-focused VM fleet.
 
 **Current release:** `v2.0.0`  
-**Release status:** **PASS WITH ACCEPTED LIMITATIONS**
+**Release status:** **PASS WITH ACCEPTED LIMITATIONS — NOT RECOMMENDED FOR NEW INSTALLATIONS**
 
 > 🎧 **If you're reading my code and want some background music, press play.**  
 > <a href="https://www.youtube.com/embed/S0Zv4IJviUs?list=RDS0Zv4IJviUs&autoplay=1&rel=0" target="_blank" rel="noopener noreferrer">Listen to the YouTube playlist ↗</a>
@@ -44,6 +47,9 @@ The design goal is simple: **safe defaults, explicit mutations, fast normal oper
 ---
 
 ## Installation from source
+
+> [!WARNING]
+> The V2.0 installation path below is retained for historical/developer reference. New users should wait for Forge V2.5 rather than installing V2.0.
 
 Forge V2 is currently distributed as source code rather than as an RPM/DNF package. On a Fedora host with Rust/Cargo and the required virtualization stack already available, clone the repository and build the release binary:
 
@@ -350,5 +356,5 @@ Additional technical and learning documentation lives under `docs/`.
 
 ## Status
 
-**Forge V2: released and formally closed.**  
-**Forge V2.5: planned — usability, automation, cloning/disposables and operational polish.**
+**Forge V2: released and formally closed, but no longer recommended for new installations.**  
+**Forge V2.5: in final clean-host acceptance testing.**
