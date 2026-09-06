@@ -4118,17 +4118,16 @@ fn image_prepare_workstation_confirm_installed() -> ExitCode {
         {
             return Err("staging storage shape is unsafe".to_owned());
         }
-        let check = std::process::Command::new("pkexec")
-            .args(["/usr/libexec/forge-image-verifier", "--preparation-id"])
-            .arg(preparation.preparation_id.as_str())
-            .output()
-            .map_err(|error| format!("privileged staging verifier failed to run: {error}"))?;
-        if !check.status.success() {
-            return Err(format!(
-                "privileged staging verification failed: {}",
-                String::from_utf8_lossy(&check.stderr).trim()
-            ));
+        if volume.name != preparation.staging.volume_name
+            || volume.path != preparation.staging.path
+            || preparation.execution.staging_volume_key.as_deref() != Some(volume.key.as_str())
+        {
+            return Err("durable staging identity drift".to_owned());
         }
+        attest_operator_qcow2_check(&volume.path)?;
+        forge_images::record_qemu_img_check_attestation(&mut preparation);
+        forge_images::update_fedora_workstation_preparation(&state_path, &preparation)
+            .map_err(|error| error.to_string())?;
         let disposition = forge_images::confirm_manually_installed_from_installer_ready(
             &mut backend,
             &mut preparation,
@@ -4155,6 +4154,31 @@ fn image_prepare_workstation_confirm_installed() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn attest_operator_qcow2_check(path: &std::path::Path) -> Result<(), String> {
+    println!(
+        "Run this exact command in a separate terminal and inspect its result:\n\n  sudo /usr/bin/qemu-img check -- {}\n",
+        path.display()
+    );
+    println!("Forge will not execute sudo or accept an operator-supplied path.");
+    print!("Type CHECKED after qemu-img reports success: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("failed to flush operator prompt: {error}"))?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| format!("failed to read operator attestation: {error}"))?;
+    if operator_qemu_img_check_answer(&answer) {
+        Ok(())
+    } else {
+        Err("operator qemu-img check attestation refused".to_owned())
+    }
+}
+
+fn operator_qemu_img_check_answer(answer: &str) -> bool {
+    answer.trim() == "CHECKED"
 }
 
 fn image_prepare_workstation_confirm_graphical() -> ExitCode {
@@ -5967,6 +5991,13 @@ mod tests {
         assert!(!confirmation_accepted("no"));
         assert!(!confirmation_accepted("force"));
         assert!(confirmation_accepted("yes\n"));
+    }
+
+    #[test]
+    fn qemu_img_check_attestation_requires_exact_checked_answer() {
+        assert!(operator_qemu_img_check_answer("CHECKED\n"));
+        assert!(!operator_qemu_img_check_answer("yes\n"));
+        assert!(!operator_qemu_img_check_answer("CHECKED extra\n"));
     }
 
     #[test]

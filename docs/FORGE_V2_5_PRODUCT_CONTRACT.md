@@ -447,11 +447,14 @@ idempotency bound to the new preparation identity. The unknown legacy file
 `forge-base-fedora-44.qcow2` is not a Workstation base and cannot become
 authoritative by filename.
 
-Protected libvirt staging is verified through the separate, narrowly typed
-`forge-image-verifier` PolicyKit boundary. The unprivileged CLI supplies only
-the preparation identity; the verifier derives the expected Fedora staging
-volume name and performs read-only `qemu-img info` and `qemu-img check` checks.
-It is not a GME operation and accepts no arbitrary path, command, or argv.
+Protected libvirt staging is first verified through the standard `qemu:///system`
+API: Forge binds the durable preparation identity to the exact volume key, path,
+format, capacity and backing topology. A rare full qcow2 integrity proof is an
+explicit operator action using the exact path printed by Forge:
+`sudo /usr/bin/qemu-img check -- <exact-staging-path>`. Forge never executes
+sudo, accepts an operator-supplied path, or changes the storage DAC/SELinux
+boundary. The custom verifier and PolicyKit path are historical and are not
+part of active V2.5.
 
 ### 14.4 Canonical-base normalization
 
@@ -551,6 +554,12 @@ unless policy explicitly classifies them. Anaconda files are removed only when
 documented as transient output; packaged Anaconda components and ordinary RPM
 metadata are not residue by filename alone.
 
+> **HISTORICAL / SUPERSEDED / NOT ACTIVE IN V2.5:** The complete Phase 4.6B
+> broker, helper, virtio preparation channel and privileged preparation
+> infrastructure experiment below was removed from the active product. It is
+> retained only as historical research; see `docs/archive/gme/`. V2.5 uses
+> standard libvirt and explicit operator assistance where required.
+
 There is currently no proven authenticated in-guest execution channel. Forge
 must not substitute SSH, cloud-init, NoCloud, a shared host filesystem, or a
 universal credential. Phase 4.6B must first implement and prove a narrowly
@@ -576,7 +585,8 @@ The read-only inventory can be issued under a new operation ID after explicit
 reconciliation, but duplicate requests/results never create a second success.
 Durable-state or identity changes invalidate outstanding operations.
 
-The intended helper is `/usr/libexec/forge-preparation-control`, with a transient
+Historical Phase 4.6B design material (not active V2.5) described an intended
+helper at `/usr/libexec/forge-preparation-control`, with a transient
 unit under `/run/systemd/system/`, transient binding under
 `/run/forge-preparation-control/`, and domain channel
 `org.majorforge.preparation.0`. It runs under SELinux enforcing, has a fixed
@@ -923,20 +933,18 @@ or silent mutation of the legacy host object.
 
 ### 14.13 Phase 4.6C — Guest Mutation Engine architecture decision
 
-Forge guest mutation is standardized as a reusable, Linux-oriented
-`GuestMutationSession`/`GuestMutationPlan` facility inside the existing
-`forge-preparation-broker`. Requests reference trusted plan and transaction
-identities only; qcow2 paths, guest paths, bytes, commands and backend choices
-are resolved internally from Forge state and profile policy. The engine uses a
-bounded direct-libguestfs session, typed logical destinations, content-addressed
-artifacts, explicit pre/postconditions, durable journal/evidence/ledger and
-fail-closed recovery. Fedora normalization will compile to this plan model in a
-later implementation phase. Phase 4.6C-II now proves the execution core on
-an ephemeral single-ext4 qcow2 with host-native direct-libguestfs; candidate
-transaction/recovery and durable cross-process evidence remain Phase
-4.6C-III.
+This is retained historical Phase 4.6C research, not an active V2.5 component.
+The proposed reusable `GuestMutationSession`/`GuestMutationPlan` facility,
+broker boundary and automatic Fedora normalization were removed from the active
+product. Their evidence and failure modes are archived in `docs/archive/gme/`;
+future work must be designed afresh for Forge 3.0.
 
 ### 14.14 Phase 4.6C-III — candidate transaction contract
+
+> **HISTORICAL EXPERIMENT — NOT ACTIVE FOR FORGE V2.5 — DEFERRED / RESEARCH
+> INPUT FOR FORGE 3.0.** The following GME transaction material is retained
+> for evidence and lessons learned only. It is not a V2.5 release requirement
+> or active implementation contract. See `docs/archive/gme/`.
 
 GME transaction execution is isolated to a trusted qcow2 candidate derived
 from an exact authoritative source identity. The source remains untouched;

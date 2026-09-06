@@ -107,15 +107,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "forge-guest-mutation"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "forge-hardware"
 version = "0.1.0"
 dependencies = [
@@ -152,18 +143,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "virt",
-]
-
-[[package]]
-name = "forge-preparation-control"
-version = "0.1.0"
-dependencies = [
- "forge-images",
- "forge-libvirt",
- "rustix",
- "serde",
- "serde_json",
- "sha2",
 ]
 
 [[package]]

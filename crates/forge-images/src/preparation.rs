@@ -219,6 +219,8 @@ pub struct FedoraWorkstationPreparation {
     pub canonical: CanonicalWorkstationBasePlan,
     pub normalization_recipe: String,
     pub operator_confirmation_recorded: bool,
+    #[serde(default)]
+    pub qemu_img_check_attested: bool,
     pub recovery_detail: Option<String>,
     #[serde(default)]
     pub execution: FedoraWorkstationExecutionEvidence,
@@ -454,6 +456,12 @@ pub fn record_anaconda_installation_completed(
     preparation.status = FedoraWorkstationPreparationStatus::InstallationConfirmed;
     preparation.operator_confirmation_recorded = true;
     Ok(())
+}
+
+/// Records the explicit operator attestation for the exact staging image
+/// after Forge has completed its identity and storage-shape checks.
+pub fn record_qemu_img_check_attestation(preparation: &mut FedoraWorkstationPreparation) {
+    preparation.qemu_img_check_attested = true;
 }
 
 /// Records an explicit operator attestation for an installation performed
@@ -1745,6 +1753,7 @@ pub fn durable_preparation(plan: FedoraWorkstationPreparationPlan) -> FedoraWork
         canonical: plan.canonical,
         normalization_recipe: plan.normalization_recipe,
         operator_confirmation_recorded: false,
+        qemu_img_check_attested: false,
         recovery_detail: None,
         execution: FedoraWorkstationExecutionEvidence::default(),
     }
@@ -2857,6 +2866,7 @@ pub fn prove_normalized_disk(
 ) -> Result<NormalizedFedoraWorkstationDisk, PreparationError> {
     if preparation.status != FedoraWorkstationPreparationStatus::OfflineProofPending
         || !preparation.operator_confirmation_recorded
+        || !preparation.qemu_img_check_attested
     {
         return Err(PreparationError::InvalidStateTransition);
     }
@@ -3189,6 +3199,7 @@ mod tests {
         let mut preparation = durable_preparation(fixture.plan());
         preparation.status = FedoraWorkstationPreparationStatus::OfflineProofPending;
         preparation.operator_confirmation_recorded = true;
+        preparation.qemu_img_check_attested = true;
         preparation
     }
 
@@ -3306,6 +3317,23 @@ mod tests {
     }
 
     #[test]
+    fn qemu_img_attestation_is_distinct_and_old_json_defaults_to_false() {
+        let fixture = Fixture::new();
+        let mut preparation = durable_preparation(fixture.plan());
+        assert!(!preparation.qemu_img_check_attested);
+        record_qemu_img_check_attestation(&mut preparation);
+        assert!(preparation.qemu_img_check_attested);
+
+        let mut old_json = serde_json::to_value(&preparation).unwrap();
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("qemu_img_check_attested");
+        let migrated: FedoraWorkstationPreparation = serde_json::from_value(old_json).unwrap();
+        assert!(!migrated.qemu_img_check_attested);
+    }
+
+    #[test]
     fn installation_requires_explicit_confirmation_and_complete_proof() {
         let fixture = Fixture::new();
         let mut preparation = durable_preparation(fixture.plan());
@@ -3329,6 +3357,7 @@ mod tests {
             )
             .is_ok()
         );
+        assert!(!preparation.qemu_img_check_attested);
     }
 
     #[test]
@@ -3361,6 +3390,17 @@ mod tests {
             FEDORA_WORKSTATION_NORMALIZATION_RECIPE
         );
         assert_eq!(evidence.disk_sha256(), "b".repeat(64));
+    }
+
+    #[test]
+    fn normalization_refuses_without_qemu_img_attestation() {
+        let fixture = Fixture::new();
+        let mut preparation = normalization_ready(&fixture);
+        preparation.qemu_img_check_attested = false;
+        assert_eq!(
+            prove_normalized_disk(&preparation, &normalization()),
+            Err(PreparationError::InvalidStateTransition)
+        );
     }
 
     #[test]
@@ -4205,6 +4245,7 @@ mod tests {
             FedoraWorkstationPreparationStatus::InstallationConfirmed
         );
         assert!(preparation.operator_confirmation_recorded);
+        assert!(!preparation.qemu_img_check_attested);
         assert_eq!(
             published,
             [FedoraWorkstationPreparationStatus::InstallationConfirmed]

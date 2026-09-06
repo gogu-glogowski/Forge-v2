@@ -111,7 +111,7 @@ Run the test suite separately:
 cargo test
 ```
 
-At the clean-host checkpoint documented here, the main build succeeds after the prerequisites above. A historical `forge-guest-mutation` / GME test still depends on old host-specific staging state; GME is outside the V2.5 critical product path and should not be "fixed" by recreating obsolete host infrastructure.
+At the clean-host checkpoint documented here, the main build succeeds after the prerequisites above. Historical GME, broker/helper and custom verifier experiments are archived and removed from active V2.5; they must not be "fixed" by recreating obsolete host infrastructure. A rare full staging integrity proof is operator-assisted with the exact command printed by Forge.
 
 ## Host setup rule
 
