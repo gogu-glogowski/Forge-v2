@@ -15,12 +15,11 @@ use std::time::{Duration, Instant};
 #[allow(clippy::too_many_lines)]
 fn main() -> ExitCode {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
-    match arguments
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
+    let argument_views = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    if let Some(command) = parse_delete_command(&argument_views) {
+        return delete_vm(&command.instance, command.force);
+    }
+    match argument_views.as_slice() {
         ["doctor"] => match forge_doctor::run() {
             Ok(report) => {
                 print_report(&report);
@@ -128,6 +127,26 @@ fn main() -> ExitCode {
             print_usage();
             ExitCode::from(2)
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeleteCommand {
+    instance: String,
+    force: bool,
+}
+
+fn parse_delete_command(arguments: &[&str]) -> Option<DeleteCommand> {
+    match arguments {
+        ["delete", instance] => Some(DeleteCommand {
+            instance: (*instance).to_owned(),
+            force: false,
+        }),
+        ["delete", instance, "--force"] => Some(DeleteCommand {
+            instance: (*instance).to_owned(),
+            force: true,
+        }),
+        _ => None,
     }
 }
 
@@ -1592,6 +1611,412 @@ fn load_index_manifests(
         .iter()
         .map(|entry| load_generation(&layout.generation_path(&entry.generation_id)))
         .collect()
+}
+
+#[derive(Debug)]
+enum DeleteFailure {
+    Refused(String),
+    Recoverable(String),
+}
+
+fn classify_domain_delete_error(error: forge_libvirt::DomainDeleteError) -> DeleteFailure {
+    match error {
+        forge_libvirt::DomainDeleteError::Conflict(reason)
+        | forge_libvirt::DomainDeleteError::UnsafeState(reason) => DeleteFailure::Refused(reason),
+        forge_libvirt::DomainDeleteError::Backend(reason) => DeleteFailure::Recoverable(reason),
+    }
+}
+
+fn classify_volume_delete_error(error: forge_libvirt::ManagedVolumeDeleteError) -> DeleteFailure {
+    match error {
+        forge_libvirt::ManagedVolumeDeleteError::IdentityMismatch(reason)
+        | forge_libvirt::ManagedVolumeDeleteError::Referenced(reason) => {
+            DeleteFailure::Refused(reason)
+        }
+        forge_libvirt::ManagedVolumeDeleteError::SharedBase => {
+            DeleteFailure::Refused("shared base deletion is forbidden".to_owned())
+        }
+        forge_libvirt::ManagedVolumeDeleteError::Backend(reason) => {
+            DeleteFailure::Recoverable(reason)
+        }
+    }
+}
+
+fn classify_volume_absence_error(error: forge_libvirt::ManagedVolumeAbsenceError) -> DeleteFailure {
+    match error {
+        forge_libvirt::ManagedVolumeAbsenceError::Present(reason) => DeleteFailure::Refused(reason),
+        forge_libvirt::ManagedVolumeAbsenceError::Backend(reason) => {
+            DeleteFailure::Recoverable(reason)
+        }
+    }
+}
+
+fn persist_delete_index(
+    layout: &forge_state::StateLayout,
+    expected: &forge_state::GenerationIndex,
+    next: &forge_state::GenerationIndex,
+) -> Result<(), String> {
+    let current = forge_state::read_index(&layout.index)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "durable delete index disappeared".to_owned())?;
+    if &current != expected {
+        return Err("durable delete state changed before checkpoint".to_owned());
+    }
+    forge_state::write_index_atomic(&layout.index, next).map_err(|error| error.to_string())
+}
+
+fn build_delete_plan(
+    instance: &InstanceName,
+    layout: &forge_state::StateLayout,
+    index: &forge_state::GenerationIndex,
+) -> Result<forge_state::DeletePlan, String> {
+    let manifests = load_index_manifests(layout, index)?;
+    let active = active_manifest(index, &manifests)?;
+    let backend = forge_libvirt::LibvirtBootBackend::connect_instance(instance.clone())
+        .map_err(|error| error.to_string())?;
+    let observed = backend
+        .inspect_managed_state(active)
+        .map_err(|error| error.to_string())?;
+    let reconciliation = forge_state::reconcile_managed(index, &manifests, &observed);
+    forge_state::plan_instance_delete(index, &manifests, &observed, reconciliation.status)
+        .map_err(|error| error.to_string())
+}
+
+fn print_delete_plan(instance: &str, plan: &forge_state::DeletePlan, force: bool) {
+    println!("Managed VM: {instance}");
+    println!("Exact domain UUID: {}", plan.domain_uuid);
+    println!("Resources to remove:");
+    for item in &plan.resources {
+        println!("- {:?}: {}", item.resource.role, item.resource.path);
+    }
+    println!("Shared/canonical base: preserved");
+    if force {
+        println!("Force mode: only an exact running domain may be force-stopped");
+    }
+}
+
+fn delete_vm(instance_name: &str, force: bool) -> ExitCode {
+    let instance = match InstanceName::new(instance_name) {
+        Ok(instance) => instance,
+        Err(error) => {
+            eprintln!("delete refused: invalid instance name: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let layout = match managed_state_layout_for(&instance) {
+        Ok(layout) => layout,
+        Err(error) => {
+            eprintln!("delete refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let state = match forge_state::inspect_layout(&layout) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("delete refused: durable state is invalid: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let index = match state {
+        forge_state::ManagedState::Current(index) => index,
+        forge_state::ManagedState::Missing => {
+            eprintln!("delete refused: Forge ownership state is missing");
+            return ExitCode::from(1);
+        }
+        forge_state::ManagedState::Legacy(_) => {
+            eprintln!("delete refused: legacy state requires explicit migration");
+            return ExitCode::from(1);
+        }
+        forge_state::ManagedState::Conflict(reason) => {
+            eprintln!("delete refused: {reason}");
+            return ExitCode::from(1);
+        }
+    };
+    match &index.delete_state {
+        Some(forge_state::DeleteState::Deleted(_)) => {
+            println!("already deleted: {instance_name}");
+            return ExitCode::SUCCESS;
+        }
+        Some(forge_state::DeleteState::Deleting(progress)) => {
+            println!("Resuming durable delete for {instance_name}.");
+            return execute_delete_plan(&instance, &layout, &index, &progress.plan, force, false);
+        }
+        None => {}
+    }
+
+    let plan = match build_delete_plan(&instance, &layout, &index) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("delete refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let define = match forge_libvirt::LibvirtDefineBackend::connect_local() {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("delete refused: libvirt connection failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let identity = forge_libvirt::ExactDomainIdentity {
+        name: plan.domain_name.clone(),
+        uuid: plan.domain_uuid.clone(),
+    };
+    let observation = match define.observe_domain_for_delete(&identity) {
+        Ok(observation) => observation,
+        Err(error) => {
+            eprintln!("delete refused: exact domain observation failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match &observation {
+        forge_libvirt::DomainDeleteObservation::Absent => {
+            eprintln!("delete refused: expected domain is absent before durable delete intent");
+            return ExitCode::from(1);
+        }
+        forge_libvirt::DomainDeleteObservation::Conflict(reason) => {
+            eprintln!("delete refused: domain identity conflict: {reason}");
+            return ExitCode::from(1);
+        }
+        forge_libvirt::DomainDeleteObservation::ExactPresent { state, .. }
+            if *state != forge_core::VmState::Shutoff
+                && !(*state == forge_core::VmState::Running && force) =>
+        {
+            eprintln!("delete refused: exact domain is {state}; use --force only for a running VM");
+            return ExitCode::from(1);
+        }
+        forge_libvirt::DomainDeleteObservation::ExactPresent { .. } => {}
+    }
+    print_delete_plan(instance_name, &plan, force);
+    eprint!("Delete this exact managed VM? [y/N] ");
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err() || !confirmation_accepted(&answer) {
+        eprintln!("Delete cancelled.");
+        return ExitCode::SUCCESS;
+    }
+    let fresh_index = match forge_state::read_index(&layout.index) {
+        Ok(Some(index)) => index,
+        Ok(None) => {
+            eprintln!("delete refused: durable state disappeared before intent");
+            return ExitCode::from(1);
+        }
+        Err(error) => {
+            eprintln!("delete refused: state revalidation failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let fresh_plan = match build_delete_plan(&instance, &layout, &fresh_index) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("delete refused: pre-mutation ownership revalidation failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if fresh_index != index || fresh_plan != plan {
+        eprintln!("delete refused: durable ownership or exact plan changed before intent");
+        return ExitCode::from(1);
+    }
+    let next = match forge_state::begin_instance_delete(&index, &plan) {
+        Ok(next) => next,
+        Err(error) => {
+            eprintln!("delete refused before mutation: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) = persist_delete_index(&layout, &index, &next) {
+        eprintln!("delete refused before mutation: durable intent was not persisted: {error}");
+        return ExitCode::from(1);
+    }
+    execute_delete_plan(&instance, &layout, &next, &plan, force, force)
+}
+
+fn execute_delete_plan(
+    instance: &InstanceName,
+    layout: &forge_state::StateLayout,
+    index: &forge_state::GenerationIndex,
+    plan: &forge_state::DeletePlan,
+    force: bool,
+    force_confirmed: bool,
+) -> ExitCode {
+    let result = execute_delete_plan_inner(instance, layout, index, plan, force, force_confirmed);
+    match result {
+        Ok(()) => {
+            println!("Delete completed: {}", instance);
+            ExitCode::SUCCESS
+        }
+        Err(DeleteFailure::Recoverable(error)) => {
+            eprintln!("delete stopped: {error}");
+            eprintln!(
+                "VM remains in durable Deleting state; retry `forge delete {}` to resume the immutable plan.",
+                instance
+            );
+            ExitCode::from(1)
+        }
+        Err(DeleteFailure::Refused(error)) => {
+            eprintln!("delete refused: {error}");
+            eprintln!("Durable state requires recovery or manual inspection; no plan was guessed.");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn execute_delete_plan_inner(
+    instance: &InstanceName,
+    layout: &forge_state::StateLayout,
+    index: &forge_state::GenerationIndex,
+    plan: &forge_state::DeletePlan,
+    force: bool,
+    force_confirmed: bool,
+) -> Result<(), DeleteFailure> {
+    let mut current = index.clone();
+    let mut boot = forge_libvirt::LibvirtBootBackend::connect_instance(instance.clone())
+        .map_err(|error| DeleteFailure::Recoverable(error.to_string()))?;
+    let define = forge_libvirt::LibvirtDefineBackend::connect_local()
+        .map_err(|error| DeleteFailure::Recoverable(error.to_string()))?;
+    let identity = forge_libvirt::ExactDomainIdentity {
+        name: plan.domain_name.clone(),
+        uuid: plan.domain_uuid.clone(),
+    };
+    let domain_pending = matches!(
+        &current.delete_state,
+        Some(forge_state::DeleteState::Deleting(progress))
+            if progress.domain == forge_state::DeleteDomainProgress::UndefinePending
+    );
+    if domain_pending {
+        let observation = define
+            .observe_domain_for_delete(&identity)
+            .map_err(DeleteFailure::Recoverable)?;
+        match observation {
+            forge_libvirt::DomainDeleteObservation::Absent => {
+                let next = forge_state::record_delete_domain_absent(&current, plan)
+                    .map_err(|error| DeleteFailure::Refused(error.to_string()))?;
+                persist_delete_index(layout, &current, &next)
+                    .map_err(DeleteFailure::Recoverable)?;
+                current = next;
+            }
+            forge_libvirt::DomainDeleteObservation::Conflict(reason) => {
+                return Err(DeleteFailure::Refused(format!(
+                    "domain identity conflict during resume: {reason}"
+                )));
+            }
+            forge_libvirt::DomainDeleteObservation::ExactPresent { state, .. } => {
+                if state == forge_core::VmState::Running {
+                    if !force {
+                        return Err(DeleteFailure::Refused(
+                            "exact domain is running; rerun with --force".to_owned(),
+                        ));
+                    }
+                    if !force_confirmed {
+                        eprint!(
+                            "Force-stop exact domain {} before delete? [y/N] ",
+                            plan.domain_uuid
+                        );
+                        let mut answer = String::new();
+                        if io::stdin().read_line(&mut answer).is_err()
+                            || !confirmation_accepted(&answer)
+                        {
+                            return Err(DeleteFailure::Recoverable(
+                                "force-stop cancelled; no further mutation was attempted"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                    forge_provisioning::execute_force_stop(
+                        &mut boot,
+                        &plan.domain_uuid,
+                        Duration::from_secs(
+                            forge_provisioning::ShutdownTimeoutPolicy::default().force_seconds,
+                        ),
+                    )
+                    .map_err(|error| DeleteFailure::Recoverable(error.to_string()))?;
+                    match define
+                        .observe_domain_for_delete(&identity)
+                        .map_err(DeleteFailure::Recoverable)?
+                    {
+                        forge_libvirt::DomainDeleteObservation::ExactPresent {
+                            state: forge_core::VmState::Shutoff,
+                            ..
+                        } => {}
+                        forge_libvirt::DomainDeleteObservation::Conflict(reason) => {
+                            return Err(DeleteFailure::Refused(format!(
+                                "domain identity conflict after force-stop: {reason}"
+                            )));
+                        }
+                        other => {
+                            return Err(DeleteFailure::Recoverable(format!(
+                                "exact domain was not verified shutoff after force-stop: {other:?}"
+                            )));
+                        }
+                    }
+                } else if state != forge_core::VmState::Shutoff {
+                    return Err(DeleteFailure::Refused(format!(
+                        "unsupported exact domain state for undefine: {state}"
+                    )));
+                }
+                define
+                    .undefine_domain_exact(&identity)
+                    .map_err(classify_domain_delete_error)?;
+                let next = forge_state::record_delete_domain_absent(&current, plan)
+                    .map_err(|error| DeleteFailure::Refused(error.to_string()))?;
+                persist_delete_index(layout, &current, &next)
+                    .map_err(DeleteFailure::Recoverable)?;
+                current = next;
+            }
+        }
+    }
+
+    let resources = match &current.delete_state {
+        Some(forge_state::DeleteState::Deleting(progress)) => progress.resources.clone(),
+        _ => {
+            return Err(DeleteFailure::Refused(
+                "delete state changed before storage execution".to_owned(),
+            ));
+        }
+    };
+    for (position, progress) in resources.iter().enumerate() {
+        if *progress == forge_state::DeleteResourceProgress::Absent {
+            continue;
+        }
+        let resource = &plan.resources[position].resource;
+        if resource.role == forge_state::ResourceRole::SharedBase {
+            return Err(DeleteFailure::Refused(
+                "internal delete plan attempted to remove SharedBase".to_owned(),
+            ));
+        }
+        match boot.delete_managed_volume_exact(resource) {
+            Ok(()) => {}
+            Err(error @ forge_libvirt::ManagedVolumeDeleteError::IdentityMismatch(_))
+            | Err(error @ forge_libvirt::ManagedVolumeDeleteError::Referenced(_))
+            | Err(error @ forge_libvirt::ManagedVolumeDeleteError::SharedBase) => {
+                return Err(classify_volume_delete_error(error));
+            }
+            Err(forge_libvirt::ManagedVolumeDeleteError::Backend(delete_error)) => {
+                if let Err(verify_error) = boot.verify_managed_volume_absent(resource) {
+                    return Err(match verify_error {
+                        forge_libvirt::ManagedVolumeAbsenceError::Present(reason) => {
+                            DeleteFailure::Refused(reason)
+                        }
+                        forge_libvirt::ManagedVolumeAbsenceError::Backend(reason) => {
+                            DeleteFailure::Recoverable(format!(
+                                "exact volume delete failed for {}: {delete_error}; {reason}",
+                                resource.path
+                            ))
+                        }
+                    });
+                }
+            }
+        }
+        boot.verify_managed_volume_absent(resource)
+            .map_err(classify_volume_absence_error)?;
+        let next = forge_state::record_delete_resource_absent(&current, plan, resource)
+            .map_err(|error| DeleteFailure::Refused(error.to_string()))?;
+        persist_delete_index(layout, &current, &next).map_err(DeleteFailure::Recoverable)?;
+        current = next;
+    }
+    let next = forge_state::complete_instance_delete(&current, plan)
+        .map_err(|error| DeleteFailure::Refused(error.to_string()))?;
+    persist_delete_index(layout, &current, &next).map_err(DeleteFailure::Recoverable)?;
+    Ok(())
 }
 
 fn discover_cleanup_evidence(
@@ -5799,6 +6224,7 @@ fn print_usage() {
     eprintln!("  forge vm status fedora-lab");
     eprintln!("  forge vm create <profile> <instance> --dry-run");
     eprintln!("  forge vm clone <source-instance> <target-instance> [--dry-run]");
+    eprintln!("  forge delete <instance> [--force]");
     eprintln!("  forge vm cleanup <instance> [--dry-run]");
     eprintln!("  forge state show fedora-lab");
     eprintln!("  forge state reconcile fedora-lab");
@@ -5886,6 +6312,81 @@ mod tests {
     #[test]
     fn empty_domain_list_is_not_an_error() {
         assert_eq!(format_domain_list(&[]), "No virtual machines defined.\n");
+    }
+
+    #[test]
+    fn delete_parser_accepts_only_the_public_root_command() {
+        assert_eq!(
+            parse_delete_command(&["delete", "fedora-lab"]),
+            Some(DeleteCommand {
+                instance: "fedora-lab".into(),
+                force: false,
+            })
+        );
+        assert_eq!(
+            parse_delete_command(&["delete", "fedora-lab", "--force"]),
+            Some(DeleteCommand {
+                instance: "fedora-lab".into(),
+                force: true,
+            })
+        );
+        assert_eq!(parse_delete_command(&["vm", "delete", "fedora-lab"]), None);
+        assert_eq!(
+            parse_delete_command(&["delete", "fedora-lab", "--force", "extra"]),
+            None
+        );
+    }
+
+    #[test]
+    fn delete_integrity_errors_refuse_and_backend_errors_can_resume() {
+        assert!(matches!(
+            classify_domain_delete_error(forge_libvirt::DomainDeleteError::Conflict(
+                "UUID mismatch".to_owned()
+            )),
+            DeleteFailure::Refused(_)
+        ));
+        assert!(matches!(
+            classify_domain_delete_error(forge_libvirt::DomainDeleteError::UnsafeState(
+                "running".to_owned()
+            )),
+            DeleteFailure::Refused(_)
+        ));
+        assert!(matches!(
+            classify_domain_delete_error(forge_libvirt::DomainDeleteError::Backend(
+                "libvirt unavailable".to_owned()
+            )),
+            DeleteFailure::Recoverable(_)
+        ));
+        assert!(matches!(
+            classify_volume_delete_error(
+                forge_libvirt::ManagedVolumeDeleteError::IdentityMismatch("wrong key".to_owned())
+            ),
+            DeleteFailure::Refused(_)
+        ));
+        assert!(matches!(
+            classify_volume_delete_error(forge_libvirt::ManagedVolumeDeleteError::Referenced(
+                "backing reference".to_owned()
+            )),
+            DeleteFailure::Refused(_)
+        ));
+        assert!(matches!(
+            classify_volume_delete_error(forge_libvirt::ManagedVolumeDeleteError::Backend(
+                "storage unavailable".to_owned()
+            )),
+            DeleteFailure::Recoverable(_)
+        ));
+        assert!(matches!(
+            classify_volume_absence_error(forge_libvirt::ManagedVolumeAbsenceError::Present(
+                "still exists".to_owned()
+            )),
+            DeleteFailure::Refused(_)
+        ));
+        assert!(matches!(
+            classify_volume_absence_error(forge_libvirt::ManagedVolumeAbsenceError::Backend(
+                "lookup failed".to_owned()
+            )),
+            DeleteFailure::Recoverable(_)
+        ));
     }
 
     #[test]

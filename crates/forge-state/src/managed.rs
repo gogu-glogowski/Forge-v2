@@ -544,6 +544,19 @@ pub fn begin_instance_delete(
             "delete intent already exists".to_owned(),
         ));
     }
+    if !index.cleanup_progress.is_empty()
+        || index.generations.iter().any(|entry| {
+            matches!(
+                entry.status,
+                GenerationStatus::Retained | GenerationStatus::Preparing | GenerationStatus::Failed
+            )
+        })
+    {
+        return Err(StateError::InvalidObservedState(
+            "delete intent requires one Active generation without recovery or retained state"
+                .to_owned(),
+        ));
+    }
     let mut next = index.clone();
     next.delete_state = Some(DeleteState::Deleting(DeleteInProgress {
         plan: plan.clone(),

@@ -174,13 +174,73 @@ pub enum DomainDeleteObservation {
     Conflict(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainDeleteError {
+    Conflict(String),
+    UnsafeState(String),
+    Backend(String),
+}
+
+impl fmt::Display for DomainDeleteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Conflict(reason) => write!(formatter, "domain identity conflict: {reason}"),
+            Self::UnsafeState(reason) => formatter.write_str(reason),
+            Self::Backend(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for DomainDeleteError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedVolumeDeleteError {
+    IdentityMismatch(String),
+    Referenced(String),
+    SharedBase,
+    Backend(String),
+}
+
+impl fmt::Display for ManagedVolumeDeleteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IdentityMismatch(reason) => {
+                write!(formatter, "managed volume identity mismatch: {reason}")
+            }
+            Self::Referenced(reason) => {
+                write!(formatter, "managed volume reference conflict: {reason}")
+            }
+            Self::SharedBase => formatter.write_str("shared base deletion is forbidden"),
+            Self::Backend(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for ManagedVolumeDeleteError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedVolumeAbsenceError {
+    Present(String),
+    Backend(String),
+}
+
+impl fmt::Display for ManagedVolumeAbsenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Present(reason) | Self::Backend(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for ManagedVolumeAbsenceError {}
+
 /// Applies the destructive undefine policy to a synthetic observation. The
 /// policy is kept separate from the libvirt adapter so it can be tested
 /// without touching a host domain.
 pub fn authorize_domain_undefine(
     expected: &ExactDomainIdentity,
     observed: &DomainDeleteObservation,
-) -> Result<(), String> {
+) -> Result<(), DomainDeleteError> {
     match observed {
         DomainDeleteObservation::ExactPresent {
             identity,
@@ -188,17 +248,23 @@ pub fn authorize_domain_undefine(
             persistent,
         } if identity == expected && *persistent && *state == VmState::Shutoff => Ok(()),
         DomainDeleteObservation::ExactPresent { state, .. } if *state != VmState::Shutoff => {
-            Err("domain undefine requires the exact domain to be shutoff".to_owned())
+            Err(DomainDeleteError::UnsafeState(
+                "domain undefine requires the exact domain to be shutoff".to_owned(),
+            ))
         }
         DomainDeleteObservation::ExactPresent {
             persistent: false, ..
-        } => Err("domain undefine requires a persistent exact domain".to_owned()),
-        DomainDeleteObservation::ExactPresent { .. } => {
-            Err("domain identity changed before undefine".to_owned())
-        }
-        DomainDeleteObservation::Absent => Err("exact domain is already absent".to_owned()),
+        } => Err(DomainDeleteError::UnsafeState(
+            "domain undefine requires a persistent exact domain".to_owned(),
+        )),
+        DomainDeleteObservation::ExactPresent { .. } => Err(DomainDeleteError::Conflict(
+            "domain identity changed before undefine".to_owned(),
+        )),
+        DomainDeleteObservation::Absent => Err(DomainDeleteError::UnsafeState(
+            "exact domain is already absent".to_owned(),
+        )),
         DomainDeleteObservation::Conflict(reason) => {
-            Err(format!("domain undefine refused: {reason}"))
+            Err(DomainDeleteError::Conflict(reason.clone()))
         }
     }
 }
@@ -306,33 +372,50 @@ impl LibvirtDefineBackend {
 
     /// Re-observes and undefines one exact stopped persistent domain. No
     /// destroy operation, storage deletion, or undefine flags are used.
-    pub fn undefine_domain_exact(&self, expected: &ExactDomainIdentity) -> Result<(), String> {
-        let observed = self.observe_domain_for_delete(expected)?;
+    pub fn undefine_domain_exact(
+        &self,
+        expected: &ExactDomainIdentity,
+    ) -> Result<(), DomainDeleteError> {
+        let observed = self
+            .observe_domain_for_delete(expected)
+            .map_err(DomainDeleteError::Backend)?;
         authorize_domain_undefine(expected, &observed)?;
         let domain = Domain::lookup_by_uuid_string(&self.connection, &expected.uuid)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| DomainDeleteError::Backend(error.to_string()))?;
         let identity = ExactDomainIdentity {
-            name: domain.get_name().map_err(|error| error.to_string())?,
+            name: domain
+                .get_name()
+                .map_err(|error| DomainDeleteError::Backend(error.to_string()))?,
             uuid: domain
                 .get_uuid_string()
-                .map_err(|error| error.to_string())?,
+                .map_err(|error| DomainDeleteError::Backend(error.to_string()))?,
         };
-        let (raw_state, _) = domain.get_state().map_err(|error| error.to_string())?;
+        let (raw_state, _) = domain
+            .get_state()
+            .map_err(|error| DomainDeleteError::Backend(error.to_string()))?;
         let immediate = DomainDeleteObservation::ExactPresent {
             identity,
-            state: map_domain_state(raw_state).map_err(|error| error.to_string())?,
-            persistent: domain.is_persistent().map_err(|error| error.to_string())?,
+            state: map_domain_state(raw_state)
+                .map_err(|error| DomainDeleteError::Backend(error.to_string()))?,
+            persistent: domain
+                .is_persistent()
+                .map_err(|error| DomainDeleteError::Backend(error.to_string()))?,
         };
         authorize_domain_undefine(expected, &immediate)?;
-        domain.undefine().map_err(|error| error.to_string())?;
-        match self.observe_domain_for_delete(expected)? {
+        domain
+            .undefine()
+            .map_err(|error| DomainDeleteError::Backend(error.to_string()))?;
+        match self
+            .observe_domain_for_delete(expected)
+            .map_err(DomainDeleteError::Backend)?
+        {
             DomainDeleteObservation::Absent => Ok(()),
-            DomainDeleteObservation::ExactPresent { .. } => {
-                Err("exact domain remains after undefine".to_owned())
-            }
-            DomainDeleteObservation::Conflict(reason) => {
-                Err(format!("domain identity changed after undefine: {reason}"))
-            }
+            DomainDeleteObservation::ExactPresent { .. } => Err(DomainDeleteError::UnsafeState(
+                "exact domain remains after undefine".to_owned(),
+            )),
+            DomainDeleteObservation::Conflict(reason) => Err(DomainDeleteError::Conflict(format!(
+                "domain identity changed after undefine: {reason}"
+            ))),
         }
     }
 
@@ -2112,56 +2195,70 @@ impl LibvirtBootBackend {
     pub fn delete_managed_volume_exact(
         &self,
         expected: &forge_state::ManagedResource,
-    ) -> Result<(), forge_provisioning::ProvisioningError> {
+    ) -> Result<(), ManagedVolumeDeleteError> {
         if expected.role == forge_state::ResourceRole::SharedBase {
-            return Err(forge_provisioning::ProvisioningError::Backend(
-                "shared base deletion is forbidden".to_owned(),
-            ));
+            return Err(ManagedVolumeDeleteError::SharedBase);
         }
         for domain in self
             .connection
             .list_all_domains(0)
-            .map_err(provisioning_backend_error)?
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?
         {
-            let xml = domain.get_xml_desc(0).map_err(provisioning_backend_error)?;
+            let xml = domain
+                .get_xml_desc(0)
+                .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?;
             if domain_source_paths(&xml)
                 .iter()
                 .any(|path| path == &expected.path)
             {
-                return Err(forge_provisioning::ProvisioningError::Backend(
+                return Err(ManagedVolumeDeleteError::Referenced(
                     "volume gained a domain reference before delete".to_owned(),
                 ));
             }
         }
-        let pool = self.pool()?;
+        let pool = self
+            .pool()
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?;
         for candidate in pool
             .list_all_volumes(0)
-            .map_err(provisioning_backend_error)?
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?
         {
             let xml = candidate
                 .get_xml_desc(0)
-                .map_err(provisioning_backend_error)?;
+                .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?;
             if backing_store_path(&xml).as_deref() == Some(expected.path.as_str()) {
-                return Err(forge_provisioning::ProvisioningError::Backend(
+                return Err(ManagedVolumeDeleteError::Referenced(
                     "volume gained a backing-store reference before delete".to_owned(),
                 ));
             }
         }
         let volume = StorageVol::lookup_by_path(&self.connection, &expected.path)
-            .map_err(provisioning_backend_error)?;
-        let info = volume.get_info().map_err(provisioning_backend_error)?;
-        let xml = volume.get_xml_desc(0).map_err(provisioning_backend_error)?;
-        if volume.get_name().map_err(provisioning_backend_error)? != expected.volume_name
-            || volume.get_key().map_err(provisioning_backend_error)? != expected.volume_key
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?;
+        let info = volume
+            .get_info()
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?;
+        let xml = volume
+            .get_xml_desc(0)
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?;
+        if volume
+            .get_name()
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?
+            != expected.volume_name
+            || volume
+                .get_key()
+                .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?
+                != expected.volume_key
             || info.capacity != expected.capacity_bytes
             || xml_attribute(&xml, "format", "type").as_deref() != Some(expected.format.as_str())
             || backing_store_path(&xml) != expected.backing_path
         {
-            return Err(forge_provisioning::ProvisioningError::Backend(
+            return Err(ManagedVolumeDeleteError::IdentityMismatch(
                 "volume identity changed immediately before delete".to_owned(),
             ));
         }
-        volume.delete(0).map_err(provisioning_backend_error)
+        volume
+            .delete(0)
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))
     }
 
     /// Proves that no libvirt storage volume remains at an exact managed path.
@@ -2170,13 +2267,15 @@ impl LibvirtBootBackend {
     pub fn verify_managed_volume_absent(
         &self,
         expected: &forge_state::ManagedResource,
-    ) -> Result<(), forge_provisioning::ProvisioningError> {
+    ) -> Result<(), ManagedVolumeAbsenceError> {
         match StorageVol::lookup_by_path(&self.connection, &expected.path) {
             Err(error) if error.code() == ErrorNumber::NoStorageVolume => Ok(()),
-            Err(error) => Err(provisioning_backend_error(error)),
+            Err(error) => Err(ManagedVolumeAbsenceError::Backend(error.to_string())),
             Ok(volume) => {
-                let key = volume.get_key().map_err(provisioning_backend_error)?;
-                Err(forge_provisioning::ProvisioningError::Backend(format!(
+                let key = volume
+                    .get_key()
+                    .map_err(|error| ManagedVolumeAbsenceError::Backend(error.to_string()))?;
+                Err(ManagedVolumeAbsenceError::Present(format!(
                     "managed volume still exists after delete: path={} key={key}",
                     expected.path
                 )))
@@ -2940,6 +3039,53 @@ mod tests {
     #[test]
     fn domain_absence_cannot_be_used_as_undefine_authorization() {
         assert!(authorize_domain_undefine(&expected(), &DomainDeleteObservation::Absent).is_err());
+    }
+
+    #[test]
+    fn domain_delete_errors_preserve_integrity_vs_backend_classification() {
+        assert!(matches!(
+            authorize_domain_undefine(
+                &expected(),
+                &DomainDeleteObservation::Conflict("UUID mismatch".to_owned())
+            ),
+            Err(DomainDeleteError::Conflict(_))
+        ));
+        assert!(matches!(
+            authorize_domain_undefine(&expected(), &exact_present(VmState::Running)),
+            Err(DomainDeleteError::UnsafeState(_))
+        ));
+        assert!(matches!(
+            DomainDeleteError::Backend("libvirt unavailable".to_owned()),
+            DomainDeleteError::Backend(_)
+        ));
+    }
+
+    #[test]
+    fn volume_delete_errors_preserve_integrity_vs_backend_classification() {
+        assert!(matches!(
+            ManagedVolumeDeleteError::IdentityMismatch("wrong key".to_owned()),
+            ManagedVolumeDeleteError::IdentityMismatch(_)
+        ));
+        assert!(matches!(
+            ManagedVolumeDeleteError::Referenced("domain reference".to_owned()),
+            ManagedVolumeDeleteError::Referenced(_)
+        ));
+        assert_eq!(
+            ManagedVolumeDeleteError::SharedBase.to_string(),
+            "shared base deletion is forbidden"
+        );
+        assert!(matches!(
+            ManagedVolumeDeleteError::Backend("storage unavailable".to_owned()),
+            ManagedVolumeDeleteError::Backend(_)
+        ));
+        assert!(matches!(
+            ManagedVolumeAbsenceError::Present("still exists".to_owned()),
+            ManagedVolumeAbsenceError::Present(_)
+        ));
+        assert!(matches!(
+            ManagedVolumeAbsenceError::Backend("lookup failed".to_owned()),
+            ManagedVolumeAbsenceError::Backend(_)
+        ));
     }
 
     #[test]
