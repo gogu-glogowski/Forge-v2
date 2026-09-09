@@ -842,6 +842,34 @@ mod tests {
     }
 
     #[test]
+    fn fedora_workstation_uses_graphical_uefi_q35_nat_without_guest_channels() {
+        let mut profile = profile();
+        profile.id = ProfileId::new("fedora-workstation").unwrap();
+        profile.kind = GuestProfileKind::FedoraWorkstation;
+        profile.image_source = ImageSourcePolicy::PromotedFedoraWorkstation {
+            release: "44".to_owned(),
+            compose: "1.7".to_owned(),
+        };
+        profile.image_verification = ImageVerificationPolicy::Sha256Digest;
+        profile.provisioning = ProvisioningPolicy::None;
+        profile.first_boot_success = forge_core::FirstBootSuccessPolicy::ManualGuest;
+        let spec = profile_spec(
+            &profile,
+            &plan(),
+            DomainMetadata {
+                name: "fedora-workstation-1".to_owned(),
+                disk_path: "/var/lib/libvirt/images/overlay.qcow2".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(spec.firmware, FirmwareMode::Uefi);
+        assert_eq!(spec.machine, MachineType::Q35);
+        assert_eq!(spec.graphics, GraphicsMode::Virtual);
+        assert_eq!(spec.network_interfaces.len(), 1);
+        assert!(spec.channels.is_empty());
+    }
+
+    #[test]
     fn kali_manual_guest_uses_bios_q35_without_guest_agent_channel() {
         let profile = forge_profiles::kali_lab();
         let resources = forge_profiles::plan(

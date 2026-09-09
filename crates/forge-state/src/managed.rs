@@ -140,6 +140,9 @@ pub enum ManagedState {
     Missing,
     Legacy(GenerationManifest),
     Current(GenerationIndex),
+    /// The immutable first-create intent was published, but its initial Active
+    /// index was never committed. This is an explicit recovery boundary.
+    InitialCreateRecoveryRequired(GenerationManifest),
     Conflict(String),
 }
 
@@ -418,8 +421,10 @@ pub fn plan_instance_delete(
         .ok_or_else(|| {
             StateError::InvalidObservedState("Active generation manifest is missing".to_owned())
         })?;
-    if active.status != GenerationStatus::Active
-        || !generation_identity_matches_exact(active, observed)
+    // Generation manifests are immutable create intent: an initially
+    // Preparing manifest remains so after the index atomically publishes it
+    // Active. The validated index is the lifecycle-status authority.
+    if !generation_identity_matches_exact(active, observed)
         || observed.unmanaged_resources.len() != 0
     {
         return Err(StateError::InvalidObservedState(
@@ -752,10 +757,46 @@ pub fn inspect_layout(layout: &StateLayout) -> Result<ManagedState, StateError> 
     let legacy = read_manifest(&layout.legacy_manifest)?;
     let index = read_index(&layout.index)?;
     match (legacy, index) {
-        (None, None) => Ok(ManagedState::Missing),
+        (None, None) => inspect_initial_create_recovery(layout),
         (Some(manifest), None) => Ok(ManagedState::Legacy(manifest)),
         (_, Some(index)) => Ok(ManagedState::Current(index)),
     }
+}
+
+fn inspect_initial_create_recovery(layout: &StateLayout) -> Result<ManagedState, StateError> {
+    if !layout.generations.exists() {
+        return Ok(ManagedState::Missing);
+    }
+    let mut manifests = Vec::new();
+    for entry in fs::read_dir(&layout.generations)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            return Ok(ManagedState::Conflict(
+                "initial create state contains a non-generation entry".to_owned(),
+            ));
+        }
+        let Some(manifest) = read_manifest(&entry.path())? else {
+            return Ok(ManagedState::Conflict(
+                "initial create generation disappeared during inspection".to_owned(),
+            ));
+        };
+        if entry.path() != layout.generation_path(&manifest.generation_id) {
+            return Ok(ManagedState::Conflict(
+                "initial create generation manifest is not at its canonical path".to_owned(),
+            ));
+        }
+        manifests.push(manifest);
+    }
+    if manifests.len() == 1 && manifests[0].status == GenerationStatus::Preparing {
+        return Ok(ManagedState::InitialCreateRecoveryRequired(
+            manifests.remove(0),
+        ));
+    }
+    Ok(ManagedState::Conflict(
+        "initial create state requires exactly one Preparing generation and no index".to_owned(),
+    ))
 }
 
 /// Classifies the complete durable generation index against persistent libvirt observation.
@@ -1140,6 +1181,47 @@ pub fn activate_initial_generation(
     };
     write_index_atomic(&layout.index, &index)?;
     Ok(index)
+}
+
+/// Plans the only supported recovery for an interrupted first create.
+///
+/// The immutable Preparing intent and independently observed libvirt/storage
+/// identities must still match exactly. This function performs no mutation.
+pub fn plan_initial_create_recovery(
+    layout: &StateLayout,
+    manifest: &GenerationManifest,
+    observed: &ObservedGeneration,
+) -> Result<GenerationIndex, StateError> {
+    match inspect_layout(layout)? {
+        ManagedState::InitialCreateRecoveryRequired(current)
+            if current == *manifest
+                && manifest.domain_name == observed.domain_name
+                && generation_identity_matches_exact(manifest, observed) => {}
+        ManagedState::InitialCreateRecoveryRequired(_) => {
+            return Err(StateError::InvalidObservedState(
+                "initial recovery durable intent changed".to_owned(),
+            ));
+        }
+        _ => {
+            return Err(StateError::InvalidObservedState(
+                "initial recovery requires exactly one durable Preparing generation and no index"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(GenerationIndex {
+        schema_version: INDEX_SCHEMA_VERSION,
+        domain_name: manifest.domain_name.clone(),
+        domain_uuid: manifest.domain_uuid.clone(),
+        active_generation_id: manifest.generation_id.clone(),
+        generations: vec![GenerationEntry {
+            generation_id: manifest.generation_id.clone(),
+            status: GenerationStatus::Active,
+            manifest_file: format!("generations/{}.json", manifest.generation_id),
+        }],
+        cleanup_progress: Vec::new(),
+        delete_state: None,
+    })
 }
 
 /// Plans a lossless migration. The legacy manifest remains as a recovery source.
@@ -2030,7 +2112,9 @@ mod tests {
         DeletePlan,
     ) {
         let index = index();
-        let manifest = manifest("old", GenerationStatus::Active);
+        // Immutable initial-create manifests retain Preparing; the index is
+        // the durable authority that publishes this generation Active.
+        let manifest = manifest("old", GenerationStatus::Preparing);
         let observed = observed("old");
         let plan = plan_instance_delete(
             &index,
@@ -2055,6 +2139,64 @@ mod tests {
             item.generation_id == plan.generation_id
                 && item.resource.role != ResourceRole::SharedBase
         }));
+    }
+
+    #[test]
+    fn recovered_initial_create_active_index_passes_exact_delete_preflight() {
+        let root = temp();
+        fs::create_dir_all(&root).unwrap();
+        let layout = StateLayout::new(&root, "fedora-lab");
+        let preparing = manifest("initial", GenerationStatus::Preparing);
+        let observed = observed("initial");
+        write_manifest_atomic(&layout.generation_path("initial"), &preparing).unwrap();
+        let active_index = plan_initial_create_recovery(&layout, &preparing, &observed).unwrap();
+        write_index_atomic(&layout.index, &active_index).unwrap();
+        let plan = plan_instance_delete(
+            &active_index,
+            std::slice::from_ref(&preparing),
+            &observed,
+            ManagedReconciliationStatus::Consistent,
+        )
+        .unwrap();
+        assert_eq!(plan.generation_id, "initial");
+        assert!(
+            plan.resources
+                .iter()
+                .all(|item| item.resource.role != ResourceRole::SharedBase)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_preflight_still_refuses_exact_identity_drift_after_recovery() {
+        let root = temp();
+        fs::create_dir_all(&root).unwrap();
+        let layout = StateLayout::new(&root, "fedora-lab");
+        let preparing = manifest("initial", GenerationStatus::Preparing);
+        let observed = observed("initial");
+        write_manifest_atomic(&layout.generation_path("initial"), &preparing).unwrap();
+        let index = plan_initial_create_recovery(&layout, &preparing, &observed).unwrap();
+        let mut drifted = observed.clone();
+        drifted.resources[1].backing_path = Some("/p/foreign-base".into());
+        assert!(
+            plan_instance_delete(
+                &index,
+                std::slice::from_ref(&preparing),
+                &drifted,
+                ManagedReconciliationStatus::Consistent,
+            )
+            .is_err()
+        );
+        assert!(
+            plan_instance_delete(
+                &index,
+                std::slice::from_ref(&preparing),
+                &observed,
+                ManagedReconciliationStatus::Conflict,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2238,6 +2380,70 @@ mod tests {
                 .active_generation_id,
             "old"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initial_preparing_without_index_is_explicit_recovery_not_missing() {
+        let root = temp();
+        fs::create_dir_all(&root).unwrap();
+        let layout = StateLayout::new(&root, "fedora-lab");
+        let preparing = manifest("initial", GenerationStatus::Preparing);
+        write_manifest_atomic(&layout.generation_path("initial"), &preparing).unwrap();
+        assert!(matches!(
+            inspect_layout(&layout).unwrap(),
+            ManagedState::InitialCreateRecoveryRequired(value) if value == preparing
+        ));
+        assert!(!layout.index.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initial_create_recovery_requires_exact_single_preparing_identity() {
+        let root = temp();
+        fs::create_dir_all(&root).unwrap();
+        let layout = StateLayout::new(&root, "fedora-lab");
+        let preparing = manifest("initial", GenerationStatus::Preparing);
+        write_manifest_atomic(&layout.generation_path("initial"), &preparing).unwrap();
+        let observed = observed("initial");
+        let index = plan_initial_create_recovery(&layout, &preparing, &observed).unwrap();
+        assert_eq!(index.active_generation_id, "initial");
+        assert!(!layout.index.exists());
+        for drift in [
+            |value: &mut ObservedGeneration| value.domain_uuid = "other".into(),
+            |value: &mut ObservedGeneration| value.storage_pool_uuid = "other".into(),
+            |value: &mut ObservedGeneration| value.resources[0].path = "/other".into(),
+            |value: &mut ObservedGeneration| {
+                value.resources[1].backing_path = Some("/other".into())
+            },
+        ] {
+            let mut changed = observed.clone();
+            drift(&mut changed);
+            assert!(plan_initial_create_recovery(&layout, &preparing, &changed).is_err());
+        }
+        let second = manifest("second", GenerationStatus::Preparing);
+        write_manifest_atomic(&layout.generation_path("second"), &second).unwrap();
+        assert!(matches!(
+            inspect_layout(&layout).unwrap(),
+            ManagedState::Conflict(_)
+        ));
+        assert!(plan_initial_create_recovery(&layout, &preparing, &observed).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initial_create_recovery_refuses_a_preparing_manifest_at_a_noncanonical_path() {
+        let root = temp();
+        fs::create_dir_all(&root).unwrap();
+        let layout = StateLayout::new(&root, "fedora-lab");
+        let preparing = manifest("initial", GenerationStatus::Preparing);
+        write_manifest_atomic(&layout.generations.join("random-name.json"), &preparing).unwrap();
+        assert!(matches!(
+            inspect_layout(&layout).unwrap(),
+            ManagedState::Conflict(reason) if reason.contains("canonical path")
+        ));
+        assert!(plan_initial_create_recovery(&layout, &preparing, &observed("initial")).is_err());
+        assert!(!layout.index.exists());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

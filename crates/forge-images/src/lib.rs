@@ -156,6 +156,15 @@ pub struct WhonixWorkstationExecuteProof {
     files: Vec<VerifiedFileIdentity>,
 }
 
+/// Byte-backed Gateway proof that may only be reused while the authenticated
+/// archive, prepared Gateway disk, and durable metadata retain their exact
+/// filesystem identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhonixGatewayExecuteProof {
+    metadata: WhonixGatewayImageMetadata,
+    files: Vec<VerifiedFileIdentity>,
+}
+
 /// Byte-backed Kali proof that may only be reused while the authenticated
 /// archive, prepared qcow2, and durable metadata retain their exact identities.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -455,6 +464,19 @@ pub enum KaliPreparationState {
     Verified(Box<KaliImageMetadata>),
     InterruptedPreparation,
     OrphanedPreparedImage,
+    Conflict(String),
+}
+
+/// Lightweight local inventory classification. `RecordedVerified` means that
+/// durable metadata records a completed verification; it is not a fresh
+/// cryptographic proof of the artifact bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedPreparationState {
+    Missing,
+    Preparing,
+    RecordedVerified,
+    Interrupted,
+    Orphaned,
     Conflict(String),
 }
 
@@ -1981,6 +2003,96 @@ fn prove_existing_whonix_gateway(
     Ok((metadata, archive_evidence, after))
 }
 
+fn whonix_gateway_execute_input_paths(directories: &ImageDirectories) -> [PathBuf; 5] {
+    [
+        directories.downloads.join(WHONIX_ARCHIVE_FILENAME),
+        directories
+            .downloads
+            .join(format!("{WHONIX_ARCHIVE_FILENAME}.asc")),
+        directories.downloads.join("whonix-derivative.asc"),
+        directories.images.join(WHONIX_GATEWAY_DISK_FILENAME),
+        directories.images.join("whonix.metadata.json"),
+    ]
+}
+
+fn capture_whonix_gateway_execute_inputs(
+    directories: &ImageDirectories,
+) -> Result<Vec<VerifiedFileIdentity>, ImageError> {
+    whonix_gateway_execute_input_paths(directories)
+        .iter()
+        .map(|path| verified_file_identity(path))
+        .collect()
+}
+
+/// Prepares or fully validates the Gateway once and returns byte-backed proof
+/// for the immediately following create transaction.
+///
+/// # Errors
+/// Refuses missing, untrusted, changed, or concurrently replaced inputs.
+pub fn prepare_whonix_gateway_for_execute<F: ArtifactFetcher>(
+    directories: &ImageDirectories,
+    fetcher: &mut F,
+) -> Result<(WhonixGatewayImageMetadata, WhonixGatewayExecuteProof), ImageError> {
+    // This cheap metadata/provenance check avoids an unnecessary full hash of
+    // an already prepared base. If it cannot establish a complete existing
+    // state, fetch performs its own fail-closed state classification.
+    if read_whonix_verified_metadata(directories).is_err() {
+        fetch_whonix_gateway(directories, fetcher)?;
+    }
+    let (metadata, _, files) = prove_existing_whonix_gateway(directories)?;
+    let proof = WhonixGatewayExecuteProof {
+        metadata: metadata.clone(),
+        files,
+    };
+    revalidate_whonix_gateway_execute_proof(directories, &proof)?;
+    Ok((metadata, proof))
+}
+
+/// Cheaply revalidates the exact local identities captured by a full Gateway
+/// proof. It deliberately does not grant trust from paths or metadata alone.
+///
+/// # Errors
+/// Refuses replacement, writes, mode/link/timestamp drift, or metadata drift.
+pub fn revalidate_whonix_gateway_execute_proof(
+    directories: &ImageDirectories,
+    proof: &WhonixGatewayExecuteProof,
+) -> Result<WhonixGatewayImageMetadata, ImageError> {
+    if capture_whonix_gateway_execute_inputs(directories)? != proof.files {
+        return Err(ImageError::SourceNotVerified);
+    }
+    let metadata_path = directories.images.join("whonix.metadata.json");
+    let metadata: WhonixGatewayImageMetadata = serde_json::from_slice(&fs::read(metadata_path)?)
+        .map_err(|error| ImageError::Metadata(error.to_string()))?;
+    if metadata != proof.metadata {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(metadata)
+}
+
+/// Opens the Gateway inode proven by an execute proof. The descriptor keeps
+/// the imported bytes bound even if its pathname is replaced afterwards.
+///
+/// # Errors
+/// Refuses proof drift or an opened inode that differs from the proof.
+pub fn open_whonix_gateway_execute_source(
+    directories: &ImageDirectories,
+    proof: &WhonixGatewayExecuteProof,
+) -> Result<File, ImageError> {
+    revalidate_whonix_gateway_execute_proof(directories, proof)?;
+    let path = directories.images.join(WHONIX_GATEWAY_DISK_FILENAME);
+    let file = File::open(&path)?;
+    let opened = opened_file_identity(&path, &file)?;
+    let expected = proof
+        .files
+        .iter()
+        .find(|identity| identity.path == path)
+        .ok_or(ImageError::SourceNotVerified)?;
+    if &opened != expected {
+        return Err(ImageError::SourceNotVerified);
+    }
+    Ok(file)
+}
+
 /// Publishes the typed Workstation disk from the already downloaded, fully
 /// authenticated Whonix bundle. No network download is performed.
 ///
@@ -3046,6 +3158,135 @@ pub fn inspect_kali_preparation(
         return Ok(KaliPreparationState::InterruptedPreparation);
     }
     Ok(KaliPreparationState::Missing)
+}
+
+/// Classifies Kali inventory from durable metadata and inexpensive filesystem
+/// shape checks only. It deliberately never hashes an archive or qcow2.
+pub fn inspect_kali_inventory(
+    directories: &ImageDirectories,
+) -> Result<RecordedPreparationState, ImageError> {
+    let metadata_path = directories.images.join("kali.metadata.json");
+    let metadata_temporary_path = directories.images.join("kali.metadata.json.tmp");
+    let prepared = directories.images.join(KALI_QCOW2_FILENAME);
+    let archive = directories.downloads.join(KALI_ARCHIVE_FILENAME);
+    let intent_path = kali_intent_path(directories);
+    if metadata_path.exists() {
+        let metadata: KaliImageMetadata = serde_json::from_slice(&fs::read(&metadata_path)?)
+            .map_err(|error| ImageError::Metadata(error.to_string()))?;
+        let coherent = metadata.status == ImageStatus::Verified
+            && metadata.release == KALI_RELEASE
+            && metadata.architecture == "x86_64"
+            && metadata.source_url == KALI_SOURCE_URL
+            && metadata.archive_path == archive
+            && metadata.prepared_qcow2_path == prepared
+            && metadata
+                .authenticated_archive_checksum
+                .as_deref()
+                .is_some_and(valid_sha256)
+            && metadata
+                .actual_archive_checksum
+                .as_deref()
+                .is_some_and(valid_sha256)
+            && metadata
+                .prepared_qcow2_checksum
+                .as_deref()
+                .is_some_and(valid_sha256)
+            && is_single_regular_file(&archive)
+            && is_single_regular_file(&prepared);
+        return Ok(if coherent {
+            RecordedPreparationState::RecordedVerified
+        } else {
+            RecordedPreparationState::Conflict(
+                "recorded Kali provenance or artifact shape is inconsistent".to_owned(),
+            )
+        });
+    }
+    if prepared.exists() {
+        return Ok(if is_single_regular_file(&prepared) {
+            RecordedPreparationState::Orphaned
+        } else {
+            RecordedPreparationState::Conflict(
+                "orphaned Kali prepared path is not one regular file".to_owned(),
+            )
+        });
+    }
+    if intent_path.exists()
+        || metadata_temporary_path.exists()
+        || !kali_extraction_roots(&directories.downloads)?.is_empty()
+    {
+        return Ok(RecordedPreparationState::Interrupted);
+    }
+    Ok(RecordedPreparationState::Missing)
+}
+
+fn inspect_whonix_inventory(
+    directories: &ImageDirectories,
+    metadata_name: &str,
+    intent_name: &str,
+    prepared_name: &str,
+) -> Result<RecordedPreparationState, ImageError> {
+    let metadata_path = directories.images.join(metadata_name);
+    let intent_path = directories.images.join(intent_name);
+    let prepared = directories.images.join(prepared_name);
+    if intent_path.exists()
+        || directories
+            .images
+            .join(format!("{metadata_name}.tmp"))
+            .exists()
+    {
+        return Ok(RecordedPreparationState::Preparing);
+    }
+    if !metadata_path.exists() {
+        return Ok(if prepared.exists() {
+            RecordedPreparationState::Orphaned
+        } else {
+            RecordedPreparationState::Missing
+        });
+    }
+    let metadata: WhonixGatewayImageMetadata =
+        serde_json::from_slice(&fs::read(&metadata_path)?)
+            .map_err(|error| ImageError::Metadata(error.to_string()))?;
+    let archive = directories.downloads.join(WHONIX_ARCHIVE_FILENAME);
+    let coherent = metadata.status == ImageStatus::Verified
+        && metadata.prepared_qcow2_path == prepared
+        && metadata.provenance.release == WHONIX_RELEASE
+        && metadata.provenance.archive_filename == WHONIX_ARCHIVE_FILENAME
+        && metadata.provenance.source_url == WHONIX_SOURCE_URL
+        && metadata.provenance.signer_fingerprint == WHONIX_SIGNING_KEY_FINGERPRINT
+        && metadata.provenance.signature_notation == WHONIX_SIGNATURE_NOTATION
+        && is_single_regular_file(&archive)
+        && is_single_regular_file(&prepared);
+    Ok(if coherent {
+        RecordedPreparationState::RecordedVerified
+    } else {
+        RecordedPreparationState::Conflict(
+            "recorded Whonix provenance or artifact shape is inconsistent".to_owned(),
+        )
+    })
+}
+
+/// Lightweight Gateway inventory without a fresh artifact hash.
+pub fn inspect_whonix_gateway_inventory(
+    directories: &ImageDirectories,
+) -> Result<RecordedPreparationState, ImageError> {
+    inspect_whonix_inventory(
+        directories,
+        "whonix.metadata.json",
+        "whonix.intent.json",
+        WHONIX_GATEWAY_DISK_FILENAME,
+    )
+}
+
+/// Lightweight Workstation inventory without a fresh artifact hash.
+pub fn inspect_whonix_workstation_inventory(
+    directories: &ImageDirectories,
+) -> Result<RecordedPreparationState, ImageError> {
+    inspect_whonix_inventory(
+        directories,
+        "whonix-workstation.metadata.json",
+        "whonix-workstation.intent.json",
+        WHONIX_WORKSTATION_DISK_FILENAME,
+    )
 }
 
 /// Reads Kali metadata without treating absence as trust.
@@ -4644,6 +4885,31 @@ mod tests {
     }
 
     #[test]
+    fn lightweight_inventory_never_runs_full_artifact_hashes_and_lists_whonix_roles() {
+        let test = TestDirectories::new();
+        let image = qcow2_header(WHONIX_WORKSTATION_VIRTUAL_BYTES);
+        let mut fetcher = FixtureFetcher::valid(&image);
+        fetch_kali(&test.directories, &mut fetcher).unwrap();
+        fetch_whonix_gateway(&test.directories, &mut fetcher).unwrap();
+        prepare_whonix_workstation(&test.directories, &mut fetcher).unwrap();
+
+        let ((kali, gateway, workstation), reads) = audit_full_reads(|| {
+            (
+                inspect_kali_inventory(&test.directories),
+                inspect_whonix_gateway_inventory(&test.directories),
+                inspect_whonix_workstation_inventory(&test.directories),
+            )
+        });
+        assert_eq!(reads, Vec::<FullReadOperation>::new());
+        assert_eq!(kali.unwrap(), RecordedPreparationState::RecordedVerified);
+        assert_eq!(gateway.unwrap(), RecordedPreparationState::RecordedVerified);
+        assert_eq!(
+            workstation.unwrap(),
+            RecordedPreparationState::RecordedVerified
+        );
+    }
+
+    #[test]
     fn whonix_workstation_publication_selects_exact_role_without_download() {
         let test = TestDirectories::new();
         let gateway_image = qcow2_header(WHONIX_WORKSTATION_VIRTUAL_BYTES);
@@ -4716,6 +4982,40 @@ mod tests {
         fs::write(workstation, changed).unwrap();
         assert!(matches!(
             revalidate_whonix_workstation_execute_proof(&test.directories, &proof),
+            Err(ImageError::SourceNotVerified)
+        ));
+    }
+
+    #[test]
+    fn gateway_execute_proof_has_one_full_hash_per_artifact_and_refuses_drift() {
+        let test = TestDirectories::new();
+        let image = qcow2_header(WHONIX_WORKSTATION_VIRTUAL_BYTES);
+        let mut fetcher = FixtureFetcher::valid(&image);
+        fetch_whonix_gateway(&test.directories, &mut fetcher).unwrap();
+
+        let (result, reads) = audit_full_reads(|| {
+            prepare_whonix_gateway_for_execute(&test.directories, &mut fetcher)
+        });
+        let (metadata, proof) = result.unwrap();
+        assert_eq!(
+            metadata.prepared_qcow2_path,
+            test.directories.images.join(WHONIX_GATEWAY_DISK_FILENAME)
+        );
+        assert_eq!(
+            reads,
+            vec![
+                FullReadOperation::ArchiveHash,
+                FullReadOperation::GatewayHash
+            ]
+        );
+        assert!(revalidate_whonix_gateway_execute_proof(&test.directories, &proof).is_ok());
+
+        let gateway = test.directories.images.join(WHONIX_GATEWAY_DISK_FILENAME);
+        let mut changed = fs::read(&gateway).unwrap();
+        changed.push(0x42);
+        fs::write(gateway, changed).unwrap();
+        assert!(matches!(
+            revalidate_whonix_gateway_execute_proof(&test.directories, &proof),
             Err(ImageError::SourceNotVerified)
         ));
     }

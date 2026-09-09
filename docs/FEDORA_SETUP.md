@@ -30,6 +30,21 @@ virsh -c qemu:///system pool-list --all
 
 A clean host may legitimately have **zero VMs and zero storage pools**. Do not create a storage pool only to make this check look populated. The standard libvirt `default` network should be available for the current Forge workflow.
 
+Before the first `forge vm create`, Forge requires the standard system libvirt
+storage pool named `default`. If it is absent, run the normal libvirt setup as
+an operator:
+
+```bash
+sudo virsh -c qemu:///system pool-define-as default dir --target /var/lib/libvirt/images
+sudo virsh -c qemu:///system pool-start default
+sudo virsh -c qemu:///system pool-autostart default
+virsh -c qemu:///system pool-info default
+```
+
+`forge doctor` reports this prerequisite and prints the same remediation when
+the pool is missing or inactive. Forge does not create or mutate the host pool
+automatically.
+
 ## 3. Install build prerequisites
 
 Forge uses the Rust `virt` / `virt-sys` bindings to system libvirt. Building therefore needs the libvirt development files, not only the runtime library.

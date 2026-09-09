@@ -18,6 +18,7 @@ const RATIO_SCALE_USIZE: usize = 1000;
 pub fn built_in_profiles() -> Vec<VmProfile> {
     vec![
         fedora_lab(),
+        fedora_workstation(),
         kali_lab(),
         whonix_gateway(),
         whonix_workstation(),
@@ -38,6 +39,9 @@ pub fn base_volume_name(profile: &VmProfile) -> String {
     match &profile.image_source {
         ImageSourcePolicy::FedoraCloudBase { release } => {
             format!("forge-base-fedora-{release}.qcow2")
+        }
+        ImageSourcePolicy::PromotedFedoraWorkstation { release, compose } => {
+            format!("forge-base-fedora-workstation-{release}-{compose}.qcow2")
         }
         ImageSourcePolicy::KaliQemuArchive { release } => {
             format!("forge-base-kali-{release}.qcow2")
@@ -215,6 +219,38 @@ pub fn fedora_lab() -> VmProfile {
 }
 
 #[must_use]
+pub fn fedora_workstation() -> VmProfile {
+    profile(
+        ProfileMetadata {
+            id: "fedora-workstation",
+            display_name: "Fedora Workstation",
+            kind: GuestProfileKind::FedoraWorkstation,
+            instance_kind: InstanceKind::Lab,
+            guest_family: GuestFamily::Fedora,
+        },
+        VmResources {
+            cpu_ratio_per_mille: 250,
+            min_vcpus: 2,
+            max_vcpus: 8,
+            memory_start_ratio_per_mille: 250,
+            memory_max_ratio_per_mille: 375,
+            min_memory_bytes: 4 * GIB,
+            host_memory_reserve_bytes: 4 * GIB,
+            disk_bytes: 80 * GIB,
+        },
+        ImagePolicy {
+            source: ImageSourcePolicy::PromotedFedoraWorkstation {
+                release: "44".to_owned(),
+                compose: "1.7".to_owned(),
+            },
+            verification: ImageVerificationPolicy::Sha256Digest,
+        },
+        ProvisioningPolicy::None,
+        FirstBootSuccessPolicy::ManualGuest,
+    )
+}
+
+#[must_use]
 pub fn luna_dev_fedora() -> VmProfile {
     profile(
         ProfileMetadata {
@@ -377,6 +413,7 @@ pub enum PrepareBaseStrategy {
     SevenZipSingleQcow2,
     WhonixBundleGateway,
     WhonixBundleWorkstation,
+    PromotedFedoraWorkstationCanonical,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,6 +718,7 @@ pub fn plan_create(
                 ImageSourcePolicy::WhonixLibvirtBundle { .. } => {
                     SourceImageFormat::TarXzMultiArtifactBundle
                 }
+                ImageSourcePolicy::PromotedFedoraWorkstation { .. } => SourceImageFormat::Qcow2,
                 _ => SourceImageFormat::Qcow2,
             },
             preparation: match &instance.image.source {
@@ -692,6 +730,9 @@ pub fn plan_create(
                         "whonix-workstation" => PrepareBaseStrategy::WhonixBundleWorkstation,
                         _ => PrepareBaseStrategy::WhonixBundleGateway,
                     }
+                }
+                ImageSourcePolicy::PromotedFedoraWorkstation { .. } => {
+                    PrepareBaseStrategy::PromotedFedoraWorkstationCanonical
                 }
                 _ => PrepareBaseStrategy::VerifiedQcow2,
             },
@@ -841,6 +882,58 @@ mod tests {
         assert_eq!(plan.vcpus, 4);
         assert_eq!(plan.network, NetworkMode::Nat);
         assert_eq!(plan.gpu, GpuMode::Virtual);
+    }
+
+    #[test]
+    fn fedora_workstation_is_supported_manual_promoted_base_profile() {
+        let profile = find("fedora-workstation").unwrap();
+        assert_eq!(profile.kind, GuestProfileKind::FedoraWorkstation);
+        assert_eq!(profile.availability, ProductAvailability::Supported);
+        assert_eq!(profile.provisioning, ProvisioningPolicy::None);
+        assert_eq!(
+            profile.first_boot_success,
+            FirstBootSuccessPolicy::ManualGuest
+        );
+        assert_eq!(profile.firmware_machine, FirmwareMachinePolicy::UefiQ35);
+        assert_eq!(profile.network_policy, NetworkPolicy::DefaultNat);
+        assert_eq!(
+            profile.image_source,
+            ImageSourcePolicy::PromotedFedoraWorkstation {
+                release: "44".to_owned(),
+                compose: "1.7".to_owned(),
+            }
+        );
+        assert_eq!(
+            base_volume_name(&profile),
+            "forge-base-fedora-workstation-44-1.7.qcow2"
+        );
+    }
+
+    #[test]
+    fn fedora_workstation_plan_uses_promoted_base_without_provisioning() {
+        let profile = fedora_workstation();
+        let plan = plan_instance(
+            &hardware(16, 32),
+            &profile,
+            InstanceIdentity {
+                name: InstanceName::new("fedora-workstation-1").unwrap(),
+                profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plan.image.base_volume_name,
+            "forge-base-fedora-workstation-44-1.7.qcow2"
+        );
+        assert_eq!(plan.provisioning, ProvisioningPolicy::None);
+        assert_eq!(plan.first_boot_success, FirstBootSuccessPolicy::ManualGuest);
+        assert_eq!(plan.storage.seed_volume_name, None);
+        assert_eq!(
+            plan.lifecycle,
+            LifecyclePlan::PersistentManaged {
+                state_directory_name: "fedora-workstation-1".to_owned(),
+            }
+        );
     }
 
     #[test]
@@ -1121,6 +1214,7 @@ mod tests {
             names,
             [
                 "fedora-lab",
+                "fedora-workstation",
                 "kali-lab",
                 "whonix-gateway",
                 "whonix-workstation",

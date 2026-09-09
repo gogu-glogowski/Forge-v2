@@ -212,6 +212,7 @@ pub enum GuestProfileKind {
     LunaDevFedora,
     LunaLabFedora,
     FedoraLab,
+    FedoraWorkstation,
     DebianClean,
     KaliLab,
     TsurugiLab,
@@ -278,6 +279,7 @@ pub enum FirmwareMachinePolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageSourcePolicy {
     FedoraCloudBase { release: String },
+    PromotedFedoraWorkstation { release: String, compose: String },
     KaliQemuArchive { release: String },
     WhonixLibvirtBundle { release: String },
     VerifiedQcow2 { source_id: String },

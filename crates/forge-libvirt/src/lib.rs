@@ -370,8 +370,8 @@ impl LibvirtDefineBackend {
         Ok(classify_domain_delete_observation(expected, &summaries))
     }
 
-    /// Re-observes and undefines one exact stopped persistent domain. No
-    /// destroy operation, storage deletion, or undefine flags are used.
+    /// Re-observes and undefines one exact stopped persistent domain, removing
+    /// only libvirt-managed NVRAM associated with that exact domain.
     pub fn undefine_domain_exact(
         &self,
         expected: &ExactDomainIdentity,
@@ -403,7 +403,7 @@ impl LibvirtDefineBackend {
         };
         authorize_domain_undefine(expected, &immediate)?;
         domain
-            .undefine()
+            .undefine_flags(domain_undefine_flags())
             .map_err(|error| DomainDeleteError::Backend(error.to_string()))?;
         match self
             .observe_domain_for_delete(expected)
@@ -653,6 +653,37 @@ impl LibvirtDefineBackend {
         Ok(info)
     }
 
+    /// Creates an immutable canonical qcow2 from one exact preparation volume.
+    pub fn clone_protected_workstation_volume(
+        &self,
+        pool_name: &str,
+        source_path: &str,
+        target_name: &str,
+        capacity_bytes: u64,
+    ) -> Result<forge_storage::VolumeInfo, String> {
+        let pool = self.pool(pool_name).map_err(|error| error.to_string())?;
+        let source = StorageVol::lookup_by_path(&self.connection, source_path)
+            .map_err(|error| format!("exact source volume lookup failed: {error}"))?;
+        let xml = format!(
+            "<volume><name>{target_name}</name><capacity unit='bytes'>{capacity_bytes}</capacity><target><format type='qcow2'/><permissions><mode>0444</mode></permissions></target></volume>"
+        );
+        let volume = StorageVol::create_xml_from(&pool, &xml, &source, CLONE_CREATE_FLAGS)
+            .map_err(|error| error.to_string())?;
+        pool.refresh(0).map_err(|error| error.to_string())?;
+        let info = volume_info(&volume, target_name).map_err(|error| error.to_string())?;
+        let volume_xml = volume.get_xml_desc(0).map_err(|error| error.to_string())?;
+        if xml_attribute(&volume_xml, "format", "type").as_deref() != Some("qcow2")
+            || backing_store_path(&volume_xml).is_some()
+            || info.capacity_bytes != capacity_bytes
+        {
+            let _ = volume.delete(0);
+            return Err(
+                "canonical create-from produced a non-flat or mismatched target".to_owned(),
+            );
+        }
+        Ok(info)
+    }
+
     /// Reads the persistent shutoff domain identity used by Fresh replacement/recovery.
     ///
     /// # Errors
@@ -684,6 +715,10 @@ impl LibvirtDefineBackend {
             xml,
         ))
     }
+}
+
+const fn domain_undefine_flags() -> sys::virDomainUndefineFlagsValues {
+    sys::VIR_DOMAIN_UNDEFINE_NVRAM
 }
 
 /// Produces a define-over-existing document by changing only the exact old disk source.
@@ -840,10 +875,16 @@ impl forge_storage::DefineBackend for LibvirtDefineBackend {
         &mut self,
         name: &str,
     ) -> Result<Option<forge_storage::StoragePoolInfo>, forge_storage::StorageError> {
-        let pool = match StoragePool::lookup_by_name(&self.connection, name) {
-            Ok(pool) => pool,
-            Err(error) if error.code() == ErrorNumber::NoStoragePool => return Ok(None),
-            Err(error) => return Err(storage_backend_error(error)),
+        let pool = find_listed_resource_by_name(
+            self.connection
+                .list_all_storage_pools(0)
+                .map_err(storage_backend_error)?,
+            name,
+            StoragePool::get_name,
+        )
+        .map_err(storage_backend_error)?;
+        let Some(pool) = pool else {
+            return Ok(None);
         };
         let active = pool.is_active().map_err(storage_backend_error)?;
         let info = pool.get_info().map_err(storage_backend_error)?;
@@ -862,11 +903,15 @@ impl forge_storage::DefineBackend for LibvirtDefineBackend {
     }
 
     fn domain_exists(&mut self, name: &str) -> Result<bool, forge_storage::StorageError> {
-        match Domain::lookup_by_name(&self.connection, name) {
-            Ok(_) => Ok(true),
-            Err(error) if error.code() == ErrorNumber::NoDomain => Ok(false),
-            Err(error) => Err(storage_backend_error(error)),
-        }
+        Ok(find_listed_resource_by_name(
+            self.connection
+                .list_all_domains(0)
+                .map_err(storage_backend_error)?,
+            name,
+            Domain::get_name,
+        )
+        .map_err(storage_backend_error)?
+        .is_some())
     }
 
     fn volume_exists(
@@ -875,11 +920,13 @@ impl forge_storage::DefineBackend for LibvirtDefineBackend {
         name: &str,
     ) -> Result<bool, forge_storage::StorageError> {
         let pool = self.pool(pool)?;
-        match StorageVol::lookup_by_name(&pool, name) {
-            Ok(_) => Ok(true),
-            Err(error) if error.code() == ErrorNumber::NoStorageVolume => Ok(false),
-            Err(error) => Err(storage_backend_error(error)),
-        }
+        Ok(find_listed_resource_by_name(
+            pool.list_all_volumes(0).map_err(storage_backend_error)?,
+            name,
+            StorageVol::get_name,
+        )
+        .map_err(storage_backend_error)?
+        .is_some())
     }
 
     fn create_volume(
@@ -1129,6 +1176,94 @@ impl forge_images::FedoraWorkstationPreparationBackend for LibvirtDefineBackend 
     }
 }
 
+impl LibvirtDefineBackend {
+    /// Proves that an exact canonical qcow2 volume retains the Forge read-only mode.
+    ///
+    /// # Errors
+    /// Refuses an absent or identity-drifted volume, a non-flat qcow2, or a mode other than
+    /// the canonical `0444` contract.
+    pub fn verify_exact_protected_qcow2_volume(
+        &self,
+        pool: &str,
+        expected: &forge_images::PreparationVolumeEvidence,
+    ) -> Result<(), String> {
+        let pool_obj = self.pool(pool).map_err(|error| error.to_string())?;
+        let volume = StorageVol::lookup_by_name(&pool_obj, &expected.name)
+            .map_err(|error| error.to_string())?;
+        let info = volume.get_info().map_err(|error| error.to_string())?;
+        let xml = volume.get_xml_desc(0).map_err(|error| error.to_string())?;
+        let observed = forge_images::PreparationVolumeEvidence {
+            name: volume.get_name().map_err(|error| error.to_string())?,
+            key: volume.get_key().map_err(|error| error.to_string())?,
+            path: volume.get_path().map_err(|error| error.to_string())?.into(),
+            format: xml_attribute(&xml, "format", "type").unwrap_or_default(),
+            capacity_bytes: info.capacity,
+            allocation_bytes: info.allocation,
+            backing_path: backing_store_path(&xml).map(Into::into),
+        };
+        if observed != *expected
+            || observed.format != "qcow2"
+            || observed.backing_path.is_some()
+            || xml_element(&xml, "mode").as_deref() != Some("0444")
+        {
+            return Err("exact canonical qcow2 protection or identity drift".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Proves one exact flat qcow2 volume by hashing its libvirt-delivered storage representation.
+    pub fn stream_exact_qcow2_volume(
+        &self,
+        pool: &str,
+        expected: &forge_images::PreparationVolumeEvidence,
+    ) -> Result<forge_images::Qcow2VolumeProof, String> {
+        let pool_obj = self.pool(pool).map_err(|error| error.to_string())?;
+        let volume = StorageVol::lookup_by_name(&pool_obj, &expected.name)
+            .map_err(|error| error.to_string())?;
+        let info = volume.get_info().map_err(|error| error.to_string())?;
+        let xml = volume.get_xml_desc(0).map_err(|error| error.to_string())?;
+        let observed = forge_images::PreparationVolumeEvidence {
+            name: volume.get_name().map_err(|error| error.to_string())?,
+            key: volume.get_key().map_err(|error| error.to_string())?,
+            path: volume.get_path().map_err(|error| error.to_string())?.into(),
+            format: xml_attribute(&xml, "format", "type").unwrap_or_default(),
+            capacity_bytes: info.capacity,
+            allocation_bytes: info.allocation,
+            backing_path: backing_store_path(&xml).map(Into::into),
+        };
+        if observed != *expected || observed.format != "qcow2" || observed.backing_path.is_some() {
+            return Err("exact qcow2 volume identity or shape drift".to_owned());
+        }
+        let stream = Stream::new(&self.connection, 0).map_err(|error| error.to_string())?;
+        // A zero length asks libvirt for the complete storage object, whose sparse
+        // representation length is independent from qcow2 virtual capacity.
+        volume
+            .download(&stream, 0, 0, 0)
+            .map_err(|error| error.to_string())?;
+        let mut hash = Sha256::new();
+        let mut streamed_bytes = 0u64;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let count = stream
+                .recv(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            streamed_bytes = streamed_bytes
+                .checked_add(count as u64)
+                .ok_or_else(|| "qcow2 stream byte count overflow".to_owned())?;
+            hash.update(&buffer[..count]);
+        }
+        stream.finish().map_err(|error| error.to_string())?;
+        Ok(forge_images::Qcow2VolumeProof {
+            volume: observed,
+            streamed_bytes,
+            sha256: format!("{:x}", hash.finalize()),
+        })
+    }
+}
+
 impl forge_storage::ImagePrepareBackend for LibvirtDefineBackend {
     fn inspect_pool(
         &mut self,
@@ -1178,10 +1313,14 @@ impl forge_storage::ImagePrepareBackend for LibvirtDefineBackend {
         let pool = self
             .pool(pool)
             .map_err(forge_storage::ImagePrepareError::from)?;
-        let volume = match StorageVol::lookup_by_name(&pool, name) {
-            Ok(volume) => volume,
-            Err(error) if error.code() == ErrorNumber::NoStorageVolume => return Ok(None),
-            Err(error) => return Err(image_backend_error(error)),
+        let volume = find_listed_resource_by_name(
+            pool.list_all_volumes(0).map_err(image_backend_error)?,
+            name,
+            StorageVol::get_name,
+        )
+        .map_err(image_backend_error)?;
+        let Some(volume) = volume else {
+            return Ok(None);
         };
         let info = volume.get_info().map_err(image_backend_error)?;
         let path = volume.get_path().map_err(image_backend_error)?;
@@ -1488,22 +1627,18 @@ fn generation_volume_status(
     volume_backings: &[(String, Option<String>)],
 ) -> Result<forge_provisioning::GenerationVolumeStatus, forge_provisioning::ProvisioningError> {
     let expected_path = format!("{pool_path}/{name}");
-    let volume = match StorageVol::lookup_by_name(pool, name) {
-        Ok(volume) => volume,
-        Err(error) if error.code() == ErrorNumber::NoStorageVolume => {
-            return Ok(forge_provisioning::GenerationVolumeStatus {
-                name: name.to_owned(),
-                path: expected_path,
-                exists: false,
-                capacity_bytes: None,
-                format: None,
-                backing_path: None,
-                referenced_by_domains: Vec::new(),
-                backing_for_volumes: Vec::new(),
-                ownership_marker: None,
-            });
-        }
-        Err(error) => return Err(provisioning_backend_error(error)),
+    let volume = find_listed_resource_by_name(
+        pool.list_all_volumes(0)
+            .map_err(provisioning_backend_error)?,
+        name,
+        StorageVol::get_name,
+    )
+    .map_err(provisioning_backend_error)?;
+    let Some(volume) = volume else {
+        return Ok(absent_generation_volume_status_with_path(
+            name,
+            expected_path,
+        ));
     };
     let info = volume.get_info().map_err(provisioning_backend_error)?;
     let path = volume.get_path().map_err(provisioning_backend_error)?;
@@ -1529,12 +1664,71 @@ fn generation_volume_status(
     })
 }
 
-fn domain_ip_addresses(domain: &Domain) -> Vec<String> {
+fn absent_generation_volume_status_with_path(
+    name: &str,
+    path: String,
+) -> forge_provisioning::GenerationVolumeStatus {
+    forge_provisioning::GenerationVolumeStatus {
+        name: name.to_owned(),
+        path,
+        exists: false,
+        capacity_bytes: None,
+        format: None,
+        backing_path: None,
+        referenced_by_domains: Vec::new(),
+        backing_for_volumes: Vec::new(),
+        ownership_marker: None,
+    }
+}
+
+fn find_listed_resource_by_name<T, F>(
+    resources: Vec<T>,
+    expected_name: &str,
+    mut name_of: F,
+) -> Result<Option<T>, VirtError>
+where
+    F: FnMut(&T) -> Result<String, VirtError>,
+{
+    for resource in resources {
+        if name_of(&resource)? == expected_name {
+            return Ok(Some(resource));
+        }
+    }
+    Ok(None)
+}
+
+fn observe_legacy_fedora_resources(active_manifest_present: bool) -> bool {
+    !active_manifest_present
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterfaceAddressSource {
+    Agent,
+    Lease,
+}
+
+fn interface_address_sources(qga_channel: bool) -> &'static [InterfaceAddressSource] {
+    if qga_channel {
+        &[InterfaceAddressSource::Agent, InterfaceAddressSource::Lease]
+    } else {
+        &[]
+    }
+}
+
+fn unconfigured_qga_status_observation() -> (forge_provisioning::GuestAgentStatus, Vec<String>) {
+    (
+        forge_provisioning::GuestAgentStatus::Unavailable,
+        Vec::new(),
+    )
+}
+
+fn domain_ip_addresses(domain: &Domain, qga_channel: bool) -> Vec<String> {
     let mut addresses = Vec::new();
-    for source in [
-        sys::VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT,
-        sys::VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE,
-    ] {
+    for source in interface_address_sources(qga_channel) {
+        let source = match source {
+            InterfaceAddressSource::Agent => sys::VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT,
+            InterfaceAddressSource::Lease => sys::VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE,
+        };
         if let Ok(interfaces) = domain.interface_addresses(source, 0) {
             addresses.extend(
                 interfaces
@@ -1783,22 +1977,25 @@ impl LibvirtBootBackend {
                 &volume_backings,
             )
         };
-        let ip_addresses = if domain_state == VmState::Running {
-            domain_ip_addresses(&domain)
-        } else {
-            Vec::new()
-        };
         let guest_agent_channel = domain_xml.contains("org.qemu.guest_agent.0");
-        let guest_agent_status = if !guest_agent_channel {
-            forge_provisioning::GuestAgentStatus::Unavailable
-        } else if domain_state == VmState::Running
-            && domain
-                .qemu_agent_command("{\"execute\":\"guest-ping\"}", 5, 0)
-                .is_ok()
-        {
-            forge_provisioning::GuestAgentStatus::Available
+        let (guest_agent_status, ip_addresses) = if !guest_agent_channel {
+            unconfigured_qga_status_observation()
         } else {
-            forge_provisioning::GuestAgentStatus::Unavailable
+            let ip_addresses = if domain_state == VmState::Running {
+                domain_ip_addresses(&domain, true)
+            } else {
+                Vec::new()
+            };
+            let guest_agent_status = if domain_state == VmState::Running
+                && domain
+                    .qemu_agent_command("{\"execute\":\"guest-ping\"}", 5, 0)
+                    .is_ok()
+            {
+                forge_provisioning::GuestAgentStatus::Available
+            } else {
+                forge_provisioning::GuestAgentStatus::Unavailable
+            };
+            (guest_agent_status, ip_addresses)
         };
         let default_network_active = Network::lookup_by_name(&self.connection, "default")
             .and_then(|network| network.is_active())
@@ -1871,8 +2068,24 @@ impl LibvirtBootBackend {
             base: volume_status(&base_name)?,
             current_overlay: volume_status(&overlay_name)?,
             current_seed,
-            legacy_overlay: volume_status(forge_provisioning::OVERLAY_VOLUME)?,
-            legacy_seed: volume_status(forge_provisioning::SEED_VOLUME)?,
+            // Literal Fedora Cloud/NoCloud artifacts are observable only through
+            // the explicit legacy path (which has no V2.5 generation manifest).
+            legacy_overlay: if !observe_legacy_fedora_resources(active.is_some()) {
+                absent_generation_volume_status_with_path(
+                    forge_provisioning::OVERLAY_VOLUME,
+                    "not-observed".to_owned(),
+                )
+            } else {
+                volume_status(forge_provisioning::OVERLAY_VOLUME)?
+            },
+            legacy_seed: if !observe_legacy_fedora_resources(active.is_some()) {
+                absent_generation_volume_status_with_path(
+                    forge_provisioning::SEED_VOLUME,
+                    "not-observed".to_owned(),
+                )
+            } else {
+                volume_status(forge_provisioning::SEED_VOLUME)?
+            },
         })
     }
 
@@ -3011,6 +3224,11 @@ mod tests {
     }
 
     #[test]
+    fn exact_domain_undefine_requests_only_libvirt_managed_nvram_retirement() {
+        assert_eq!(domain_undefine_flags(), sys::VIR_DOMAIN_UNDEFINE_NVRAM);
+    }
+
+    #[test]
     fn domain_delete_observation_distinguishes_absence_and_conflict() {
         assert!(matches!(
             classify_domain_delete_observation(&expected(), &[]),
@@ -3202,6 +3420,43 @@ mod tests {
             validate_managed_seed_topology(Some("/pool/expected.iso"), Some("/pool/other.iso"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn managed_profiles_never_observe_legacy_fedora_resources() {
+        for profile in ["kali", "fedora-workstation", "whonix"] {
+            assert!(
+                !observe_legacy_fedora_resources(true),
+                "managed {profile} lifecycle must not query legacy Fedora artifacts"
+            );
+        }
+        assert!(observe_legacy_fedora_resources(false));
+    }
+
+    #[test]
+    fn status_without_qga_channel_performs_no_interface_address_probes() {
+        assert_eq!(interface_address_sources(false), []);
+        assert_eq!(
+            interface_address_sources(true),
+            [InterfaceAddressSource::Agent, InterfaceAddressSource::Lease]
+        );
+        assert_eq!(
+            unconfigured_qga_status_observation(),
+            (
+                forge_provisioning::GuestAgentStatus::Unavailable,
+                Vec::new()
+            )
+        );
+    }
+
+    #[test]
+    fn listed_absence_is_non_failing() {
+        let absent =
+            find_listed_resource_by_name(vec!["other-volume"], "missing-volume", |value| {
+                Ok::<_, VirtError>((*value).to_owned())
+            })
+            .unwrap();
+        assert!(absent.is_none());
     }
 
     #[test]

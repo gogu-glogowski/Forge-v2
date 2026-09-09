@@ -240,6 +240,51 @@ pub struct FedoraWorkstationExecutionEvidence {
     pub installed_disk_start_recorded: bool,
     #[serde(default)]
     pub graphical_boot_confirmation: Option<GraphicalBootConfirmationEvidence>,
+    #[serde(default)]
+    pub host_only_promotion: Option<HostOnlyPromotionEvidence>,
+    #[serde(default)]
+    pub host_only_canonical: Option<HostOnlyCanonicalEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qcow2VolumeProof {
+    pub volume: PreparationVolumeEvidence,
+    pub streamed_bytes: u64,
+    pub sha256: String,
+}
+
+/// Truthful V2.5 host-only evidence for publishing an operator-installed base.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostOnlyPromotionEvidence {
+    pub preparation_id: FedoraWorkstationPreparationId,
+    pub staging_volume_name: String,
+    pub staging_volume_key: String,
+    pub staging_path: PathBuf,
+    pub staging_format: String,
+    pub staging_capacity_bytes: u64,
+    pub staging_allocation_bytes: u64,
+    pub staging_streamed_bytes: u64,
+    pub staging_sha256: String,
+    pub domain_name: String,
+    pub domain_uuid: String,
+    pub disk_only_topology_xml_sha256: String,
+    pub domain_shutoff: bool,
+    pub qemu_img_check_attested: bool,
+}
+
+/// Durable canonical representation proof for a host-only V2.5 promotion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostOnlyCanonicalEvidence {
+    pub staging_sha256: String,
+    pub staging_streamed_bytes: u64,
+    pub canonical_volume_name: String,
+    pub canonical_volume_key: String,
+    pub canonical_path: PathBuf,
+    pub canonical_format: String,
+    pub canonical_capacity_bytes: u64,
+    pub canonical_allocation_bytes: u64,
+    pub canonical_streamed_bytes: u64,
+    pub canonical_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1742,6 +1787,34 @@ pub fn prove_fedora_workstation_post_install_staging_topology(
     prove_fedora_workstation_installer_topology(&expected, evidence)
 }
 
+/// Proves only the exact primary preparation disk binding for an abort path.
+///
+/// # Errors
+/// Refuses a missing, duplicate, or changed primary disk source.
+pub fn prove_fedora_workstation_abort_disk_binding(
+    preparation: &FedoraWorkstationPreparation,
+    evidence: &InstallerDomainEvidence,
+) -> Result<(), PreparationError> {
+    if evidence.name != preparation.installer.name || evidence.uuid != preparation.installer.uuid {
+        return Err(PreparationError::Backend(
+            "preparation domain identity drift".to_owned(),
+        ));
+    }
+    let disks = xml_blocks(&evidence.xml, "disk")
+        .into_iter()
+        .filter(|disk| xml_attribute(disk, "disk", "device").as_deref() == Some("disk"))
+        .collect::<Vec<_>>();
+    if disks.len() != 1
+        || xml_attribute(disks[0], "source", "file").as_deref()
+            != Some(preparation.staging.path.to_string_lossy().as_ref())
+    {
+        return Err(PreparationError::Backend(
+            "preparation primary disk binding drift".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Proves the exact same-domain, staging-disk-only boot topology.
 ///
 /// # Errors
@@ -1753,6 +1826,26 @@ pub fn prove_fedora_workstation_disk_only_topology(
     let mut expected = preparation.clone();
     expected.status = FedoraWorkstationPreparationStatus::InstalledDiskBootPending;
     prove_fedora_workstation_installer_topology(&expected, evidence)
+}
+
+/// Proves the exact running disk-only topology at the graphical-confirmation
+/// boundary without treating a running domain as graphical-installation proof.
+///
+/// # Errors
+/// Refuses non-running state, identity, persistence, autostart, or topology drift.
+pub fn prove_fedora_workstation_running_disk_only_topology(
+    preparation: &FedoraWorkstationPreparation,
+    evidence: &InstallerDomainEvidence,
+) -> Result<ProvenResolvedInstallerTopology, PreparationError> {
+    if !evidence.running || evidence.shutoff {
+        return Err(PreparationError::Backend(
+            "installer domain lifecycle state drift: expected running".to_owned(),
+        ));
+    }
+    let mut persistent = evidence.clone();
+    persistent.shutoff = true;
+    persistent.running = false;
+    prove_fedora_workstation_disk_only_topology(preparation, &persistent)
 }
 
 /// Proves that a disk-only recovery candidate differs only in its single NIC MAC.
@@ -1952,8 +2045,8 @@ where
         if !domain.shutoff {
             return Err(PreparationError::InstallationProofFailed);
         }
-        let manually_confirmed_attached = preparation.execution.runtime_iso.is_none();
-        if manually_confirmed_attached {
+        let installer_attached = domain.xml.contains("device='cdrom'");
+        if installer_attached {
             let mut attached_preparation = preparation.clone();
             attached_preparation.status = FedoraWorkstationPreparationStatus::InstallerRunning;
             prove_fedora_workstation_post_install_staging_topology(&attached_preparation, &domain)?;
@@ -1967,7 +2060,7 @@ where
                 PreparationError::Backend("authoritative stable MAC unavailable".into())
             })?;
         let observed_mac = observed_single_domain_mac(&domain)?;
-        if manually_confirmed_attached {
+        if installer_attached {
             // Manual confirmation proves the installer-attached source topology;
             // the bounded redefine below is what establishes disk-only boot.
             backend
@@ -2006,9 +2099,6 @@ where
         preparation.execution.disk_only_topology = Some(resolved);
         preparation.status = FedoraWorkstationPreparationStatus::InstalledDiskBootPending;
         publish(preparation).map_err(PreparationError::Backend)?;
-        if manually_confirmed_attached {
-            return Ok(InstalledDiskBootDisposition::DiskOnlyPrepared);
-        }
     }
 
     if preparation.status == FedoraWorkstationPreparationStatus::InstalledDiskBootPending {
@@ -2142,6 +2232,74 @@ where
     prove_staging(preparation, &volume)?;
     preparation.execution.staging_volume_key = Some(volume.key);
     preparation.execution.staging_allocation_bytes = Some(volume.allocation_bytes);
+    publish(preparation).map_err(PreparationError::Backend)?;
+
+    let suffix = &preparation.preparation_id.as_str()[..8];
+    let runtime_name = format!(
+        "forge-install-fedora-workstation-{}-{}-{suffix}.iso",
+        preparation.source.release, preparation.source.compose
+    );
+    let runtime = if let Some(record) = preparation.execution.runtime_iso.as_ref() {
+        if record.preparation_id != preparation.preparation_id
+            || record.volume_name != runtime_name
+            || record.source_sha256 != preparation.source.iso_sha256
+            || record.source_bytes != preparation.source.iso_bytes
+        {
+            return Err(PreparationError::Backend(
+                "runtime installer ISO provenance conflict".to_owned(),
+            ));
+        }
+        let (volume, bytes, digest) = backend
+            .stream_installer_iso_digest("default", &runtime_name, preparation.source.iso_bytes)
+            .map_err(PreparationError::Backend)?;
+        if volume.key != record.volume_key
+            || volume.path != record.path
+            || bytes != record.destination_bytes
+            || digest != record.destination_sha256
+        {
+            return Err(PreparationError::Backend(
+                "runtime installer ISO identity drift".to_owned(),
+            ));
+        }
+        volume
+    } else {
+        backend
+            .materialize_installer_iso(
+                "default",
+                &runtime_name,
+                &preparation.source.iso_path,
+                preparation.source.iso_bytes,
+            )
+            .map_err(PreparationError::Backend)?
+    };
+    let (proven_runtime, bytes, digest) = backend
+        .stream_installer_iso_digest("default", &runtime_name, preparation.source.iso_bytes)
+        .map_err(PreparationError::Backend)?;
+    if proven_runtime != runtime
+        || bytes != preparation.source.iso_bytes
+        || digest != preparation.source.iso_sha256
+        || !matches!(runtime.format.as_str(), "raw" | "iso")
+        || runtime.backing_path.is_some()
+    {
+        return Err(PreparationError::Backend(
+            "runtime installer ISO proof failed".to_owned(),
+        ));
+    }
+    if preparation.execution.runtime_iso.is_none() {
+        preparation.execution.runtime_iso = Some(LibvirtManagedInstallerIso {
+            preparation_id: preparation.preparation_id.clone(),
+            volume_name: runtime_name,
+            path: runtime.path.clone(),
+            source_filename: preparation.source.filename.clone(),
+            source_sha256: preparation.source.iso_sha256.clone(),
+            source_bytes: preparation.source.iso_bytes,
+            destination_bytes: bytes,
+            destination_sha256: digest,
+            volume_key: runtime.key,
+            role: FedoraWorkstationArtifactRole::LibvirtManagedInstallerIso,
+        });
+    }
+    preparation.installer.iso_path.clone_from(&runtime.path);
     publish(preparation).map_err(PreparationError::Backend)?;
 
     let domain = match backend
@@ -2305,6 +2463,81 @@ pub fn prove_normalized_disk(
         clean_shutdown: observation.shutdown
             == NormalizationShutdownEvidence::GuestRequestedAndLibvirtObservedShutoff,
     })
+}
+
+/// Records the V2.5 host-only promotion boundary without claiming guest sanitation.
+///
+/// # Errors
+/// Refuses anything other than an explicitly graphically proven, shut-off exact staging disk.
+pub fn record_host_only_promotion_ready(
+    preparation: &mut FedoraWorkstationPreparation,
+    evidence: HostOnlyPromotionEvidence,
+) -> Result<(), PreparationError> {
+    let graphical = preparation
+        .execution
+        .graphical_boot_confirmation
+        .as_ref()
+        .ok_or(PreparationError::InvalidStateTransition)?;
+    let topology = preparation
+        .execution
+        .disk_only_topology
+        .as_ref()
+        .ok_or(PreparationError::InvalidStateTransition)?;
+    if preparation.status != FedoraWorkstationPreparationStatus::InstalledSystemProven
+        || evidence.preparation_id != preparation.preparation_id
+        || evidence.staging_volume_name != preparation.staging.volume_name
+        || evidence.staging_volume_key
+            != preparation
+                .execution
+                .staging_volume_key
+                .as_deref()
+                .unwrap_or_default()
+        || evidence.staging_path != preparation.staging.path
+        || evidence.staging_format != preparation.staging.format
+        || evidence.staging_capacity_bytes != preparation.staging.capacity_bytes
+        || evidence.staging_allocation_bytes > evidence.staging_capacity_bytes
+        || evidence.staging_streamed_bytes == 0
+        || evidence.staging_sha256.len() != 64
+        || evidence.domain_name != preparation.installer.name
+        || evidence.domain_uuid != preparation.installer.uuid
+        || evidence.disk_only_topology_xml_sha256 != topology.xml_sha256
+        || evidence.disk_only_topology_xml_sha256 != graphical.disk_only_topology_xml_sha256
+        || !evidence.domain_shutoff
+        || !evidence.qemu_img_check_attested
+    {
+        return Err(PreparationError::PromotionProofFailed);
+    }
+    preparation.execution.host_only_promotion = Some(evidence);
+    preparation.status = FedoraWorkstationPreparationStatus::PromotionReady;
+    Ok(())
+}
+
+/// Records independent canonical qcow2 representation evidence after exact promotion.
+pub fn record_host_only_canonical_publication(
+    preparation: &mut FedoraWorkstationPreparation,
+    canonical: HostOnlyCanonicalEvidence,
+) -> Result<(), PreparationError> {
+    let staging = preparation
+        .execution
+        .host_only_promotion
+        .as_ref()
+        .ok_or(PreparationError::PromotionProofFailed)?;
+    if preparation.status != FedoraWorkstationPreparationStatus::PromotionReady
+        || canonical.staging_sha256 != staging.staging_sha256
+        || canonical.staging_streamed_bytes != staging.staging_streamed_bytes
+        || canonical.canonical_volume_name != preparation.canonical.volume_name
+        || canonical.canonical_path != preparation.canonical.path
+        || canonical.canonical_format != "qcow2"
+        || canonical.canonical_capacity_bytes != preparation.canonical.capacity_bytes
+        || canonical.canonical_allocation_bytes > canonical.canonical_capacity_bytes
+        || canonical.canonical_streamed_bytes == 0
+        || canonical.canonical_sha256.len() != 64
+    {
+        return Err(PreparationError::PromotionProofFailed);
+    }
+    preparation.execution.host_only_canonical = Some(canonical);
+    preparation.status = FedoraWorkstationPreparationStatus::Promoted;
+    Ok(())
 }
 
 #[allow(clippy::missing_errors_doc)]
@@ -3117,11 +3350,13 @@ mod tests {
     struct ExecutorBackend {
         pool_path: PathBuf,
         volume: Option<PreparationVolumeEvidence>,
+        runtime_bytes: Option<u64>,
         domain: Option<InstallerDomainEvidence>,
         canonical: bool,
         create_calls: usize,
         define_calls: usize,
         start_calls: usize,
+        start_failure: bool,
         define_failure: bool,
         drift_domain: bool,
     }
@@ -3155,8 +3390,8 @@ mod tests {
                 key: format!("{}/{}", self.pool_path.display(), name),
                 path: self.pool_path.join(name),
                 format: "raw".to_owned(),
-                capacity_bytes: 1024,
-                allocation_bytes: 1024,
+                capacity_bytes: self.runtime_bytes.unwrap_or(1024),
+                allocation_bytes: self.runtime_bytes.unwrap_or(1024),
                 backing_path: None,
             }))
         }
@@ -3228,6 +3463,9 @@ mod tests {
 
         fn start_installer_domain(&mut self, _: &str) -> Result<(), String> {
             self.start_calls += 1;
+            if self.start_failure {
+                return Err("start failed".to_owned());
+            }
             if let Some(domain) = self.domain.as_mut() {
                 domain.shutoff = false;
                 domain.running = true;
@@ -3248,6 +3486,7 @@ mod tests {
             _: &std::path::Path,
             source_bytes: u64,
         ) -> Result<PreparationVolumeEvidence, String> {
+            self.runtime_bytes = Some(source_bytes);
             Ok(PreparationVolumeEvidence {
                 name: name.to_owned(),
                 key: format!("{}/{}", self.pool_path.display(), name),
@@ -3276,7 +3515,7 @@ mod tests {
                     backing_path: None,
                 },
                 expected_bytes,
-                "digest".to_owned(),
+                "a".repeat(64),
             ))
         }
     }
@@ -3320,11 +3559,18 @@ mod tests {
         assert_eq!(disposition, InstallerReadyDisposition::Created);
         assert_eq!(backend.create_calls, 1);
         assert_eq!(backend.define_calls, 1);
+        let runtime = preparation.execution.runtime_iso.as_ref().unwrap();
+        assert_eq!(runtime.source_sha256, preparation.source.iso_sha256);
+        assert_eq!(runtime.destination_sha256, preparation.source.iso_sha256);
+        assert_eq!(preparation.installer.iso_path, runtime.path);
+        let xml = backend.domain.as_ref().unwrap().xml.as_str();
+        assert!(xml.contains(&runtime.path.to_string_lossy().to_string()));
+        assert!(!xml.contains(&preparation.source.iso_path.to_string_lossy().to_string()));
         assert_eq!(
             preparation.status,
             FedoraWorkstationPreparationStatus::InstallerReady
         );
-        assert_eq!(publications.len(), 2);
+        assert_eq!(publications.len(), 3);
         let volume = backend.volume.unwrap();
         assert_eq!(volume.capacity_bytes, 80 * 1024 * 1024 * 1024);
         assert_eq!(volume.format, "qcow2");
@@ -3332,8 +3578,12 @@ mod tests {
     }
 
     #[test]
-    fn manual_install_confirmation_is_explicit_idempotent_and_never_fakes_start() {
+    fn manual_install_confirmation_accepts_non_historical_preparation_and_never_fakes_start() {
         let (_fixture, mut preparation, mut backend) = executor_fixture();
+        assert_ne!(
+            preparation.preparation_id.as_str(),
+            "4ad083f66d9d4dd0a834250ddef9826d"
+        );
         execute_to_installer_ready(&mut backend, &mut preparation, |_| Ok(())).unwrap();
         let mut published = Vec::new();
         assert_eq!(
@@ -3617,6 +3867,21 @@ mod tests {
             .unwrap();
         preparation.execution.staging_volume_key =
             Some(backend.volume.as_ref().unwrap().key.clone());
+        let runtime_name = "forge-install-fedora-workstation-44-1.7-1234abcd.iso";
+        let runtime_path = backend.pool_path.join(runtime_name);
+        preparation.execution.runtime_iso = Some(LibvirtManagedInstallerIso {
+            preparation_id: preparation.preparation_id.clone(),
+            volume_name: runtime_name.to_owned(),
+            path: runtime_path.clone(),
+            source_filename: preparation.source.filename.clone(),
+            source_sha256: preparation.source.iso_sha256.clone(),
+            source_bytes: preparation.source.iso_bytes,
+            destination_bytes: preparation.source.iso_bytes,
+            destination_sha256: preparation.source.iso_sha256.clone(),
+            volume_key: format!("{}/{}", backend.pool_path.display(), runtime_name),
+            role: FedoraWorkstationArtifactRole::LibvirtManagedInstallerIso,
+        });
+        preparation.installer.iso_path = runtime_path;
         backend
             .define_installer_domain(&render_fedora_workstation_installer_xml(&preparation))
             .unwrap();
@@ -3698,6 +3963,7 @@ mod tests {
             volume_key: format!("{}/{}", backend.pool_path.display(), runtime_name),
             role: FedoraWorkstationArtifactRole::LibvirtManagedInstallerIso,
         });
+        backend.runtime_bytes = Some(1024);
         let original_uuid = preparation.installer.uuid.clone();
         let original_mac = preparation
             .execution
@@ -3778,7 +4044,7 @@ mod tests {
     }
 
     #[test]
-    fn manually_confirmed_installer_attached_topology_transitions_to_disk_only_without_starting() {
+    fn manually_confirmed_installer_attached_topology_checkpoints_then_starts() {
         let (_fixture, mut preparation, mut backend) = executor_fixture();
         execute_to_installer_ready(&mut backend, &mut preparation, |_| Ok(())).unwrap();
         preparation.status = FedoraWorkstationPreparationStatus::InstallationConfirmed;
@@ -3786,7 +4052,7 @@ mod tests {
 
         let original_uuid = preparation.installer.uuid.clone();
         let original_staging = preparation.staging.path.clone();
-        assert!(preparation.execution.runtime_iso.is_none());
+        assert!(preparation.execution.runtime_iso.is_some());
         assert!(
             backend
                 .domain
@@ -3796,15 +4062,27 @@ mod tests {
                 .contains("<boot dev='cdrom'/>")
         );
 
+        let mut published = Vec::new();
         assert_eq!(
-            execute_to_installed_disk_running(&mut backend, &mut preparation, true, |_| Ok(()))
-                .unwrap(),
-            InstalledDiskBootDisposition::DiskOnlyPrepared
+            execute_to_installed_disk_running(&mut backend, &mut preparation, true, |value| {
+                published.push(value.status);
+                Ok(())
+            })
+            .unwrap(),
+            InstalledDiskBootDisposition::Started
         );
-        assert_eq!(backend.start_calls, 0);
+        assert_eq!(backend.start_calls, 1);
         assert_eq!(
             preparation.status,
-            FedoraWorkstationPreparationStatus::InstalledDiskBootPending
+            FedoraWorkstationPreparationStatus::AwaitingGraphicalBootConfirmation
+        );
+        assert_eq!(
+            published,
+            [
+                FedoraWorkstationPreparationStatus::InstalledDiskBootPending,
+                FedoraWorkstationPreparationStatus::InstalledDiskBooting,
+                FedoraWorkstationPreparationStatus::AwaitingGraphicalBootConfirmation,
+            ]
         );
         assert_eq!(preparation.installer.uuid, original_uuid);
         assert_eq!(preparation.staging.path, original_staging);
@@ -3817,17 +4095,92 @@ mod tests {
     }
 
     #[test]
+    fn disk_only_start_failure_keeps_the_durable_start_intent_for_recovery() {
+        let (_fixture, mut preparation, mut backend) = executor_fixture();
+        execute_to_installer_ready(&mut backend, &mut preparation, |_| Ok(())).unwrap();
+        preparation.status = FedoraWorkstationPreparationStatus::InstallationConfirmed;
+        preparation.operator_confirmation_recorded = true;
+        backend.start_failure = true;
+        let mut published = Vec::new();
+
+        assert!(
+            execute_to_installed_disk_running(&mut backend, &mut preparation, true, |value| {
+                published.push(value.status);
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(backend.start_calls, 1);
+        assert_eq!(
+            preparation.status,
+            FedoraWorkstationPreparationStatus::InstalledDiskBooting
+        );
+        assert!(preparation.execution.installed_disk_start_recorded);
+        assert_eq!(
+            published,
+            [
+                FedoraWorkstationPreparationStatus::InstalledDiskBootPending,
+                FedoraWorkstationPreparationStatus::InstalledDiskBooting,
+            ]
+        );
+        assert!(backend.domain.as_ref().unwrap().shutoff);
+    }
+
+    #[test]
+    fn installed_system_proven_running_disk_only_topology_requires_exact_identity() {
+        let (_fixture, mut preparation, mut backend) = executor_fixture();
+        execute_to_installer_ready(&mut backend, &mut preparation, |_| Ok(())).unwrap();
+        preparation.status = FedoraWorkstationPreparationStatus::InstalledDiskBootPending;
+        backend
+            .define_installer_domain(
+                &render_fedora_workstation_disk_only_xml(&preparation).unwrap(),
+            )
+            .unwrap();
+        let shutoff = backend.domain.clone().unwrap();
+        assert!(
+            prove_fedora_workstation_running_disk_only_topology(&preparation, &shutoff).is_err()
+        );
+
+        backend
+            .start_installer_domain(&preparation.installer.name)
+            .unwrap();
+        preparation.status = FedoraWorkstationPreparationStatus::InstalledSystemProven;
+        let running = backend.domain.clone().unwrap();
+        assert!(prove_fedora_workstation_disk_only_topology(&preparation, &running).is_err());
+        assert!(
+            prove_fedora_workstation_running_disk_only_topology(&preparation, &running).is_ok()
+        );
+
+        let mut uuid_drift = running.clone();
+        uuid_drift.uuid = "foreign".to_owned();
+        assert!(
+            prove_fedora_workstation_running_disk_only_topology(&preparation, &uuid_drift).is_err()
+        );
+        let mut topology_drift = running;
+        topology_drift.xml = topology_drift
+            .xml
+            .replace("network='default'", "network='evil'");
+        assert!(
+            prove_fedora_workstation_running_disk_only_topology(&preparation, &topology_drift)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn manually_confirmed_wrong_installer_iso_fails_before_redefine() {
         let (_fixture, mut preparation, mut backend) = executor_fixture();
         execute_to_installer_ready(&mut backend, &mut preparation, |_| Ok(())).unwrap();
         preparation.status = FedoraWorkstationPreparationStatus::InstallationConfirmed;
         preparation.operator_confirmation_recorded = true;
-        backend.domain.as_mut().unwrap().xml = backend
-            .domain
-            .as_ref()
-            .unwrap()
-            .xml
-            .replace(&preparation.source.filename, "wrong.iso");
+        backend.domain.as_mut().unwrap().xml = backend.domain.as_ref().unwrap().xml.replace(
+            &preparation
+                .execution
+                .runtime_iso
+                .as_ref()
+                .unwrap()
+                .volume_name,
+            "wrong.iso",
+        );
         let before = backend.domain.as_ref().unwrap().xml.clone();
         let result =
             execute_to_installed_disk_running(&mut backend, &mut preparation, true, |_| Ok(()));
@@ -4032,7 +4385,7 @@ mod tests {
             preparation.status,
             FedoraWorkstationPreparationStatus::AwaitingGraphicalBootConfirmation
         );
-        assert!(preparation.execution.runtime_iso.is_none());
+        assert!(preparation.execution.runtime_iso.is_some());
         assert_eq!(
             record_graphical_installed_system_confirmation(&mut preparation, &running, true, false)
                 .unwrap(),
@@ -4173,8 +4526,9 @@ mod tests {
         );
         assert!(backend.volume.is_some());
         assert!(backend.domain.is_none());
-        assert_eq!(published.len(), 1);
+        assert_eq!(published.len(), 2);
         assert!(published[0].execution.staging_volume_key.is_some());
+        assert!(published[1].execution.runtime_iso.is_some());
     }
 
     #[test]

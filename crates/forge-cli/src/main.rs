@@ -4,10 +4,8 @@ use forge_core::{
 use forge_images::FedoraWorkstationPreparationBackend;
 use forge_provisioning::{BootBackend, RebuildBackend};
 use forge_storage::{DefineBackend, ImagePrepareBackend};
-use sha2::{Digest, Sha256};
 use std::env;
-use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -16,14 +14,19 @@ use std::time::{Duration, Instant};
 fn main() -> ExitCode {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     let argument_views = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    if is_help_request(&argument_views) {
+        print_usage();
+        return ExitCode::SUCCESS;
+    }
     if let Some(command) = parse_delete_command(&argument_views) {
         return delete_vm(&command.instance, command.force);
     }
     match argument_views.as_slice() {
         ["doctor"] => match forge_doctor::run() {
             Ok(report) => {
-                print_report(&report);
-                if matches!(report.state, HostState::Ready | HostState::Degraded) {
+                let storage_ready = print_storage_readiness();
+                print_report(&report, storage_ready);
+                if matches!(report.state, HostState::Ready | HostState::Degraded) && storage_ready {
                     ExitCode::SUCCESS
                 } else {
                     ExitCode::from(1)
@@ -106,6 +109,8 @@ fn main() -> ExitCode {
         ["image", "list"] => image_list(),
         ["image", "inspect", "fedora"] => image_inspect(),
         ["image", "fetch", "fedora"] => image_fetch(),
+        ["image", "inspect", "kali"] => image_inspect_kali(),
+        ["image", "fetch", "kali"] => image_fetch_kali(),
         ["image", "inspect", "fedora-workstation"] => image_inspect_workstation(),
         ["image", "fetch", "fedora-workstation"] => image_fetch_workstation(),
         ["image", "prepare", "fedora-workstation", "--dry-run"] => {
@@ -120,6 +125,10 @@ fn main() -> ExitCode {
         }
         ["image", "prepare-confirm-graphical", "fedora-workstation"] => {
             image_prepare_workstation_confirm_graphical()
+        }
+        ["image", "prepare-promote", "fedora-workstation"] => image_prepare_workstation_promote(),
+        ["image", "abort", "fedora-workstation", preparation_id] => {
+            image_abort_workstation(preparation_id)
         }
         ["image", "recover", "whonix-workstation", "--dry-run"] => recover_whonix_workstation(true),
         ["image", "recover", "whonix-workstation"] => recover_whonix_workstation(false),
@@ -150,6 +159,10 @@ fn parse_delete_command(arguments: &[&str]) -> Option<DeleteCommand> {
     }
 }
 
+fn is_help_request(arguments: &[&str]) -> bool {
+    matches!(arguments, ["--help"] | ["-h"])
+}
+
 const LEGACY_FEDORA_RETIRED: &str = "Legacy Fedora Cloud/NoCloud is retired in Forge V2.5. Fedora Workstation support is being introduced through the new Workstation architecture.";
 
 fn require_new_product(profile: &forge_core::VmProfile) -> Result<(), &'static str> {
@@ -159,6 +172,56 @@ fn require_new_product(profile: &forge_core::VmProfile) -> Result<(), &'static s
             forge_core::LegacyProductClassification::LegacyFedoraCloudNoCloud,
         ) => Err(LEGACY_FEDORA_RETIRED),
     }
+}
+
+fn print_storage_readiness() -> bool {
+    let mut backend = match forge_libvirt::LibvirtDefineBackend::connect_local() {
+        Ok(backend) => backend,
+        Err(error) => {
+            println!("Storage pool (default): Unavailable");
+            println!("- libvirt connection failed: {error}");
+            return false;
+        }
+    };
+    let pool = match DefineBackend::inspect_pool(&mut backend, forge_storage::DEFAULT_POOL) {
+        Ok(pool) => pool,
+        Err(error) => {
+            println!("Storage pool (default): Unavailable");
+            println!("- cannot inspect the standard libvirt storage pool: {error}");
+            return false;
+        }
+    };
+    let Some(pool) = pool else {
+        println!("Storage pool (default): Missing");
+        println!(
+            "- Forge needs the standard system libvirt pool named 'default' for images and VM disks."
+        );
+        println!("- Create and activate it with standard libvirt commands:");
+        println!(
+            "  sudo virsh -c qemu:///system pool-define-as default dir --target /var/lib/libvirt/images"
+        );
+        println!("  sudo virsh -c qemu:///system pool-start default");
+        println!("  sudo virsh -c qemu:///system pool-autostart default");
+        println!("- Recheck with: virsh -c qemu:///system pool-info default");
+        return false;
+    };
+    if !pool.active {
+        println!("Storage pool (default): Inactive");
+        println!("- Start it with: sudo virsh -c qemu:///system pool-start default");
+        println!("- Enable it with: sudo virsh -c qemu:///system pool-autostart default");
+        return false;
+    }
+    if pool.target_path.is_empty() || !pool.target_path.starts_with('/') {
+        println!("Storage pool (default): Unusable");
+        println!("- The pool has no valid absolute target path.");
+        return false;
+    }
+    println!(
+        "Storage pool (default): Ready (target {}, available {} GiB)",
+        pool.target_path,
+        pool.available_bytes / (1024 * 1024 * 1024)
+    );
+    true
 }
 
 fn state_manifest_path() -> Result<std::path::PathBuf, String> {
@@ -244,6 +307,12 @@ fn state_reconcile(instance_name: &str) -> ExitCode {
             println!("ReconciliationStatus: Missing");
             println!("Manifest path: {}", layout.legacy_manifest.display());
             return ExitCode::SUCCESS;
+        }
+        forge_state::ManagedState::InitialCreateRecoveryRequired(manifest) => {
+            println!("ManagedReconciliationStatus: InitialCreateRecoveryRequired");
+            println!("Preparing generation: {}", manifest.generation_id);
+            println!("Recovery: forge state recover {instance_name} --dry-run");
+            return ExitCode::from(1);
         }
         forge_state::ManagedState::Legacy(manifest) => manifest,
         forge_state::ManagedState::Current(index) => {
@@ -400,6 +469,26 @@ fn recovery_inputs(
 
 #[allow(clippy::too_many_lines)]
 fn state_recover(instance_name: &str, dry_run: bool) -> ExitCode {
+    let instance = match InstanceName::new(instance_name) {
+        Ok(instance) => instance,
+        Err(error) => {
+            eprintln!("recovery refused: invalid instance name: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let layout = match managed_state_layout_for(&instance) {
+        Ok(layout) => layout,
+        Err(error) => {
+            eprintln!("recovery refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if matches!(
+        forge_state::inspect_layout(&layout),
+        Ok(forge_state::ManagedState::InitialCreateRecoveryRequired(_))
+    ) {
+        return recover_initial_create(instance, layout, dry_run);
+    }
     if instance_name != "fedora-lab" {
         return fresh_restore_old(instance_name, dry_run);
     }
@@ -509,6 +598,187 @@ fn state_recover(instance_name: &str, dry_run: bool) -> ExitCode {
             eprintln!("atomic recovery state transition failed: {error}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn recover_initial_create(
+    instance: InstanceName,
+    layout: forge_state::StateLayout,
+    dry_run: bool,
+) -> ExitCode {
+    let manifest = match forge_state::inspect_layout(&layout) {
+        Ok(forge_state::ManagedState::InitialCreateRecoveryRequired(manifest)) => manifest,
+        Ok(_) => {
+            eprintln!("recovery refused: initial Preparing recovery boundary changed");
+            return ExitCode::from(1);
+        }
+        Err(error) => {
+            eprintln!("recovery refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if manifest.domain_name != instance.as_str() {
+        eprintln!(
+            "recovery refused: durable Preparing domain identity differs from requested instance"
+        );
+        return ExitCode::from(1);
+    }
+    let boot = match forge_libvirt::LibvirtBootBackend::connect_instance(instance.clone()) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("recovery refused: libvirt connection failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let observed = match boot.inspect_managed_state(&manifest) {
+        Ok(observed) => observed,
+        Err(error) => {
+            eprintln!("recovery refused: exact Preparing resource inspection failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let index = match forge_state::plan_initial_create_recovery(&layout, &manifest, &observed) {
+        Ok(index) => index,
+        Err(error) => {
+            eprintln!("recovery refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let profile = match validate_profile_binding(instance.as_str(), &index, &manifest) {
+        Ok(profile) => profile,
+        Err(error) => {
+            eprintln!("recovery refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) = validate_initial_create_domain_topology(&instance, &manifest, &profile) {
+        eprintln!("recovery refused: {error}");
+        return ExitCode::from(1);
+    }
+    println!("Recovery boundary: InitialCreatePreparing");
+    println!("Instance: {}", instance);
+    println!("Preparing generation: {}", manifest.generation_id);
+    println!("Planned transition: Preparing -> Active initial index");
+    println!("Mutation: {}", !dry_run);
+    if dry_run {
+        return ExitCode::SUCCESS;
+    }
+    eprint!("Publish the exact verified initial Active index? [y/N] ");
+    let mut confirmation = String::new();
+    if io::stdin().read_line(&mut confirmation).is_err()
+        || !matches!(confirmation.trim(), "y" | "Y" | "yes" | "YES")
+    {
+        println!("Recovery cancelled; state unchanged.");
+        return ExitCode::SUCCESS;
+    }
+    let fresh_manifest = match forge_state::inspect_layout(&layout) {
+        Ok(forge_state::ManagedState::InitialCreateRecoveryRequired(value))
+            if value == manifest =>
+        {
+            value
+        }
+        _ => {
+            eprintln!("recovery refused: durable Preparing intent changed before publication");
+            return ExitCode::from(1);
+        }
+    };
+    let fresh_observed = match boot.inspect_managed_state(&fresh_manifest) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("recovery refused: exact Preparing resource reinspection failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let fresh_index = match forge_state::plan_initial_create_recovery(
+        &layout,
+        &fresh_manifest,
+        &fresh_observed,
+    ) {
+        Ok(value) if value == index => value,
+        Ok(_) => {
+            eprintln!("recovery refused: planned initial Active index changed before publication");
+            return ExitCode::from(1);
+        }
+        Err(error) => {
+            eprintln!("recovery refused: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) =
+        validate_initial_create_domain_topology(&instance, &fresh_manifest, &profile)
+    {
+        eprintln!("recovery refused: {error}");
+        return ExitCode::from(1);
+    }
+    match forge_state::write_index_atomic(&layout.index, &fresh_index) {
+        Ok(()) => {
+            println!(
+                "Initial create recovery finalized atomically; immutable Preparing manifest was not changed."
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("atomic initial recovery publication failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn validate_initial_create_domain_topology(
+    instance: &InstanceName,
+    manifest: &forge_state::GenerationManifest,
+    profile: &forge_core::VmProfile,
+) -> Result<(), String> {
+    let storage =
+        forge_libvirt::LibvirtDefineBackend::connect_local().map_err(|e| e.to_string())?;
+    let (domain, xml) = storage.inspect_stable_domain(instance.as_str())?;
+    let overlay = manifest
+        .resources
+        .iter()
+        .find(|r| r.role == forge_state::ResourceRole::WritableOverlay)
+        .ok_or_else(|| "Preparing manifest lacks writable overlay".to_owned())?;
+    if domain.name != manifest.domain_name
+        || domain.uuid != manifest.domain_uuid
+        || !domain.persistent
+        || domain.disk_path != overlay.path
+        || domain.topology.disks.len() != 1
+        || domain.topology.disks[0].format != "qcow2"
+        || domain.topology.disks[0].source != overlay.path
+    {
+        return Err("defined domain identity or primary-disk topology differs from durable Preparing intent".to_owned());
+    }
+    match profile.kind {
+        forge_core::GuestProfileKind::KaliLab => {
+            forge_storage::validate_kali_topology(&domain.topology, &overlay.path)
+        }
+        forge_core::GuestProfileKind::WhonixGateway => {
+            if xml.matches("<interface ").count() != 2
+                || !xml.contains("<interface type='user'>")
+                || !xml.contains("<backend type='passt'/>")
+                || !xml.contains("<interface type='udp'>")
+                || !xml.contains("<source address='127.0.0.1' port='5577'>")
+                || !xml.contains("<local address='127.0.0.1' port='6688'/>")
+            {
+                Err("Gateway domain topology differs from exact built-in pair policy".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+        forge_core::GuestProfileKind::WhonixWorkstation => {
+            if xml.matches("<interface ").count() != 1
+                || !xml.contains("<interface type='udp'>")
+                || !xml.contains("<source address='127.0.0.1' port='6688'>")
+                || !xml.contains("<local address='127.0.0.1' port='5577'/>")
+            {
+                Err(
+                    "Workstation domain topology differs from exact built-in pair policy"
+                        .to_owned(),
+                )
+            } else {
+                Ok(())
+            }
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1576,6 +1846,12 @@ fn operational_instance_internal(
         forge_state::ManagedState::Missing => {
             return Err("managed instance state is missing".into());
         }
+        forge_state::ManagedState::InitialCreateRecoveryRequired(manifest) => {
+            return Err(format!(
+                "initial create was interrupted after durable Preparing intent {}; run `forge state recover {instance_name} --dry-run`",
+                manifest.generation_id
+            ));
+        }
         forge_state::ManagedState::Legacy(_) => {
             return Err("legacy state requires explicit migration before managed lifecycle".into());
         }
@@ -1721,6 +1997,10 @@ fn delete_vm(instance_name: &str, force: bool) -> ExitCode {
         forge_state::ManagedState::Current(index) => index,
         forge_state::ManagedState::Missing => {
             eprintln!("delete refused: Forge ownership state is missing");
+            return ExitCode::from(1);
+        }
+        forge_state::ManagedState::InitialCreateRecoveryRequired(_) => {
+            eprintln!("delete refused: initial create recovery is required");
             return ExitCode::from(1);
         }
         forge_state::ManagedState::Legacy(_) => {
@@ -2228,6 +2508,10 @@ fn managed_cleanup(instance_name: &str, dry_run: bool) -> ExitCode {
         }
         forge_state::ManagedState::Missing => {
             eprintln!("cleanup refused: Forge ownership state is missing");
+            return ExitCode::from(1);
+        }
+        forge_state::ManagedState::InitialCreateRecoveryRequired(_) => {
+            eprintln!("cleanup refused: initial create recovery is required");
             return ExitCode::from(1);
         }
         forge_state::ManagedState::Conflict(reason) => {
@@ -2932,6 +3216,8 @@ fn clone_vm(source_name: &str, target_name: &str, dry_run: bool) -> ExitCode {
     let mut backend = ManualGuestCreateBackend {
         storage: forge_libvirt::LibvirtDefineBackend::connect_local()
             .expect("libvirt connection checked"),
+        boot: forge_libvirt::LibvirtBootBackend::connect_instance(target.clone())
+            .expect("libvirt connection checked"),
         instance: target,
         domain_uuid,
         source: PreparedBaseArtifact {
@@ -2939,7 +3225,9 @@ fn clone_vm(source_name: &str, target_name: &str, dry_run: bool) -> ExitCode {
             file_bytes: 0,
             capacity_bytes: 0,
             kali_proof: None,
+            whonix_gateway_proof: None,
             whonix_workstation_proof: None,
+            promoted_workstation: None,
         },
         layout,
         workstation_pair_snapshot: None,
@@ -3097,6 +3385,10 @@ fn managed_rebuild(dry_run: bool) -> ExitCode {
         forge_state::ManagedState::Current(index) => (index, None, None),
         forge_state::ManagedState::Missing => {
             eprintln!("managed rebuild refused: active ownership manifest is missing");
+            return ExitCode::from(1);
+        }
+        forge_state::ManagedState::InitialCreateRecoveryRequired(_) => {
+            eprintln!("managed rebuild refused: initial create recovery is required");
             return ExitCode::from(1);
         }
         forge_state::ManagedState::Conflict(reason) => {
@@ -3834,7 +4126,7 @@ fn image_list() -> ExitCode {
     };
     match forge_images::list(&directories) {
         Ok(images) => {
-            println!("PRODUCT\tRELEASE\tARCH\tSTATUS");
+            println!("PROFILE / IMAGE\tRELEASE\tARCH\tSTATUS\tTRUST / VERIFICATION\tGENERATION");
             let source = forge_images::resolve_fedora_workstation_iso(
                 forge_images::FEDORA_WORKSTATION_RELEASE,
                 forge_images::FEDORA_WORKSTATION_COMPOSE,
@@ -3849,21 +4141,240 @@ fn image_list() -> ExitCode {
                     Ok(forge_images::FedoraWorkstationIsoState::Conflict(_)) => "Conflict",
                     Err(_) => "Invalid",
                 };
+            let workstation_generation = workstation_inventory_generation();
             println!(
-                "{}\t{}\tx86_64\t{workstation_status}",
+                "fedora-workstation / {}\t{}\tx86_64\t{workstation_status}\t{}\t{workstation_generation}",
                 forge_images::FEDORA_WORKSTATION_PRODUCT_LABEL,
-                source.release()
+                source.release(),
+                if workstation_status == "Verified" {
+                    "signed CHECKSUM verified"
+                } else {
+                    "not verified"
+                }
             );
             for image in images {
                 println!(
-                    "Fedora Cloud Base (Legacy/Retired)\t{}\t{}\t{}",
+                    "fedora-lab / Fedora Cloud Base (legacy)\t{}\t{}\t{}\tlegacy / retired\tn/a",
                     image.release, image.architecture, image.status
                 );
             }
+            print_kali_inventory(&directories);
+            print_whonix_inventory(
+                "whonix-gateway",
+                forge_images::inspect_whonix_gateway_inventory(&directories),
+            );
+            print_whonix_inventory(
+                "whonix-workstation",
+                forge_images::inspect_whonix_workstation_inventory(&directories),
+            );
             ExitCode::SUCCESS
         }
         Err(error) => {
             eprintln!("image listing failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn workstation_inventory_generation() -> String {
+    let Ok(path) = workstation_preparation_state_path() else {
+        return "preparation state unavailable".to_owned();
+    };
+    let Ok(Some(preparation)) = forge_images::read_fedora_workstation_preparation(&path) else {
+        return "not prepared".to_owned();
+    };
+    workstation_inventory_generation_from_evidence(
+        preparation.status,
+        exact_workstation_source(&preparation),
+        preparation.execution.host_only_promotion.is_some(),
+        preparation.execution.host_only_canonical.is_some(),
+    )
+}
+
+fn workstation_inventory_generation_from_evidence(
+    status: forge_images::FedoraWorkstationPreparationStatus,
+    exact_source: bool,
+    promotion_evidence: bool,
+    canonical_evidence: bool,
+) -> String {
+    if status == forge_images::FedoraWorkstationPreparationStatus::Promoted
+        && exact_source
+        && promotion_evidence
+        && canonical_evidence
+    {
+        "promoted canonical base (durable evidence)".to_owned()
+    } else {
+        format!("preparation stage {status:?}")
+    }
+}
+
+fn recorded_inventory_fields(
+    state: Result<forge_images::RecordedPreparationState, forge_images::ImageError>,
+) -> (&'static str, &'static str, String) {
+    match state {
+        Ok(forge_images::RecordedPreparationState::Missing) => {
+            ("Missing", "not acquired", "not prepared".to_owned())
+        }
+        Ok(forge_images::RecordedPreparationState::Preparing) => (
+            "Preparing",
+            "recorded state incomplete",
+            "not prepared".to_owned(),
+        ),
+        Ok(forge_images::RecordedPreparationState::Interrupted) => (
+            "Interrupted",
+            "recorded state incomplete",
+            "recovery required".to_owned(),
+        ),
+        Ok(forge_images::RecordedPreparationState::Orphaned) => {
+            ("Orphaned", "not trusted", "recovery required".to_owned())
+        }
+        Ok(forge_images::RecordedPreparationState::RecordedVerified) => (
+            "RecordedVerified",
+            "durable recorded verification; not freshly reverified",
+            "prepared artifact".to_owned(),
+        ),
+        Ok(forge_images::RecordedPreparationState::Conflict(reason)) => {
+            ("Conflict", "not trusted", reason)
+        }
+        Err(_) => (
+            "Invalid",
+            "inspection failed",
+            "recovery required".to_owned(),
+        ),
+    }
+}
+
+fn print_kali_inventory(directories: &forge_images::ImageDirectories) {
+    let (status, trust, generation) =
+        recorded_inventory_fields(forge_images::inspect_kali_inventory(directories));
+    println!(
+        "kali-lab / Kali QEMU\t{}\tx86_64\t{status}\t{trust}\t{generation}",
+        forge_images::KALI_RELEASE
+    );
+}
+
+fn print_whonix_inventory(
+    profile: &str,
+    state: Result<forge_images::RecordedPreparationState, forge_images::ImageError>,
+) {
+    let (status, trust, generation) = recorded_inventory_fields(state);
+    println!(
+        "{profile} / Whonix bundle role\t{}\tx86_64\t{status}\t{trust}\t{generation}",
+        forge_images::WHONIX_RELEASE
+    );
+}
+
+fn image_inspect_kali() -> ExitCode {
+    let Ok(directories) = image_directories() else {
+        return ExitCode::from(2);
+    };
+    println!("Product: Kali Lab");
+    println!("Artifact class: Kali QEMU archive with one qcow2 member");
+    println!("Release: {}", forge_images::KALI_RELEASE);
+    println!("Architecture: x86_64");
+    println!("Source: {}", forge_images::KALI_SOURCE_URL);
+    println!(
+        "Archive: {}",
+        directories
+            .downloads
+            .join(forge_images::KALI_ARCHIVE_FILENAME)
+            .display()
+    );
+    println!(
+        "Prepared image: {}",
+        directories
+            .images
+            .join(forge_images::KALI_QCOW2_FILENAME)
+            .display()
+    );
+    println!(
+        "Signing key: {}",
+        forge_images::KALI_SIGNING_KEY_FINGERPRINT
+    );
+    println!(
+        "Verification chain: detached signature → authenticated SHA256SUMS → archive checksum → extracted qcow2 checksum"
+    );
+    match forge_images::inspect_kali_preparation(&directories) {
+        Ok(forge_images::KaliPreparationState::Verified(metadata)) => {
+            println!("Status: Verified");
+            println!(
+                "Archive SHA-256: {}",
+                metadata
+                    .actual_archive_checksum
+                    .as_deref()
+                    .unwrap_or("unavailable")
+            );
+            println!(
+                "Prepared qcow2 SHA-256: {}",
+                metadata
+                    .prepared_qcow2_checksum
+                    .as_deref()
+                    .unwrap_or("unavailable")
+            );
+            println!("Trusted prepared base: yes");
+            println!("Next: forge vm create kali-lab <instance>");
+            ExitCode::SUCCESS
+        }
+        Ok(state) => {
+            println!("Status: {state:?}");
+            println!("Trusted prepared base: no");
+            println!("Next: forge image fetch kali");
+            kali_inspect_exit_code(&state)
+        }
+        Err(error) => {
+            eprintln!("Kali image inspection failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn kali_inspect_exit_code(state: &forge_images::KaliPreparationState) -> ExitCode {
+    match state {
+        forge_images::KaliPreparationState::Verified(_)
+        | forge_images::KaliPreparationState::Missing
+        | forge_images::KaliPreparationState::Preparing => ExitCode::SUCCESS,
+        forge_images::KaliPreparationState::Conflict(_)
+        | forge_images::KaliPreparationState::OrphanedPreparedImage
+        | forge_images::KaliPreparationState::InterruptedPreparation => ExitCode::from(1),
+    }
+}
+
+fn image_fetch_kali() -> ExitCode {
+    let Ok(directories) = image_directories() else {
+        return ExitCode::from(2);
+    };
+    println!(
+        "Acquiring and preparing official Kali QEMU image {}...",
+        forge_images::KALI_RELEASE
+    );
+    println!("Source: {}", forge_images::KALI_SOURCE_URL);
+    println!(
+        "Verification: detached SHA256SUMS signature with pinned key {}",
+        forge_images::KALI_SIGNING_KEY_FINGERPRINT
+    );
+    match forge_images::fetch_kali(&directories, &mut forge_images::SystemArtifactFetcher) {
+        Ok(metadata) => {
+            println!("Status: Verified");
+            println!("Prepared qcow2: {}", metadata.prepared_qcow2_path.display());
+            println!(
+                "Archive SHA-256: {}",
+                metadata
+                    .actual_archive_checksum
+                    .as_deref()
+                    .unwrap_or("unavailable")
+            );
+            println!(
+                "Prepared qcow2 SHA-256: {}",
+                metadata
+                    .prepared_qcow2_checksum
+                    .as_deref()
+                    .unwrap_or("unavailable")
+            );
+            println!("Shared libvirt base: created/reused during forge vm create");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Kali image fetch failed: {error}");
             ExitCode::from(1)
         }
     }
@@ -3915,7 +4426,37 @@ fn image_inspect_workstation() -> ExitCode {
             return ExitCode::from(1);
         }
     }
-    println!("Canonical base: Not prepared");
+    match resolve_promoted_workstation_base() {
+        Ok(base) => {
+            println!("Canonical base: {}", base.volume.name);
+            println!("Canonical status: Prepared");
+            println!("Canonical proof: Verified");
+        }
+        Err(error) if error == "no Promoted Fedora Workstation preparation exists" => {
+            println!("Canonical base: Not prepared");
+        }
+        Err(error) if error == "Fedora Workstation preparation is not Promoted" => {
+            match workstation_preparation_state_path()
+                .ok()
+                .and_then(|path| forge_images::read_fedora_workstation_preparation(&path).ok())
+                .flatten()
+            {
+                Some(preparation) => {
+                    println!("Canonical base: Not prepared");
+                    println!(
+                        "Canonical status: preparation stage {:?}",
+                        preparation.status
+                    );
+                }
+                None => println!("Canonical base: Not prepared"),
+            }
+        }
+        Err(error) => {
+            println!("Canonical base: Recovery required");
+            eprintln!("Promoted canonical proof failed: {error}");
+            return ExitCode::from(1);
+        }
+    }
     ExitCode::SUCCESS
 }
 
@@ -4026,6 +4567,325 @@ fn publish_workstation_active_pointer(path: &std::path::Path) -> Result<(), Stri
         .map_err(|error| format!("cannot publish active preparation pointer: {error}"))?;
     writeln!(file, "{}", path.display()).map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())
+}
+
+trait WorkstationAbortBackend {
+    fn canonical_base_exists(&mut self, name: &str) -> Result<bool, String>;
+    fn inspect_domain(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<forge_images::InstallerDomainEvidence>, String>;
+    fn inspect_volume(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<forge_images::PreparationVolumeEvidence>, String>;
+    fn stream_installer_iso_digest(
+        &mut self,
+        name: &str,
+        expected_bytes: u64,
+    ) -> Result<(forge_images::PreparationVolumeEvidence, u64, String), String>;
+    fn undefine_domain_exact(
+        &mut self,
+        expected: &forge_libvirt::ExactDomainIdentity,
+    ) -> Result<(), String>;
+    fn domain_absent(
+        &mut self,
+        expected: &forge_libvirt::ExactDomainIdentity,
+    ) -> Result<bool, String>;
+    fn delete_volume_exact(
+        &mut self,
+        expected: &forge_state::ManagedResource,
+    ) -> Result<(), String>;
+    fn verify_volume_absent(
+        &mut self,
+        expected: &forge_state::ManagedResource,
+    ) -> Result<(), String>;
+}
+
+struct LibvirtWorkstationAbortBackend {
+    define: forge_libvirt::LibvirtDefineBackend,
+    boot: forge_libvirt::LibvirtBootBackend,
+}
+
+impl LibvirtWorkstationAbortBackend {
+    fn connect() -> Result<Self, String> {
+        Ok(Self {
+            define: forge_libvirt::LibvirtDefineBackend::connect_local()
+                .map_err(|error| error.to_string())?,
+            boot: forge_libvirt::LibvirtBootBackend::connect_local()
+                .map_err(|error| error.to_string())?,
+        })
+    }
+}
+
+impl WorkstationAbortBackend for LibvirtWorkstationAbortBackend {
+    fn canonical_base_exists(&mut self, name: &str) -> Result<bool, String> {
+        self.define.canonical_base_exists("default", name)
+    }
+
+    fn inspect_domain(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<forge_images::InstallerDomainEvidence>, String> {
+        self.define.inspect_installer_domain(name)
+    }
+
+    fn inspect_volume(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<forge_images::PreparationVolumeEvidence>, String> {
+        FedoraWorkstationPreparationBackend::inspect_volume(&mut self.define, "default", name)
+    }
+
+    fn stream_installer_iso_digest(
+        &mut self,
+        name: &str,
+        expected_bytes: u64,
+    ) -> Result<(forge_images::PreparationVolumeEvidence, u64, String), String> {
+        FedoraWorkstationPreparationBackend::stream_installer_iso_digest(
+            &mut self.define,
+            "default",
+            name,
+            expected_bytes,
+        )
+    }
+
+    fn undefine_domain_exact(
+        &mut self,
+        expected: &forge_libvirt::ExactDomainIdentity,
+    ) -> Result<(), String> {
+        self.define
+            .undefine_domain_exact(expected)
+            .map_err(|error| error.to_string())
+    }
+
+    fn domain_absent(
+        &mut self,
+        expected: &forge_libvirt::ExactDomainIdentity,
+    ) -> Result<bool, String> {
+        Ok(matches!(
+            self.define
+                .observe_domain_for_delete(expected)
+                .map_err(|error| error.to_string())?,
+            forge_libvirt::DomainDeleteObservation::Absent
+        ))
+    }
+
+    fn delete_volume_exact(
+        &mut self,
+        expected: &forge_state::ManagedResource,
+    ) -> Result<(), String> {
+        self.boot
+            .delete_managed_volume_exact(expected)
+            .map_err(|error| error.to_string())
+    }
+
+    fn verify_volume_absent(
+        &mut self,
+        expected: &forge_state::ManagedResource,
+    ) -> Result<(), String> {
+        self.boot
+            .verify_managed_volume_absent(expected)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn preparation_managed_resource(
+    volume_name: &str,
+    volume_key: &str,
+    path: &std::path::Path,
+    format: &str,
+    capacity_bytes: u64,
+) -> Result<forge_state::ManagedResource, String> {
+    Ok(forge_state::ManagedResource {
+        role: forge_state::ResourceRole::WritableOverlay,
+        volume_name: volume_name.to_owned(),
+        volume_key: volume_key.to_owned(),
+        path: path
+            .to_str()
+            .ok_or_else(|| "preparation volume path is not UTF-8".to_owned())?
+            .to_owned(),
+        format: format.to_owned(),
+        capacity_bytes,
+        backing_path: None,
+    })
+}
+
+fn validate_abort_preparation(
+    preparation: &forge_images::FedoraWorkstationPreparation,
+    requested_id: &str,
+) -> Result<(), String> {
+    if preparation.preparation_id.as_str() != requested_id {
+        return Err("selected preparation ID differs from requested abort ID".to_owned());
+    }
+    if matches!(
+        preparation.status,
+        forge_images::FedoraWorkstationPreparationStatus::PromotionReady
+            | forge_images::FedoraWorkstationPreparationStatus::Promoted
+    ) {
+        return Err(
+            "Fedora Workstation preparation has reached promotion and cannot be aborted".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn abort_workstation_preparation<B: WorkstationAbortBackend>(
+    backend: &mut B,
+    preparation: &forge_images::FedoraWorkstationPreparation,
+    requested_id: &str,
+) -> Result<(), String> {
+    validate_abort_preparation(preparation, requested_id)?;
+    if backend.canonical_base_exists(&preparation.canonical.volume_name)? {
+        return Err("canonical Fedora Workstation shared base exists; abort refused".to_owned());
+    }
+    let domain = backend
+        .inspect_domain(&preparation.installer.name)?
+        .ok_or_else(|| "preparation domain is absent; abort refused".to_owned())?;
+    if domain.name != preparation.installer.name || domain.uuid != preparation.installer.uuid {
+        return Err("preparation domain identity mismatch".to_owned());
+    }
+    if !domain.persistent || !domain.shutoff {
+        return Err(
+            "preparation domain must be persistent and shut off; abort will not stop it".to_owned(),
+        );
+    }
+    forge_images::prove_fedora_workstation_abort_disk_binding(preparation, &domain)
+        .map_err(|error| format!("preparation primary disk mismatch: {error}"))?;
+
+    let staging = backend
+        .inspect_volume(&preparation.staging.volume_name)?
+        .ok_or_else(|| "preparation staging volume is absent; abort refused".to_owned())?;
+    let staging_key = preparation
+        .execution
+        .staging_volume_key
+        .as_deref()
+        .ok_or_else(|| "preparation staging volume key was never durably recorded".to_owned())?;
+    if staging.name != preparation.staging.volume_name
+        || staging.key != staging_key
+        || staging.path != preparation.staging.path
+        || staging.format != preparation.staging.format
+        || staging.capacity_bytes != preparation.staging.capacity_bytes
+        || staging.backing_path != preparation.staging.backing_path
+    {
+        return Err("preparation staging volume identity mismatch".to_owned());
+    }
+    let staging_resource = preparation_managed_resource(
+        &staging.name,
+        &staging.key,
+        &staging.path,
+        &staging.format,
+        staging.capacity_bytes,
+    )?;
+
+    let runtime_resource = if let Some(runtime) = preparation.execution.runtime_iso.as_ref() {
+        let (volume, bytes, digest) =
+            backend.stream_installer_iso_digest(&runtime.volume_name, runtime.destination_bytes)?;
+        if runtime.preparation_id != preparation.preparation_id
+            || volume.name != runtime.volume_name
+            || volume.key != runtime.volume_key
+            || volume.path != runtime.path
+            || !matches!(volume.format.as_str(), "raw" | "iso")
+            || volume.capacity_bytes != runtime.destination_bytes
+            || volume.backing_path.is_some()
+            || bytes != runtime.destination_bytes
+            || digest != runtime.destination_sha256
+            || runtime.source_sha256 != runtime.destination_sha256
+            || runtime.source_bytes != runtime.destination_bytes
+        {
+            return Err("managed installer ISO identity or digest mismatch".to_owned());
+        }
+        Some(preparation_managed_resource(
+            &volume.name,
+            &volume.key,
+            &volume.path,
+            &volume.format,
+            volume.capacity_bytes,
+        )?)
+    } else {
+        None
+    };
+
+    let domain_identity = forge_libvirt::ExactDomainIdentity {
+        name: preparation.installer.name.clone(),
+        uuid: preparation.installer.uuid.clone(),
+    };
+    backend.undefine_domain_exact(&domain_identity)?;
+    if !backend.domain_absent(&domain_identity)? {
+        return Err("preparation domain remains after exact undefine".to_owned());
+    }
+    backend.delete_volume_exact(&staging_resource)?;
+    backend.verify_volume_absent(&staging_resource)?;
+    if let Some(runtime) = runtime_resource {
+        backend.delete_volume_exact(&runtime)?;
+        backend.verify_volume_absent(&runtime)?;
+    }
+    Ok(())
+}
+
+fn retire_workstation_preparation_state(path: &std::path::Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "preparation state has no parent".to_owned())?;
+    let pointer = parent.join("fedora-workstation-44-1.7.active");
+    if let Ok(value) = std::fs::read_to_string(&pointer) {
+        if std::path::Path::new(value.trim()) == path {
+            std::fs::remove_file(&pointer)
+                .map_err(|error| format!("cannot retire active preparation pointer: {error}"))?;
+        }
+    }
+    std::fs::remove_file(path).map_err(|error| format!("cannot retire preparation state: {error}"))
+}
+
+fn validate_workstation_active_pointer(path: &std::path::Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "preparation state has no parent".to_owned())?;
+    let pointer = parent.join("fedora-workstation-44-1.7.active");
+    match std::fs::read_to_string(&pointer) {
+        Ok(value) if std::path::Path::new(value.trim()) == path => Ok(()),
+        Ok(_) => Err("active preparation pointer identifies a different state file".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot read active preparation pointer: {error}")),
+    }
+}
+
+fn image_abort_workstation(requested_id: &str) -> ExitCode {
+    let result = (|| -> Result<(), String> {
+        let state_path = workstation_preparation_state_path()?;
+        let preparation = forge_images::read_fedora_workstation_preparation(&state_path)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "no active Fedora Workstation preparation exists".to_owned())?;
+        validate_workstation_active_pointer(&state_path)?;
+        println!(
+            "Preparation selected: {}",
+            preparation.preparation_id.as_str()
+        );
+        let mut backend = LibvirtWorkstationAbortBackend::connect()?;
+        println!("Validation: exact durable identities required");
+        abort_workstation_preparation(&mut backend, &preparation, requested_id)?;
+        println!("Domain retired: {}", preparation.installer.name);
+        println!("Staging retired: {}", preparation.staging.volume_name);
+        println!(
+            "Managed installer ISO retired: {}",
+            if preparation.execution.runtime_iso.is_some() {
+                "yes"
+            } else {
+                "not present"
+            }
+        );
+        retire_workstation_preparation_state(&state_path)?;
+        println!("Durable state retired: {}", state_path.display());
+        println!("Abort completed");
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Fedora Workstation preparation abort refused: {error}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn new_preparation_identity() -> Result<forge_images::FedoraWorkstationPreparationId, String> {
@@ -4222,8 +5082,114 @@ fn print_workstation_preparation_ready(preparation: &forge_images::FedoraWorksta
         "Open the temporary installer domain in virt-manager and complete normal graphical installation."
     );
     println!(
-        "After installation and shutdown, run: forge image prepare-continue fedora-workstation"
+        "Before starting the installer with Forge, run: forge image prepare-start fedora-workstation"
     );
+}
+
+fn workstation_preparation_next_action(
+    status: forge_images::FedoraWorkstationPreparationStatus,
+) -> &'static str {
+    use forge_images::FedoraWorkstationPreparationStatus as Status;
+
+    match status {
+        Status::InstallerReady => {
+            "If installation was performed manually or outside Forge and the VM is shut off, run: forge image prepare-confirm-installed fedora-workstation"
+        }
+        Status::InstallerRunning => {
+            "Complete graphical Anaconda, shut down the VM, then run: forge image prepare-continue fedora-workstation"
+        }
+        Status::InstallationConfirmed | Status::InstalledDiskBootPending => {
+            "Run: forge image prepare-continue fedora-workstation"
+        }
+        Status::InstalledDiskBooting => {
+            "Wait for the installed system to reach graphical first boot, then run: forge image prepare-confirm-graphical fedora-workstation"
+        }
+        Status::AwaitingGraphicalBootConfirmation => {
+            "Confirm the running graphical installed system with: forge image prepare-confirm-graphical fedora-workstation"
+        }
+        Status::InstalledSystemProven => {
+            "Graphical proof is complete. Shut down the preparation guest normally, then run: forge image prepare-promote fedora-workstation"
+        }
+        _ => "Inspect the durable preparation state before taking another action.",
+    }
+}
+
+fn installed_disk_boot_message(
+    disposition: forge_images::InstalledDiskBootDisposition,
+) -> &'static str {
+    match disposition {
+        forge_images::InstalledDiskBootDisposition::DiskOnlyPrepared => {
+            "Installed system: disk-only topology prepared; domain not started"
+        }
+        forge_images::InstalledDiskBootDisposition::Started
+        | forge_images::InstalledDiskBootDisposition::AlreadyRunning => {
+            "Installed system: running from preparation staging disk"
+        }
+    }
+}
+
+fn workstation_status_expects_running_domain(
+    status: forge_images::FedoraWorkstationPreparationStatus,
+) -> bool {
+    matches!(
+        status,
+        forge_images::FedoraWorkstationPreparationStatus::InstalledDiskBooting
+            | forge_images::FedoraWorkstationPreparationStatus::AwaitingGraphicalBootConfirmation
+            | forge_images::FedoraWorkstationPreparationStatus::InstalledSystemProven
+            | forge_images::FedoraWorkstationPreparationStatus::NormalizationPlanned
+            | forge_images::FedoraWorkstationPreparationStatus::NormalizationRunning
+            | forge_images::FedoraWorkstationPreparationStatus::NormalizationGuestComplete
+    )
+}
+
+fn prove_promoted_workstation_status(
+    preparation_id: &forge_images::FedoraWorkstationPreparationId,
+    canonical_plan: &forge_images::CanonicalWorkstationBasePlan,
+    promotion: Option<&forge_images::HostOnlyPromotionEvidence>,
+    canonical: Option<&forge_images::HostOnlyCanonicalEvidence>,
+    canonical_volume: &forge_images::PreparationVolumeEvidence,
+    canonical_proof: &forge_images::Qcow2VolumeProof,
+    canonical_protected: bool,
+    staging_present: bool,
+    preparation_domain_present: bool,
+) -> Result<(), String> {
+    let promotion = promotion
+        .ok_or_else(|| "host-only promotion evidence absent; recovery required".to_owned())?;
+    let canonical = canonical
+        .ok_or_else(|| "canonical publication evidence absent; recovery required".to_owned())?;
+    if promotion.preparation_id != *preparation_id
+        || canonical.staging_sha256 != promotion.staging_sha256
+        || canonical.staging_streamed_bytes != promotion.staging_streamed_bytes
+        || canonical.canonical_volume_name != canonical_plan.volume_name
+        || canonical.canonical_path != canonical_plan.path
+        || canonical.canonical_format != "qcow2"
+        || canonical.canonical_capacity_bytes != canonical_plan.capacity_bytes
+        || canonical_volume.name != canonical.canonical_volume_name
+        || canonical_volume.key != canonical.canonical_volume_key
+        || canonical_volume.path != canonical.canonical_path
+        || canonical_volume.format != canonical.canonical_format
+        || canonical_volume.capacity_bytes != canonical.canonical_capacity_bytes
+        || canonical_volume.backing_path.is_some()
+        || canonical_proof.volume != *canonical_volume
+        || canonical_proof.sha256 != canonical.canonical_sha256
+        || canonical_proof.streamed_bytes != canonical.canonical_streamed_bytes
+        || !canonical_protected
+    {
+        return Err("canonical promotion evidence or identity drift; recovery required".to_owned());
+    }
+    if preparation_domain_present {
+        return Err("preparation domain remains after promotion; recovery required".to_owned());
+    }
+    if staging_present {
+        return Err("staging volume remains after promotion; recovery required".to_owned());
+    }
+    Ok(())
+}
+
+fn require_promoted_canonical_volume(
+    canonical: Option<forge_images::PreparationVolumeEvidence>,
+) -> Result<forge_images::PreparationVolumeEvidence, String> {
+    canonical.ok_or_else(|| "canonical volume absent; recovery required".to_owned())
 }
 
 fn image_prepare_workstation_status() -> ExitCode {
@@ -4237,6 +5203,50 @@ fn image_prepare_workstation_status() -> ExitCode {
         }
         let mut backend = forge_libvirt::LibvirtDefineBackend::connect_local()
             .map_err(|error| error.to_string())?;
+        if preparation.status == forge_images::FedoraWorkstationPreparationStatus::Promoted {
+            let canonical_volume = require_promoted_canonical_volume(
+                FedoraWorkstationPreparationBackend::inspect_volume(
+                    &mut backend,
+                    "default",
+                    &preparation.canonical.volume_name,
+                )?,
+            )?;
+            backend.verify_exact_protected_qcow2_volume("default", &canonical_volume)?;
+            let canonical_proof =
+                backend.stream_exact_qcow2_volume("default", &canonical_volume)?;
+            // List-based discovery keeps successful terminal absence checks quiet.
+            let staging_present = DefineBackend::volume_exists(
+                &mut backend,
+                "default",
+                &preparation.staging.volume_name,
+            )
+            .map_err(|error| error.to_string())?;
+            let preparation_domain_present =
+                DefineBackend::domain_exists(&mut backend, &preparation.installer.name)
+                    .map_err(|error| error.to_string())?;
+            prove_promoted_workstation_status(
+                &preparation.preparation_id,
+                &preparation.canonical,
+                preparation.execution.host_only_promotion.as_ref(),
+                preparation.execution.host_only_canonical.as_ref(),
+                &canonical_volume,
+                &canonical_proof,
+                true,
+                staging_present,
+                preparation_domain_present,
+            )?;
+            println!("Preparation ID: {}", preparation.preparation_id.as_str());
+            println!("Source ISO verified: yes (durable exact provenance)");
+            println!("Current stage: Promoted");
+            println!("Canonical base: {}", canonical_volume.name);
+            println!("Canonical proof: verified");
+            println!("Preparation domain: retired");
+            println!("Staging volume: retired");
+            println!("Recovery required: no");
+            println!("Next action: create a normal Fedora Workstation VM from the canonical base");
+            println!("Mutation: none");
+            return Ok(());
+        }
         let volume = FedoraWorkstationPreparationBackend::inspect_volume(
             &mut backend,
             "default",
@@ -4246,8 +5256,16 @@ fn image_prepare_workstation_status() -> ExitCode {
         let domain = backend
             .inspect_installer_domain(&preparation.installer.name)?
             .ok_or_else(|| "installer domain absent; recovery required".to_owned())?;
-        forge_images::prove_fedora_workstation_installer_topology(&preparation, &domain)
+        if workstation_status_expects_running_domain(preparation.status) {
+            forge_images::prove_fedora_workstation_running_disk_only_topology(
+                &preparation,
+                &domain,
+            )
             .map_err(|error| error.to_string())?;
+        } else {
+            forge_images::prove_fedora_workstation_installer_topology(&preparation, &domain)
+                .map_err(|error| error.to_string())?;
+        }
         println!("Preparation ID: {}", preparation.preparation_id.as_str());
         println!("Source ISO verified: yes (durable exact provenance)");
         println!("Staging disk: {} ({})", volume.path.display(), volume.key);
@@ -4261,9 +5279,15 @@ fn image_prepare_workstation_status() -> ExitCode {
                 "not shut off"
             }
         );
-        println!(
-            "Next action: complete graphical Anaconda installation, shut down, then explicitly continue"
-        );
+        let next_action = if preparation.status
+            == forge_images::FedoraWorkstationPreparationStatus::InstalledSystemProven
+            && domain.shutoff
+        {
+            "Graphical proof is complete and the preparation guest is shut off. Run: forge image prepare-promote fedora-workstation"
+        } else {
+            workstation_preparation_next_action(preparation.status)
+        };
+        println!("Next action: {next_action}");
         println!("Canonical base: not prepared");
         println!("Mutation: none");
         Ok(())
@@ -4318,125 +5342,32 @@ fn image_prepare_workstation_start() -> ExitCode {
                 "installer start requires an existing InstallerReady transaction".to_owned(),
             );
         }
-        let suffix = &preparation.preparation_id.as_str()[..8];
-        let runtime_name = format!(
-            "forge-install-fedora-workstation-{}-{}-{suffix}.iso",
-            preparation.source.release, preparation.source.compose
-        );
-        let runtime = if let Some(runtime) = &preparation.execution.runtime_iso {
-            if runtime.volume_name != runtime_name
-                || runtime.preparation_id != preparation.preparation_id
-                || runtime.source_sha256 != preparation.source.iso_sha256
-                || runtime.source_bytes != preparation.source.iso_bytes
-            {
-                return Err("runtime installer ISO provenance conflict".to_owned());
-            }
-            let (volume, bytes, digest) =
-                FedoraWorkstationPreparationBackend::stream_installer_iso_digest(
-                    &mut backend,
-                    "default",
-                    &runtime_name,
-                    preparation.source.iso_bytes,
-                )?;
-            if bytes != preparation.source.iso_bytes || digest != preparation.source.iso_sha256 {
-                return Err("runtime installer ISO streamed digest mismatch".to_owned());
-            }
-            if volume.key != runtime.volume_key
-                || volume.path != runtime.path
-                || volume.capacity_bytes != runtime.destination_bytes
-            {
-                return Err("runtime installer ISO identity drift".to_owned());
-            }
-            volume
-        } else if let Some(existing) = FedoraWorkstationPreparationBackend::inspect_volume(
-            &mut backend,
-            "default",
-            &runtime_name,
-        )? {
-            let (volume, bytes, digest) =
-                FedoraWorkstationPreparationBackend::stream_installer_iso_digest(
-                    &mut backend,
-                    "default",
-                    &runtime_name,
-                    preparation.source.iso_bytes,
-                )?;
-            if volume.key != existing.key
-                || bytes != preparation.source.iso_bytes
-                || digest != preparation.source.iso_sha256
-            {
-                return Err("existing runtime installer ISO proof failed".to_owned());
-            }
-            let runtime = forge_images::LibvirtManagedInstallerIso {
-                preparation_id: preparation.preparation_id.clone(),
-                volume_name: runtime_name.clone(),
-                path: volume.path.clone(),
-                source_filename: preparation.source.filename.clone(),
-                source_sha256: preparation.source.iso_sha256.clone(),
-                source_bytes: preparation.source.iso_bytes,
-                destination_bytes: bytes,
-                destination_sha256: digest,
-                volume_key: volume.key.clone(),
-                role: forge_images::FedoraWorkstationArtifactRole::LibvirtManagedInstallerIso,
-            };
-            preparation.execution.runtime_iso = Some(runtime);
-            forge_images::update_fedora_workstation_preparation(&state_path, &preparation)
-                .map_err(|e| e.to_string())?;
-            volume
-        } else {
-            let volume = FedoraWorkstationPreparationBackend::materialize_installer_iso(
+        let runtime = preparation
+            .execution
+            .runtime_iso
+            .as_ref()
+            .ok_or_else(|| "installer-ready state lacks its managed runtime ISO".to_owned())?;
+        if runtime.preparation_id != preparation.preparation_id
+            || runtime.source_sha256 != preparation.source.iso_sha256
+            || runtime.source_bytes != preparation.source.iso_bytes
+        {
+            return Err("runtime installer ISO provenance conflict".to_owned());
+        }
+        let (volume, bytes, digest) =
+            FedoraWorkstationPreparationBackend::stream_installer_iso_digest(
                 &mut backend,
                 "default",
-                &runtime_name,
-                &preparation.source.iso_path,
+                &runtime.volume_name,
                 preparation.source.iso_bytes,
             )?;
-            let mut file = File::open(&volume.path).map_err(|e| e.to_string())?;
-            let mut hash = Sha256::new();
-            let mut bytes = 0u64;
-            let mut buf = vec![0u8; 1024 * 1024];
-            loop {
-                let n = file.read(&mut buf).map_err(|e| e.to_string())?;
-                if n == 0 {
-                    break;
-                }
-                hash.update(&buf[..n]);
-                bytes += n as u64;
-            }
-            let digest = format!("{:x}", hash.finalize());
-            if bytes != preparation.source.iso_bytes || digest != preparation.source.iso_sha256 {
-                return Err("runtime installer ISO byte proof failed".to_owned());
-            }
-            let runtime = forge_images::LibvirtManagedInstallerIso {
-                preparation_id: preparation.preparation_id.clone(),
-                volume_name: runtime_name.clone(),
-                path: volume.path.clone(),
-                source_filename: preparation.source.filename.clone(),
-                source_sha256: preparation.source.iso_sha256.clone(),
-                source_bytes: preparation.source.iso_bytes,
-                destination_bytes: bytes,
-                destination_sha256: digest,
-                volume_key: volume.key.clone(),
-                role: forge_images::FedoraWorkstationArtifactRole::LibvirtManagedInstallerIso,
-            };
-            preparation.execution.runtime_iso = Some(runtime);
-            forge_images::update_fedora_workstation_preparation(&state_path, &preparation)
-                .map_err(|e| e.to_string())?;
-            volume
-        };
-        preparation.installer.iso_path.clone_from(&runtime.path);
-        backend.define_installer_domain(&forge_images::render_fedora_workstation_installer_xml(
-            &preparation,
-        ))?;
-        let domain = backend
-            .inspect_installer_domain(&preparation.installer.name)?
-            .ok_or_else(|| "rebound installer domain disappeared".to_owned())?;
-        let resolved =
-            forge_images::prove_fedora_workstation_installer_topology(&preparation, &domain)
-                .map_err(|e| e.to_string())?;
-        preparation.execution.installer_xml_sha256 = Some(resolved.xml_sha256.clone());
-        preparation.execution.resolved_topology = Some(resolved);
-        forge_images::update_fedora_workstation_preparation(&state_path, &preparation)
-            .map_err(|e| e.to_string())?;
+        if bytes != preparation.source.iso_bytes
+            || digest != preparation.source.iso_sha256
+            || volume.key != runtime.volume_key
+            || volume.path != runtime.path
+            || volume.capacity_bytes != runtime.destination_bytes
+        {
+            return Err("runtime installer ISO identity drift".to_owned());
+        }
         backend.start_preparation_domain(&preparation.installer.name)?;
         if !backend.preparation_domain_running(&preparation.installer.name)? {
             return Err("installer domain did not reach running state".to_owned());
@@ -4492,7 +5423,7 @@ fn image_prepare_workstation_continue() -> ExitCode {
         println!("Installed-disk boot: {disposition:?}");
         println!("Anaconda installation: operator-confirmed complete");
         println!("Installer ISO: detached (retained as an unattached managed volume)");
-        println!("Installed system: running from preparation staging disk");
+        println!("{}", installed_disk_boot_message(disposition));
         println!("Graphical Fedora proof: operator confirmation required");
         println!("Canonical Workstation base: not created");
         Ok(())
@@ -4514,9 +5445,6 @@ fn image_prepare_workstation_confirm_installed() -> ExitCode {
         let mut preparation = forge_images::read_fedora_workstation_preparation(&state_path)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "no active preparation".to_owned())?;
-        if preparation.preparation_id.as_str() != "4ad083f66d9d4dd0a834250ddef9826d" {
-            return Err("active preparation is not the requested 4ad083f6 generation".to_owned());
-        }
         if !exact_workstation_source(&preparation) {
             return Err("preparation provenance conflicts with the pinned source".to_owned());
         }
@@ -4658,6 +5586,141 @@ fn image_prepare_workstation_confirm_graphical() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Fedora Workstation graphical confirmation refused: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn image_prepare_workstation_promote() -> ExitCode {
+    let result = (|| -> Result<(), String> {
+        let state_path = workstation_preparation_state_path()?;
+        let mut preparation = forge_images::read_fedora_workstation_preparation(&state_path)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "no active preparation".to_owned())?;
+        if preparation.status
+            != forge_images::FedoraWorkstationPreparationStatus::InstalledSystemProven
+        {
+            return Err("promotion requires InstalledSystemProven".to_owned());
+        }
+        if !exact_workstation_source(&preparation) {
+            return Err("preparation provenance conflicts with the pinned source".to_owned());
+        }
+        let mut define = forge_libvirt::LibvirtDefineBackend::connect_local()
+            .map_err(|error| error.to_string())?;
+        if define.canonical_base_exists("default", &preparation.canonical.volume_name)? {
+            return Err("canonical Workstation base already exists; promotion refused".to_owned());
+        }
+        let domain = define
+            .inspect_installer_domain(&preparation.installer.name)?
+            .ok_or_else(|| "preparation domain absent".to_owned())?;
+        if !domain.shutoff || domain.running {
+            return Err("shut down the preparation guest normally, then rerun forge image prepare-promote fedora-workstation".to_owned());
+        }
+        forge_images::prove_fedora_workstation_disk_only_topology(&preparation, &domain)
+            .map_err(|error| error.to_string())?;
+        let volume = FedoraWorkstationPreparationBackend::inspect_volume(
+            &mut define,
+            "default",
+            &preparation.staging.volume_name,
+        )?
+        .ok_or_else(|| "staging volume absent".to_owned())?;
+        if volume.name != preparation.staging.volume_name
+            || volume.path != preparation.staging.path
+            || volume.format != preparation.staging.format
+            || volume.capacity_bytes != preparation.staging.capacity_bytes
+            || volume.backing_path != preparation.staging.backing_path
+            || preparation.execution.staging_volume_key.as_deref() != Some(volume.key.as_str())
+        {
+            return Err("durable staging identity drift".to_owned());
+        }
+        attest_operator_qcow2_check(&volume.path)?;
+        let staging_proof = define.stream_exact_qcow2_volume("default", &volume)?;
+        let topology = preparation
+            .execution
+            .disk_only_topology
+            .as_ref()
+            .ok_or_else(|| "disk-only topology proof absent".to_owned())?;
+        let evidence = forge_images::HostOnlyPromotionEvidence {
+            preparation_id: preparation.preparation_id.clone(),
+            staging_volume_name: volume.name.clone(),
+            staging_volume_key: volume.key.clone(),
+            staging_path: volume.path.clone(),
+            staging_format: volume.format.clone(),
+            staging_capacity_bytes: volume.capacity_bytes,
+            staging_allocation_bytes: staging_proof.volume.allocation_bytes,
+            staging_streamed_bytes: staging_proof.streamed_bytes,
+            staging_sha256: staging_proof.sha256.clone(),
+            domain_name: domain.name.clone(),
+            domain_uuid: domain.uuid.clone(),
+            disk_only_topology_xml_sha256: topology.xml_sha256.clone(),
+            domain_shutoff: domain.shutoff,
+            qemu_img_check_attested: true,
+        };
+        forge_images::record_host_only_promotion_ready(&mut preparation, evidence)
+            .map_err(|error| error.to_string())?;
+        forge_images::update_fedora_workstation_preparation(&state_path, &preparation)
+            .map_err(|error| error.to_string())?;
+        define.clone_protected_workstation_volume(
+            "default",
+            &preparation.staging.path.to_string_lossy(),
+            &preparation.canonical.volume_name,
+            preparation.canonical.capacity_bytes,
+        )?;
+        let canonical_volume = FedoraWorkstationPreparationBackend::inspect_volume(
+            &mut define,
+            "default",
+            &preparation.canonical.volume_name,
+        )?
+        .ok_or_else(|| "canonical volume absent after creation".to_owned())?;
+        let canonical_proof = define.stream_exact_qcow2_volume("default", &canonical_volume)?;
+        forge_images::record_host_only_canonical_publication(
+            &mut preparation,
+            forge_images::HostOnlyCanonicalEvidence {
+                staging_sha256: staging_proof.sha256,
+                staging_streamed_bytes: staging_proof.streamed_bytes,
+                canonical_volume_name: canonical_proof.volume.name,
+                canonical_volume_key: canonical_proof.volume.key,
+                canonical_path: canonical_proof.volume.path,
+                canonical_format: canonical_proof.volume.format,
+                canonical_capacity_bytes: canonical_proof.volume.capacity_bytes,
+                canonical_allocation_bytes: canonical_proof.volume.allocation_bytes,
+                canonical_streamed_bytes: canonical_proof.streamed_bytes,
+                canonical_sha256: canonical_proof.sha256,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        forge_images::update_fedora_workstation_preparation(&state_path, &preparation)
+            .map_err(|error| error.to_string())?;
+        let expected_domain = forge_libvirt::ExactDomainIdentity {
+            name: preparation.installer.name.clone(),
+            uuid: preparation.installer.uuid.clone(),
+        };
+        define
+            .undefine_domain_exact(&expected_domain)
+            .map_err(|error| error.to_string())?;
+        let expected_staging = preparation_managed_resource(
+            &volume.name,
+            &volume.key,
+            &volume.path,
+            &volume.format,
+            volume.capacity_bytes,
+        )?;
+        let boot = forge_libvirt::LibvirtBootBackend::connect_local()
+            .map_err(|error| error.to_string())?;
+        boot.delete_managed_volume_exact(&expected_staging)
+            .map_err(|error| error.to_string())?;
+        boot.verify_managed_volume_absent(&expected_staging)
+            .map_err(|error| error.to_string())?;
+        println!(
+            "Promotion completed: canonical base {}",
+            preparation.canonical.volume_name
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Fedora Workstation promotion refused: {error}");
             ExitCode::from(1)
         }
     }
@@ -5018,6 +6081,10 @@ fn plan_instance(profile_name: &str, instance_name: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Err(error) = validate_whonix_canonical_instance(&profile, &instance) {
+        eprintln!("instance planning refused: {error}");
+        return ExitCode::from(1);
+    }
     let hardware = match forge_hardware::collect() {
         Ok(hardware) => hardware,
         Err(error) => {
@@ -5054,6 +6121,18 @@ fn plan_instance(profile_name: &str, instance_name: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if profile.kind == forge_core::GuestProfileKind::FedoraWorkstation {
+        match resolve_promoted_workstation_base() {
+            Ok(base) => println!(
+                "Promoted canonical base: {} (verified; reuse without import)",
+                base.volume.name
+            ),
+            Err(error) => {
+                eprintln!("promoted Fedora Workstation base is not usable: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    }
     println!("Mode: plan (zero mutation)");
     println!("Profile: {}", plan.identity.profile_id);
     println!("Instance: {}", plan.identity.name);
@@ -5096,6 +6175,10 @@ fn create_vm_dry_run(profile_name: &str, instance_name: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Err(error) = validate_whonix_canonical_instance(&profile, &instance) {
+        eprintln!("create refused: {error}");
+        return ExitCode::from(1);
+    }
     let hardware = match forge_hardware::collect() {
         Ok(hardware) => hardware,
         Err(error) => {
@@ -5211,6 +6294,8 @@ fn workstation_pair_evidence() -> Result<forge_profiles::WhonixPairEvidence, Str
     else {
         return Err("matching Gateway durable state is absent".to_owned());
     };
+    forge_state::require_normal_lifecycle(&index)
+        .map_err(|_| "matching Gateway durable state is deleted or recovery-required".to_owned())?;
     let manifests = load_index_manifests(&layout, &index)?;
     let active = active_manifest(&index, &manifests)?;
     let backend = forge_libvirt::LibvirtBootBackend::connect_instance(
@@ -5340,9 +6425,18 @@ fn print_create_plan(
         plan.prepared_base.source_format,
         plan.prepared_base.base_volume_name
     );
-    println!(
-        "Prepared base semantics: prove and reuse an exact existing trusted base; otherwise prepare it when absent"
-    );
+    if matches!(
+        plan.prepared_base.source,
+        forge_core::ImageSourcePolicy::PromotedFedoraWorkstation { .. }
+    ) {
+        println!(
+            "Prepared base semantics: reuse the exact promoted Fedora Workstation canonical base; no import"
+        );
+    } else {
+        println!(
+            "Prepared base semantics: prove and reuse an exact existing trusted base; otherwise prepare it when absent"
+        );
+    }
     println!("Prepared base ownership: shared, protected, reusable");
     print!("{}", format_shared_base_resolution(shared_base));
     if matches!(
@@ -5403,7 +6497,98 @@ struct PreparedBaseArtifact {
     file_bytes: u64,
     capacity_bytes: u64,
     kali_proof: Option<forge_images::KaliPreparedBaseExecuteProof>,
+    whonix_gateway_proof: Option<forge_images::WhonixGatewayExecuteProof>,
     whonix_workstation_proof: Option<forge_images::WhonixWorkstationExecuteProof>,
+    promoted_workstation: Option<PromotedWorkstationBaseProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromotedWorkstationBaseProof {
+    preparation_id: forge_images::FedoraWorkstationPreparationId,
+    volume: forge_images::PreparationVolumeEvidence,
+    canonical_sha256: String,
+    canonical_streamed_bytes: u64,
+    source_iso_sha256: String,
+}
+
+fn promoted_workstation_shared_base_resource(
+    proof: &PromotedWorkstationBaseProof,
+) -> forge_state::ManagedResource {
+    forge_state::ManagedResource {
+        role: forge_state::ResourceRole::SharedBase,
+        volume_name: proof.volume.name.clone(),
+        volume_key: proof.volume.key.clone(),
+        path: proof.volume.path.to_string_lossy().into_owned(),
+        format: proof.volume.format.clone(),
+        capacity_bytes: proof.volume.capacity_bytes,
+        backing_path: proof
+            .volume
+            .backing_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+    }
+}
+
+fn resolve_promoted_workstation_base() -> Result<PromotedWorkstationBaseProof, String> {
+    let state_path = workstation_preparation_state_path()?;
+    let preparation = forge_images::read_fedora_workstation_preparation(&state_path)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "no Promoted Fedora Workstation preparation exists".to_owned())?;
+    if preparation.status != forge_images::FedoraWorkstationPreparationStatus::Promoted {
+        return Err("Fedora Workstation preparation is not Promoted".to_owned());
+    }
+    if !exact_workstation_source(&preparation) {
+        return Err("promoted Workstation source provenance mismatch".to_owned());
+    }
+    let promotion = preparation
+        .execution
+        .host_only_promotion
+        .as_ref()
+        .ok_or_else(|| "host-only promotion evidence is absent".to_owned())?;
+    let canonical = preparation
+        .execution
+        .host_only_canonical
+        .as_ref()
+        .ok_or_else(|| "host-only canonical evidence is absent".to_owned())?;
+    if promotion.preparation_id != preparation.preparation_id
+        || canonical.staging_sha256 != promotion.staging_sha256
+        || canonical.staging_streamed_bytes != promotion.staging_streamed_bytes
+        || canonical.canonical_volume_name != preparation.canonical.volume_name
+        || canonical.canonical_path != preparation.canonical.path
+        || canonical.canonical_format != "qcow2"
+        || canonical.canonical_capacity_bytes != preparation.canonical.capacity_bytes
+    {
+        return Err("promoted Workstation evidence is incoherent".to_owned());
+    }
+    let define =
+        forge_libvirt::LibvirtDefineBackend::connect_local().map_err(|error| error.to_string())?;
+    let mut define = define;
+    let volume = FedoraWorkstationPreparationBackend::inspect_volume(
+        &mut define,
+        forge_storage::DEFAULT_POOL,
+        &preparation.canonical.volume_name,
+    )?
+    .ok_or_else(|| "promoted canonical volume is absent".to_owned())?;
+    define.verify_exact_protected_qcow2_volume(forge_storage::DEFAULT_POOL, &volume)?;
+    let proof = define.stream_exact_qcow2_volume(forge_storage::DEFAULT_POOL, &volume)?;
+    if volume.name != canonical.canonical_volume_name
+        || volume.key != canonical.canonical_volume_key
+        || volume.path != canonical.canonical_path
+        || volume.format != canonical.canonical_format
+        || volume.capacity_bytes != canonical.canonical_capacity_bytes
+        || volume.backing_path.is_some()
+        || proof.sha256 != canonical.canonical_sha256
+        || proof.streamed_bytes != canonical.canonical_streamed_bytes
+    {
+        return Err("promoted canonical live proof differs from durable evidence".to_owned());
+    }
+    Ok(PromotedWorkstationBaseProof {
+        preparation_id: preparation.preparation_id,
+        volume,
+        canonical_sha256: canonical.canonical_sha256.clone(),
+        canonical_streamed_bytes: canonical.canonical_streamed_bytes,
+        source_iso_sha256: preparation.source.iso_sha256,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5464,6 +6649,18 @@ fn validate_preparation_strategy(
         {
             Ok(plan.preparation)
         }
+        (
+            ImageSourcePolicy::PromotedFedoraWorkstation { release, compose },
+            ImageVerificationPolicy::Sha256Digest,
+            SourceImageFormat::Qcow2,
+            PrepareBaseStrategy::PromotedFedoraWorkstationCanonical,
+        ) if release == forge_images::FEDORA_WORKSTATION_RELEASE
+            && compose == forge_images::FEDORA_WORKSTATION_COMPOSE
+            && plan.base_volume_name
+                == format!("forge-base-fedora-workstation-{release}-{compose}.qcow2") =>
+        {
+            Ok(plan.preparation)
+        }
         _ => Err("unsupported or incoherent image preparation strategy".to_owned()),
     }
 }
@@ -5475,47 +6672,58 @@ fn acquire_prepared_base(
     eprintln!("[forge] phase start: prepared-base cryptographic validation");
     let directories = forge_images::default_directories()
         .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
-    let (path, kali_proof, whonix_workstation_proof) = match validate_preparation_strategy(plan)? {
-        forge_profiles::PrepareBaseStrategy::SevenZipSingleQcow2 => {
-            let (metadata, proof) = forge_images::prepare_kali_for_execute(
-                &directories,
-                &mut forge_images::SystemArtifactFetcher,
-            )
-            .map_err(|error| error.to_string())?;
-            (metadata.prepared_qcow2_path, Some(proof), None)
-        }
-        forge_profiles::PrepareBaseStrategy::WhonixBundleGateway => {
-            let path = forge_images::fetch_whonix_gateway(
-                &directories,
-                &mut forge_images::SystemArtifactFetcher,
-            )
-            .map_err(|error| error.to_string())?
-            .prepared_qcow2_path;
-            (path, None, None)
-        }
-        forge_profiles::PrepareBaseStrategy::WhonixBundleWorkstation => {
-            let (metadata, proof) = forge_images::prepare_whonix_workstation_for_execute(
-                &directories,
-                &mut forge_images::SystemArtifactFetcher,
-            )
-            .map_err(|error| error.to_string())?;
-            (metadata.prepared_qcow2_path, None, Some(proof))
-        }
-        forge_profiles::PrepareBaseStrategy::VerifiedQcow2 => {
-            return Err("verified direct-qcow2 real create is not implemented".to_owned());
-        }
+    let (path, kali_proof, whonix_gateway_proof, whonix_workstation_proof, promoted_workstation) =
+        match validate_preparation_strategy(plan)? {
+            forge_profiles::PrepareBaseStrategy::SevenZipSingleQcow2 => {
+                let (metadata, proof) = forge_images::prepare_kali_for_execute(
+                    &directories,
+                    &mut forge_images::SystemArtifactFetcher,
+                )
+                .map_err(|error| error.to_string())?;
+                (metadata.prepared_qcow2_path, Some(proof), None, None, None)
+            }
+            forge_profiles::PrepareBaseStrategy::WhonixBundleGateway => {
+                let (metadata, proof) = forge_images::prepare_whonix_gateway_for_execute(
+                    &directories,
+                    &mut forge_images::SystemArtifactFetcher,
+                )
+                .map_err(|error| error.to_string())?;
+                (metadata.prepared_qcow2_path, None, Some(proof), None, None)
+            }
+            forge_profiles::PrepareBaseStrategy::WhonixBundleWorkstation => {
+                let (metadata, proof) = forge_images::prepare_whonix_workstation_for_execute(
+                    &directories,
+                    &mut forge_images::SystemArtifactFetcher,
+                )
+                .map_err(|error| error.to_string())?;
+                (metadata.prepared_qcow2_path, None, None, Some(proof), None)
+            }
+            forge_profiles::PrepareBaseStrategy::VerifiedQcow2 => {
+                return Err("verified direct-qcow2 real create is not implemented".to_owned());
+            }
+            forge_profiles::PrepareBaseStrategy::PromotedFedoraWorkstationCanonical => {
+                let proof = resolve_promoted_workstation_base()?;
+                (proof.volume.path.clone(), None, None, None, Some(proof))
+            }
+        };
+    let (file_bytes, capacity_bytes) = if let Some(proof) = &promoted_workstation {
+        (proof.canonical_streamed_bytes, proof.volume.capacity_bytes)
+    } else {
+        (
+            std::fs::metadata(&path)
+                .map_err(|error| error.to_string())?
+                .len(),
+            forge_images::qcow2_virtual_size(&path).map_err(|error| error.to_string())?,
+        )
     };
-    let file_bytes = std::fs::metadata(&path)
-        .map_err(|error| error.to_string())?
-        .len();
-    let capacity_bytes =
-        forge_images::qcow2_virtual_size(&path).map_err(|error| error.to_string())?;
     let artifact = PreparedBaseArtifact {
         path,
         file_bytes,
         capacity_bytes,
         kali_proof,
+        whonix_gateway_proof,
         whonix_workstation_proof,
+        promoted_workstation,
     };
     eprintln!(
         "[forge] phase done: prepared-base cryptographic validation elapsed={:.1}s",
@@ -5529,37 +6737,51 @@ fn verified_prepared_base_read_only(
 ) -> Result<PreparedBaseArtifact, String> {
     let directories = forge_images::default_directories()
         .ok_or_else(|| "Forge image directories are unavailable".to_owned())?;
-    let path = match validate_preparation_strategy(plan)? {
-        forge_profiles::PrepareBaseStrategy::SevenZipSingleQcow2 => {
+    let (path, promoted_workstation) = match validate_preparation_strategy(plan)? {
+        forge_profiles::PrepareBaseStrategy::SevenZipSingleQcow2 => (
             forge_images::verified_kali(&directories)
                 .map_err(|error| error.to_string())?
-                .prepared_qcow2_path
-        }
-        forge_profiles::PrepareBaseStrategy::WhonixBundleGateway => {
+                .prepared_qcow2_path,
+            None,
+        ),
+        forge_profiles::PrepareBaseStrategy::WhonixBundleGateway => (
             forge_images::verified_whonix_gateway(&directories)
                 .map_err(|error| error.to_string())?
-                .prepared_qcow2_path
-        }
-        forge_profiles::PrepareBaseStrategy::WhonixBundleWorkstation => {
+                .prepared_qcow2_path,
+            None,
+        ),
+        forge_profiles::PrepareBaseStrategy::WhonixBundleWorkstation => (
             forge_images::verified_whonix_workstation(&directories)
                 .map_err(|error| error.to_string())?
-                .prepared_qcow2_path
-        }
+                .prepared_qcow2_path,
+            None,
+        ),
         forge_profiles::PrepareBaseStrategy::VerifiedQcow2 => {
             return Err("verified direct-qcow2 real create is not implemented".to_owned());
         }
+        forge_profiles::PrepareBaseStrategy::PromotedFedoraWorkstationCanonical => {
+            let proof = resolve_promoted_workstation_base()?;
+            (proof.volume.path.clone(), Some(proof))
+        }
     };
-    let file_bytes = std::fs::metadata(&path)
-        .map_err(|error| error.to_string())?
-        .len();
-    let capacity_bytes =
-        forge_images::qcow2_virtual_size(&path).map_err(|error| error.to_string())?;
+    let (file_bytes, capacity_bytes) = if let Some(proof) = &promoted_workstation {
+        (proof.canonical_streamed_bytes, proof.volume.capacity_bytes)
+    } else {
+        (
+            std::fs::metadata(&path)
+                .map_err(|error| error.to_string())?
+                .len(),
+            forge_images::qcow2_virtual_size(&path).map_err(|error| error.to_string())?,
+        )
+    };
     Ok(PreparedBaseArtifact {
         path,
         file_bytes,
         capacity_bytes,
         kali_proof: None,
+        whonix_gateway_proof: None,
         whonix_workstation_proof: None,
+        promoted_workstation,
     })
 }
 
@@ -5579,7 +6801,10 @@ fn prove_prepared_base(
                 .map(|_| ())
         }
         forge_profiles::PrepareBaseStrategy::WhonixBundleGateway => {
-            forge_images::verified_whonix_gateway(&directories).map(|_| ())
+            let proof = source.whonix_gateway_proof.as_ref().ok_or_else(|| {
+                "Gateway execute proof is absent after full validation".to_owned()
+            })?;
+            forge_images::revalidate_whonix_gateway_execute_proof(&directories, proof).map(|_| ())
         }
         forge_profiles::PrepareBaseStrategy::WhonixBundleWorkstation => {
             let proof = source.whonix_workstation_proof.as_ref().ok_or_else(|| {
@@ -5591,12 +6816,23 @@ fn prove_prepared_base(
         forge_profiles::PrepareBaseStrategy::VerifiedQcow2 => {
             return Err("verified direct-qcow2 real create is not implemented".to_owned());
         }
+        forge_profiles::PrepareBaseStrategy::PromotedFedoraWorkstationCanonical => {
+            let expected = source.promoted_workstation.as_ref().ok_or_else(|| {
+                "promoted Workstation proof is absent after full validation".to_owned()
+            })?;
+            let current = resolve_promoted_workstation_base()?;
+            if current != *expected {
+                return Err("promoted Workstation canonical drifted before create".to_owned());
+            }
+            Ok(())
+        }
     }
     .map_err(|error| error.to_string())
 }
 
 struct ManualGuestCreateBackend {
     storage: forge_libvirt::LibvirtDefineBackend,
+    boot: forge_libvirt::LibvirtBootBackend,
     instance: InstanceName,
     domain_uuid: String,
     source: PreparedBaseArtifact,
@@ -5605,6 +6841,123 @@ struct ManualGuestCreateBackend {
     base_created: bool,
     overlay_created: bool,
     clone_source: Option<CloneSourceProof>,
+}
+
+struct ManualGuestCreateConnections {
+    storage: forge_libvirt::LibvirtDefineBackend,
+    boot: forge_libvirt::LibvirtBootBackend,
+}
+
+fn establish_manual_guest_create_connections(
+    instance: &InstanceName,
+) -> Result<ManualGuestCreateConnections, String> {
+    eprintln!("[forge] Host authorization may be required before long-running verification.");
+    eprintln!("[forge] phase start: system libvirt authorization preflight");
+    let storage =
+        forge_libvirt::LibvirtDefineBackend::connect_local().map_err(|error| error.to_string())?;
+    let boot = forge_libvirt::LibvirtBootBackend::connect_instance(instance.clone())
+        .map_err(|error| error.to_string())?;
+    eprintln!("[forge] phase done: system libvirt authorization preflight");
+    Ok(ManualGuestCreateConnections { storage, boot })
+}
+
+fn authorize_before_prepared_base<A, T>(
+    authorize: impl FnOnce() -> Result<A, String>,
+    preflight: impl FnOnce(&mut A) -> Result<(), String>,
+    acquire: impl FnOnce() -> Result<T, String>,
+) -> Result<(A, T), String> {
+    let mut authorization = authorize()?;
+    preflight(&mut authorization)?;
+    let prepared_base = acquire()?;
+    Ok((authorization, prepared_base))
+}
+
+fn validate_execute_boundary_preconditions(
+    managed_state: &forge_state::ManagedState,
+    target_domain_exists: bool,
+    default_network_active: Option<bool>,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    if !matches!(managed_state, forge_state::ManagedState::Missing) {
+        let observed = match managed_state {
+            forge_state::ManagedState::Legacy(_) => "Legacy",
+            forge_state::ManagedState::Current(_) => "Current",
+            forge_state::ManagedState::InitialCreateRecoveryRequired(_) => {
+                "InitialCreateRecoveryRequired"
+            }
+            forge_state::ManagedState::Conflict(_) => "Conflict",
+            forge_state::ManagedState::Missing => unreachable!(),
+        };
+        failures.push(format!(
+            "managed state precondition: expected Missing, observed {observed}"
+        ));
+    }
+    if target_domain_exists {
+        failures.push("target domain precondition: expected absent, observed present".to_owned());
+    }
+    if default_network_active == Some(false) {
+        failures
+            .push("default network precondition: expected active, observed inactive".to_owned());
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "execute-boundary precondition refused: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+fn validate_manual_guest_create_target_preconditions(
+    storage: &mut forge_libvirt::LibvirtDefineBackend,
+    layout: &forge_state::StateLayout,
+    instance: &InstanceName,
+    network: &forge_core::NetworkPolicy,
+    overlay: &str,
+) -> Result<(), String> {
+    let managed_state = forge_state::inspect_layout(layout).map_err(|error| error.to_string())?;
+    let target_domain_exists =
+        forge_storage::DefineBackend::domain_exists(storage, instance.as_str())
+            .map_err(|error| error.to_string())?;
+    let default_network_active = if matches!(network, forge_core::NetworkPolicy::DefaultNat) {
+        Some(
+            storage
+                .default_network_active()
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    validate_execute_boundary_preconditions(
+        &managed_state,
+        target_domain_exists,
+        default_network_active,
+    )?;
+    if forge_storage::ImagePrepareBackend::inspect_volume(
+        storage,
+        forge_storage::DEFAULT_POOL,
+        overlay,
+    )
+    .map_err(|error| error.to_string())?
+    .is_some()
+    {
+        return Err(format!(
+            "target overlay precondition: expected absent, observed present: {overlay}"
+        ));
+    }
+    Ok(())
+}
+
+/// A completed delete tombstone retains exact historical evidence for the
+/// shared base, but its domain must never be re-observed as a live consumer.
+/// An in-progress delete remains live so a concurrent create fails closed
+/// rather than racing that transaction.
+fn shared_base_consumer_requires_live_reconciliation(index: &forge_state::GenerationIndex) -> bool {
+    !matches!(
+        index.delete_state,
+        Some(forge_state::DeleteState::Deleted(_))
+    )
 }
 
 fn existing_shared_base_proof(
@@ -5647,17 +7000,19 @@ fn existing_shared_base_proof(
         }) else {
             continue;
         };
-        let backend = forge_libvirt::LibvirtBootBackend::connect_instance(instance)
-            .map_err(|error| error.to_string())?;
-        let observed = backend
-            .inspect_managed_state(active)
-            .map_err(|error| error.to_string())?;
-        let reconciliation = forge_state::reconcile_managed(&index, &manifests, &observed);
-        if reconciliation.status != forge_state::ManagedReconciliationStatus::Consistent {
-            return Err(format!(
-                "shared base consumer {name} is not consistently reconciled: {}",
-                reconciliation.detail
-            ));
+        if shared_base_consumer_requires_live_reconciliation(&index) {
+            let backend = forge_libvirt::LibvirtBootBackend::connect_instance(instance)
+                .map_err(|error| error.to_string())?;
+            let observed = backend
+                .inspect_managed_state(active)
+                .map_err(|error| error.to_string())?;
+            let reconciliation = forge_state::reconcile_managed(&index, &manifests, &observed);
+            if reconciliation.status != forge_state::ManagedReconciliationStatus::Consistent {
+                return Err(format!(
+                    "shared base consumer {name} is not consistently reconciled: {}",
+                    reconciliation.detail
+                ));
+            }
         }
         if base.path != expected.path
             || base.format != expected.format
@@ -5700,6 +7055,39 @@ fn resolve_shared_base_dry_run(
         pool.target_path.trim_end_matches('/'),
         plan.prepared_base.base_volume_name
     );
+    if plan.prepared_base.preparation
+        == forge_profiles::PrepareBaseStrategy::PromotedFedoraWorkstationCanonical
+    {
+        let source = verified_prepared_base_read_only(&plan.prepared_base)?;
+        let existing = ImagePrepareBackend::inspect_volume(
+            &mut storage,
+            forge_storage::DEFAULT_POOL,
+            &plan.prepared_base.base_volume_name,
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "promoted Workstation canonical base is absent".to_owned())?;
+        let promoted = source
+            .promoted_workstation
+            .as_ref()
+            .ok_or_else(|| "promoted Workstation proof is absent".to_owned())?;
+        let expected = forge_storage::BaseImageVolume {
+            name: plan.prepared_base.base_volume_name.clone(),
+            path: path.clone(),
+            imported_bytes: promoted.canonical_streamed_bytes,
+            capacity_bytes: promoted.volume.capacity_bytes,
+            format: "qcow2".to_owned(),
+        };
+        let durable = promoted_workstation_shared_base_resource(promoted);
+        forge_storage::classify_shared_base(&expected, Some(&existing), Some(&durable))?;
+        return Ok(SharedBaseDryRunResolution {
+            disposition: forge_storage::SharedBaseDisposition::ReuseProven,
+            path,
+            proof_source: format!(
+                "durable Promoted Fedora Workstation preparation {}",
+                promoted.preparation_id.as_str()
+            ),
+        });
+    }
     let existing = ImagePrepareBackend::inspect_volume(
         &mut storage,
         forge_storage::DEFAULT_POOL,
@@ -5747,7 +7135,7 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
         &mut self,
         plan: &forge_storage::GenericCreateExecutionPlan,
     ) -> Result<forge_storage::SharedBaseDisposition, String> {
-        use forge_storage::{DefineBackend, ImagePrepareBackend};
+        use forge_storage::ImagePrepareBackend;
         let started = Instant::now();
         eprintln!("[forge] phase start: execute boundary revalidation");
         if let Some(planned) = &self.workstation_pair_snapshot {
@@ -5755,21 +7143,13 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
             forge_profiles::revalidate_whonix_snapshot(planned, &current)
                 .map_err(|error| error.to_string())?;
         }
-        if !matches!(
-            forge_state::inspect_layout(&self.layout).map_err(|error| error.to_string())?,
-            forge_state::ManagedState::Missing
-        ) || DefineBackend::domain_exists(&mut self.storage, self.instance.as_str())
-            .map_err(|error| error.to_string())?
-            || (matches!(
-                plan.factory.instance.network,
-                forge_core::NetworkPolicy::DefaultNat
-            ) && !self
-                .storage
-                .default_network_active()
-                .map_err(|error| error.to_string())?)
-        {
-            return Err("domain, state, or default network precondition changed".to_owned());
-        }
+        validate_manual_guest_create_target_preconditions(
+            &mut self.storage,
+            &self.layout,
+            &self.instance,
+            &plan.factory.instance.network,
+            &plan.factory.generation.overlay,
+        )?;
         let pool =
             ImagePrepareBackend::inspect_pool(&mut self.storage, forge_storage::DEFAULT_POOL)
                 .map_err(|error| error.to_string())?
@@ -5777,18 +7157,40 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
         if !pool.active || pool.available_bytes < plan.factory.instance.resources.disk_bytes {
             return Err("default pool is inactive or lacks required capacity".to_owned());
         }
-        if ImagePrepareBackend::inspect_volume(
-            &mut self.storage,
-            forge_storage::DEFAULT_POOL,
-            &plan.factory.generation.overlay,
-        )
-        .map_err(|error| error.to_string())?
-        .is_some()
-        {
-            return Err(format!(
-                "generation-owned overlay already exists: {}",
-                plan.factory.generation.overlay
-            ));
+        if let Some(promoted) = &self.source.promoted_workstation {
+            let current = resolve_promoted_workstation_base()?;
+            if current != *promoted {
+                return Err("promoted Workstation canonical drifted before create".to_owned());
+            }
+            let base = ImagePrepareBackend::inspect_volume(
+                &mut self.storage,
+                forge_storage::DEFAULT_POOL,
+                &plan.factory.prepared_base.base_volume_name,
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "promoted Workstation canonical base is absent".to_owned())?;
+            let pool =
+                ImagePrepareBackend::inspect_pool(&mut self.storage, forge_storage::DEFAULT_POOL)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "default pool is absent".to_owned())?;
+            let expected = forge_storage::BaseImageVolume {
+                name: plan.factory.prepared_base.base_volume_name.clone(),
+                path: format!(
+                    "{}/{}",
+                    pool.target_path.trim_end_matches('/'),
+                    plan.factory.prepared_base.base_volume_name
+                ),
+                imported_bytes: promoted.canonical_streamed_bytes,
+                capacity_bytes: promoted.volume.capacity_bytes,
+                format: "qcow2".to_owned(),
+            };
+            let durable = promoted_workstation_shared_base_resource(promoted);
+            let disposition =
+                forge_storage::classify_shared_base(&expected, Some(&base), Some(&durable))?;
+            if disposition != forge_storage::SharedBaseDisposition::ReuseProven {
+                return Err("promoted Workstation canonical base is not reusable".to_owned());
+            }
+            return Ok(disposition);
         }
         if let Some(source) = &self.clone_source {
             let backend = forge_libvirt::LibvirtBootBackend::connect_instance(
@@ -5908,6 +7310,11 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
                         forge_images::open_kali_prepared_base_execute_source(&directories, proof)
                             .map_err(|error| error.to_string())?,
                     )
+                } else if let Some(proof) = self.source.whonix_gateway_proof.as_ref() {
+                    Some(
+                        forge_images::open_whonix_gateway_execute_source(&directories, proof)
+                            .map_err(|error| error.to_string())?,
+                    )
                 } else {
                     self.source
                         .whonix_workstation_proof
@@ -5942,12 +7349,12 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
                 )
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "proven shared base disappeared before reuse".to_owned())?;
-                let durable = existing_shared_base_proof(&self.layout, &base.name, &existing)?;
-                forge_storage::classify_shared_base(
-                    &base,
-                    Some(&existing),
-                    Some(&durable.resource),
-                )?;
+                let durable = if let Some(promoted) = &self.source.promoted_workstation {
+                    promoted_workstation_shared_base_resource(promoted)
+                } else {
+                    existing_shared_base_proof(&self.layout, &base.name, &existing)?.resource
+                };
+                forge_storage::classify_shared_base(&base, Some(&existing), Some(&durable))?;
             }
         }
         let overlay = forge_storage::OverlayVolume {
@@ -6011,17 +7418,15 @@ impl forge_storage::GenericCreateBackend for ManualGuestCreateBackend {
         &mut self,
         plan: &forge_storage::GenericCreateExecutionPlan,
     ) -> Result<forge_state::ObservedGeneration, String> {
-        let backend = forge_libvirt::LibvirtBootBackend::connect_instance(self.instance.clone())
-            .map_err(|error| error.to_string())?;
         if self.clone_source.is_some() {
-            backend
+            self.boot
                 .inspect_generation_flat_overlay_only(&format!(
                     "/var/lib/libvirt/images/{}",
                     plan.factory.generation.overlay
                 ))
                 .map_err(|error| error.to_string())
         } else {
-            backend
+            self.boot
                 .inspect_generation_overlay_only(&format!(
                     "/var/lib/libvirt/images/{}",
                     plan.factory.generation.overlay
@@ -6079,10 +7484,25 @@ fn create_vm(profile_name: &str, instance_name: &str) -> ExitCode {
     }
     if !matches!(
         profile_name,
-        "kali-lab" | "whonix-gateway" | "whonix-workstation"
+        "kali-lab" | "fedora-workstation" | "whonix-gateway" | "whonix-workstation"
     ) {
         eprintln!("real generic create is unavailable for this profile's image strategy");
         return ExitCode::from(2);
+    }
+    let Some(profile) = forge_profiles::find(profile_name) else {
+        eprintln!("unknown VM profile: {profile_name}");
+        return ExitCode::from(2);
+    };
+    let instance = match InstanceName::new(instance_name) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("create refused: invalid instance name: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(error) = validate_whonix_canonical_instance(&profile, &instance) {
+        eprintln!("create refused: {error}");
+        return ExitCode::from(1);
     }
     eprint!("Create persistent ManualGuest {instance_name} from {profile_name}? [y/N] ");
     let mut answer = String::new();
@@ -6105,6 +7525,26 @@ fn create_vm(profile_name: &str, instance_name: &str) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn validate_whonix_canonical_instance(
+    profile: &forge_core::VmProfile,
+    instance: &InstanceName,
+) -> Result<(), String> {
+    let expected = match profile.kind {
+        forge_core::GuestProfileKind::WhonixGateway => Some("whonix-gateway"),
+        forge_core::GuestProfileKind::WhonixWorkstation => Some("whonix-workstation"),
+        _ => None,
+    };
+    if let Some(expected) = expected
+        && instance.as_str() != expected
+    {
+        return Err(format!(
+            "V2.5 built-in Whonix pairing requires canonical instance `{expected}` for profile `{}`; custom-named pairs require an explicit durable pair binding and are unsupported",
+            profile.id
+        ));
+    }
+    Ok(())
 }
 
 fn execute_manual_guest_create(
@@ -6131,6 +7571,24 @@ fn execute_manual_guest_create(
         .map_err(|error| error.to_string())?;
     let factory = forge_profiles::plan_create(instance_plan, generation)
         .map_err(|error| error.to_string())?;
+    let home = env::var_os("HOME").ok_or_else(|| "HOME is unavailable".to_owned())?;
+    let layout = forge_state::StateLayout::for_instance(
+        &forge_state::state_directory(std::path::Path::new(&home)),
+        &instance,
+    );
+    let (connections, source) = authorize_before_prepared_base(
+        || establish_manual_guest_create_connections(&instance),
+        |connections| {
+            validate_manual_guest_create_target_preconditions(
+                &mut connections.storage,
+                &layout,
+                &instance,
+                &factory.instance.network,
+                &factory.generation.overlay,
+            )
+        },
+        || acquire_prepared_base(&factory.prepared_base),
+    )?;
     let workstation_pair_snapshot =
         if profile.kind == forge_core::GuestProfileKind::WhonixWorkstation {
             let planned = workstation_pair_snapshot(&factory)?;
@@ -6143,7 +7601,6 @@ fn execute_manual_guest_create(
         } else {
             None
         };
-    let source = acquire_prepared_base(&factory.prepared_base)?;
     if source.capacity_bytes > factory.instance.resources.disk_bytes {
         return Err("prepared source capacity exceeds the profile disk policy".to_owned());
     }
@@ -6166,14 +7623,9 @@ fn execute_manual_guest_create(
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_secs();
-    let home = env::var_os("HOME").ok_or_else(|| "HOME is unavailable".to_owned())?;
-    let layout = forge_state::StateLayout::for_instance(
-        &forge_state::state_directory(std::path::Path::new(&home)),
-        &instance,
-    );
     let mut backend = ManualGuestCreateBackend {
-        storage: forge_libvirt::LibvirtDefineBackend::connect_local()
-            .map_err(|error| error.to_string())?,
+        storage: connections.storage,
+        boot: connections.boot,
         instance,
         domain_uuid,
         source,
@@ -6221,17 +7673,30 @@ fn print_usage() {
     eprintln!("  forge vm plan <profile> <instance>");
     eprintln!("  forge hypervisor info");
     eprintln!("  forge vm list");
-    eprintln!("  forge vm status fedora-lab");
+    eprintln!("  forge vm status <instance>");
     eprintln!("  forge vm create <profile> <instance> --dry-run");
+    eprintln!("  forge vm create <profile> <instance>");
     eprintln!("  forge vm clone <source-instance> <target-instance> [--dry-run]");
+    eprintln!("  forge vm fresh <instance> [--dry-run]");
+    eprintln!("  forge vm start <instance> [--dry-run]");
+    eprintln!("  forge vm shutdown <instance> [--dry-run]");
+    eprintln!("  forge vm stop <instance> --force [--dry-run]");
     eprintln!("  forge delete <instance> [--force]");
     eprintln!("  forge vm cleanup <instance> [--dry-run]");
     eprintln!("  forge state show fedora-lab");
-    eprintln!("  forge state reconcile fedora-lab");
-    eprintln!("  forge state recover fedora-lab [--dry-run]");
-    eprintln!("  forge vm rebuild <instance> --dry-run");
+    eprintln!("  forge state reconcile <instance>");
+    eprintln!("  forge state recover <instance> [--dry-run]");
+    eprintln!("  forge state adopt fedora-lab [--dry-run] (maintenance)");
+    eprintln!("  forge vm define fedora-lab [--dry-run] (legacy maintenance)");
+    eprintln!("  forge vm prepare fedora-lab [--dry-run] (legacy maintenance)");
+    eprintln!("  forge vm boot fedora-lab [--dry-run] (legacy maintenance)");
+    eprintln!("  forge vm rebuild <instance> --dry-run (maintenance)");
+    eprintln!("  forge vm rebuild fedora-lab [--managed] [--dry-run] (legacy maintenance)");
+    eprintln!("  forge domain render <profile> (diagnostic)");
     eprintln!("  forge image list");
     eprintln!("  forge image inspect fedora");
+    eprintln!("  forge image inspect kali");
+    eprintln!("  forge image fetch kali");
     eprintln!("  forge image inspect fedora-workstation");
     eprintln!("  forge image fetch fedora-workstation");
     eprintln!("  forge image prepare fedora-workstation --dry-run");
@@ -6239,15 +7704,33 @@ fn print_usage() {
     eprintln!("  forge image prepare-status fedora-workstation");
     eprintln!("  forge image prepare-start fedora-workstation");
     eprintln!("  forge image prepare-continue fedora-workstation");
+    eprintln!("  forge image prepare-confirm-installed fedora-workstation");
+    eprintln!("  forge image prepare-confirm-graphical fedora-workstation");
+    eprintln!("  forge image prepare-promote fedora-workstation");
+    eprintln!("  forge image abort fedora-workstation <preparation-id> (recovery)");
     eprintln!("  forge image recover whonix-workstation [--dry-run]");
     eprintln!(
         "Legacy Fedora Cloud/NoCloud is retired; compatibility inspection remains available."
     );
 }
 
-fn print_report(report: &DoctorReport) {
+fn doctor_host_status(state: HostState, storage_ready: bool) -> &'static str {
+    match state {
+        // Storage is an additional prerequisite, not evidence that an
+        // unsupported operating system is merely incomplete.
+        HostState::Unsupported => "Unsupported",
+        HostState::Incomplete => "Incomplete",
+        HostState::Ready if !storage_ready => "Incomplete",
+        HostState::Degraded if !storage_ready => "Incomplete",
+        HostState::Ready => "Ready",
+        HostState::Degraded => "Degraded",
+    }
+}
+
+fn print_report(report: &DoctorReport, storage_ready: bool) {
     let distro = &report.host.distribution;
-    println!("Host status: {}", report.state);
+    let host_status = doctor_host_status(report.state, storage_ready);
+    println!("Host status: {host_status}");
     println!(
         "Fedora: {} ({})",
         distro.name.as_deref().unwrap_or("unknown"),
@@ -6335,6 +7818,259 @@ mod tests {
             parse_delete_command(&["delete", "fedora-lab", "--force", "extra"]),
             None
         );
+    }
+
+    #[test]
+    fn help_request_is_a_successful_public_entrypoint() {
+        assert!(is_help_request(&["--help"]));
+        assert!(is_help_request(&["-h"]));
+        assert!(!is_help_request(&[]));
+        assert!(!is_help_request(&["--help", "extra"]));
+    }
+
+    #[test]
+    fn unsupported_doctor_state_is_never_masked_by_storage_readiness() {
+        assert_eq!(
+            doctor_host_status(HostState::Unsupported, false),
+            "Unsupported"
+        );
+        assert_eq!(
+            doctor_host_status(HostState::Unsupported, true),
+            "Unsupported"
+        );
+        assert_eq!(doctor_host_status(HostState::Ready, false), "Incomplete");
+    }
+
+    #[test]
+    fn inventory_labels_recorded_verification_without_claiming_a_fresh_proof() {
+        assert_eq!(
+            recorded_inventory_fields(Ok(forge_images::RecordedPreparationState::RecordedVerified)),
+            (
+                "RecordedVerified",
+                "durable recorded verification; not freshly reverified",
+                "prepared artifact".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn inventory_reports_a_complete_promoted_workstation_as_prepared() {
+        assert_eq!(
+            workstation_inventory_generation_from_evidence(
+                forge_images::FedoraWorkstationPreparationStatus::Promoted,
+                true,
+                true,
+                true,
+            ),
+            "promoted canonical base (durable evidence)"
+        );
+    }
+
+    #[test]
+    fn kali_inspect_refuses_untrusted_or_interrupted_states() {
+        assert_eq!(
+            kali_inspect_exit_code(&forge_images::KaliPreparationState::Missing),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            kali_inspect_exit_code(&forge_images::KaliPreparationState::Preparing),
+            ExitCode::SUCCESS
+        );
+        for state in [
+            forge_images::KaliPreparationState::InterruptedPreparation,
+            forge_images::KaliPreparationState::OrphanedPreparedImage,
+            forge_images::KaliPreparationState::Conflict("drift".to_owned()),
+        ] {
+            assert_ne!(kali_inspect_exit_code(&state), ExitCode::SUCCESS);
+        }
+    }
+
+    #[test]
+    fn authorization_preflight_precedes_prepared_base_and_failure_skips_it() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = authorize_before_prepared_base(
+            || {
+                events.borrow_mut().push("authorize");
+                Ok::<_, String>(())
+            },
+            |_| {
+                events.borrow_mut().push("target-preflight");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("prepared-base-proof");
+                Ok::<_, String>(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            events.into_inner(),
+            vec!["authorize", "target-preflight", "prepared-base-proof"]
+        );
+
+        let proof_started = std::cell::Cell::new(false);
+        let result = authorize_before_prepared_base(
+            || Err::<(), _>("host authorization refused".to_owned()),
+            |_| Ok(()),
+            || {
+                proof_started.set(true);
+                Ok::<_, String>(())
+            },
+        );
+        assert_eq!(result.unwrap_err(), "host authorization refused");
+        assert!(!proof_started.get());
+
+        let proof_started = std::cell::Cell::new(false);
+        let result = authorize_before_prepared_base(
+            || Ok::<_, String>(()),
+            |_| Err("target preflight refused".to_owned()),
+            || {
+                proof_started.set(true);
+                Ok::<_, String>(())
+            },
+        );
+        assert_eq!(result.unwrap_err(), "target preflight refused");
+        assert!(!proof_started.get());
+    }
+
+    #[test]
+    fn execute_boundary_preconditions_are_exact_and_fail_closed() {
+        assert!(
+            validate_execute_boundary_preconditions(
+                &forge_state::ManagedState::Missing,
+                false,
+                None,
+            )
+            .is_ok()
+        );
+
+        let current = forge_state::ManagedState::Current(forge_state::GenerationIndex {
+            schema_version: forge_state::INDEX_SCHEMA_VERSION,
+            domain_name: "whonix-gateway".to_owned(),
+            domain_uuid: "uuid".to_owned(),
+            active_generation_id: "gen-existing".to_owned(),
+            generations: vec![forge_state::GenerationEntry {
+                generation_id: "gen-existing".to_owned(),
+                status: forge_state::GenerationStatus::Active,
+                manifest_file: "generations/gen-existing.json".to_owned(),
+            }],
+            cleanup_progress: vec![],
+            delete_state: None,
+        });
+        assert_eq!(
+            validate_execute_boundary_preconditions(&current, false, None).unwrap_err(),
+            "execute-boundary precondition refused: managed state precondition: expected Missing, observed Current"
+        );
+        assert_eq!(
+            validate_execute_boundary_preconditions(
+                &forge_state::ManagedState::Missing,
+                true,
+                None,
+            )
+            .unwrap_err(),
+            "execute-boundary precondition refused: target domain precondition: expected absent, observed present"
+        );
+        assert_eq!(
+            validate_execute_boundary_preconditions(
+                &forge_state::ManagedState::Missing,
+                false,
+                Some(false),
+            )
+            .unwrap_err(),
+            "execute-boundary precondition refused: default network precondition: expected active, observed inactive"
+        );
+    }
+
+    #[test]
+    fn deleted_historical_gateway_proves_shared_base_without_live_domain_lookup() {
+        let root = std::env::temp_dir().join(format!(
+            "forge-deleted-gateway-shared-base-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let old_instance = InstanceName::new("whonix-gw-test").unwrap();
+        let old_layout = forge_state::StateLayout::for_instance(&root, &old_instance);
+        let generation_id = "gen-deleted-gateway".to_owned();
+        let base = forge_state::ManagedResource {
+            role: forge_state::ResourceRole::SharedBase,
+            volume_name: "forge-base-whonix-gateway.qcow2".to_owned(),
+            volume_key: "/pool/forge-base-whonix-gateway.qcow2".to_owned(),
+            path: "/pool/forge-base-whonix-gateway.qcow2".to_owned(),
+            format: "qcow2".to_owned(),
+            capacity_bytes: 100,
+            backing_path: None,
+        };
+        let overlay = forge_state::ManagedResource {
+            role: forge_state::ResourceRole::WritableOverlay,
+            volume_name: "whonix-gw-test-overlay.qcow2".to_owned(),
+            volume_key: "/pool/whonix-gw-test-overlay.qcow2".to_owned(),
+            path: "/pool/whonix-gw-test-overlay.qcow2".to_owned(),
+            format: "qcow2".to_owned(),
+            capacity_bytes: 100,
+            backing_path: Some(base.path.clone()),
+        };
+        let manifest = forge_state::GenerationManifest {
+            schema_version: forge_state::SCHEMA_VERSION,
+            domain_name: old_instance.to_string(),
+            domain_uuid: "deleted-gateway-uuid".to_owned(),
+            generation_id: generation_id.clone(),
+            created_unix_seconds: 1,
+            libvirt_uri: "qemu:///system".to_owned(),
+            storage_pool_name: "default".to_owned(),
+            storage_pool_uuid: "pool-uuid".to_owned(),
+            status: forge_state::GenerationStatus::Preparing,
+            resources: vec![base.clone(), overlay.clone()],
+            fresh_domain_evidence: None,
+        };
+        forge_state::publish_initial_preparing(&old_layout, &manifest).unwrap();
+        let index = forge_state::GenerationIndex {
+            schema_version: forge_state::INDEX_SCHEMA_VERSION,
+            domain_name: "whonix-gw-test".to_owned(),
+            domain_uuid: "deleted-gateway-uuid".to_owned(),
+            active_generation_id: generation_id.clone(),
+            generations: vec![forge_state::GenerationEntry {
+                generation_id: generation_id.clone(),
+                status: forge_state::GenerationStatus::Active,
+                manifest_file: "generations/gen-deleted-gateway.json".to_owned(),
+            }],
+            cleanup_progress: vec![],
+            delete_state: Some(forge_state::DeleteState::Deleted(
+                forge_state::DeleteTombstone {
+                    plan: forge_state::DeletePlan {
+                        domain_name: "whonix-gw-test".to_owned(),
+                        domain_uuid: "deleted-gateway-uuid".to_owned(),
+                        storage_pool_name: "default".to_owned(),
+                        storage_pool_uuid: "pool-uuid".to_owned(),
+                        generation_id: generation_id.clone(),
+                        resources: vec![forge_state::DeleteResourcePlan {
+                            generation_id: generation_id.clone(),
+                            resource: overlay,
+                        }],
+                    },
+                },
+            )),
+        };
+        forge_state::write_index_atomic(&old_layout.index, &index).unwrap();
+        assert!(!shared_base_consumer_requires_live_reconciliation(&index));
+        assert!(forge_state::require_normal_lifecycle(&index).is_err());
+
+        let target_layout = forge_state::StateLayout::for_instance(
+            &root,
+            &InstanceName::new("whonix-gateway").unwrap(),
+        );
+        let expected = forge_storage::OverlayVolume {
+            name: base.volume_name.clone(),
+            path: base.path.clone(),
+            capacity_bytes: base.capacity_bytes,
+            allocation_bytes: 0,
+            format: base.format.clone(),
+            backing_path: None,
+        };
+        let proof = existing_shared_base_proof(&target_layout, &base.volume_name, &expected)
+            .expect("deleted durable evidence must not require the absent historical domain");
+        assert_eq!(proof.consumer, "whonix-gw-test");
+        assert_eq!(proof.resource, base);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -6465,6 +8201,30 @@ mod tests {
     }
 
     #[test]
+    fn workstation_create_strategy_is_typed_and_not_legacy_fedora() {
+        let profile = forge_profiles::fedora_workstation();
+        assert!(matches!(
+            profile.image_source,
+            ImageSourcePolicy::PromotedFedoraWorkstation { .. }
+        ));
+        assert!(!matches!(
+            profile.image_source,
+            ImageSourcePolicy::FedoraCloudBase { .. }
+        ));
+        let plan = forge_profiles::PreparedBaseImagePlan {
+            source: profile.image_source,
+            verification: profile.image_verification,
+            source_format: SourceImageFormat::Qcow2,
+            preparation: PrepareBaseStrategy::PromotedFedoraWorkstationCanonical,
+            base_volume_name: "forge-base-fedora-workstation-44-1.7.qcow2".to_owned(),
+        };
+        assert_eq!(
+            validate_preparation_strategy(&plan).unwrap(),
+            PrepareBaseStrategy::PromotedFedoraWorkstationCanonical
+        );
+    }
+
+    #[test]
     fn incoherent_or_unsupported_real_create_strategy_is_refused() {
         let mismatched = prepared_plan(
             ImageSourcePolicy::WhonixLibvirtBundle {
@@ -6499,6 +8259,304 @@ mod tests {
         assert!(operator_qemu_img_check_answer("CHECKED\n"));
         assert!(!operator_qemu_img_check_answer("yes\n"));
         assert!(!operator_qemu_img_check_answer("CHECKED extra\n"));
+    }
+
+    #[test]
+    fn workstation_status_guidance_follows_the_durable_stage() {
+        use forge_images::FedoraWorkstationPreparationStatus as Status;
+
+        assert_eq!(
+            workstation_preparation_next_action(Status::InstallerReady),
+            "If installation was performed manually or outside Forge and the VM is shut off, run: forge image prepare-confirm-installed fedora-workstation"
+        );
+        assert_eq!(
+            workstation_preparation_next_action(Status::InstallerRunning),
+            "Complete graphical Anaconda, shut down the VM, then run: forge image prepare-continue fedora-workstation"
+        );
+        assert!(
+            workstation_preparation_next_action(Status::AwaitingGraphicalBootConfirmation)
+                .contains("prepare-confirm-graphical")
+        );
+    }
+
+    #[test]
+    fn disk_only_prepared_output_never_claims_the_domain_is_running() {
+        assert_eq!(
+            installed_disk_boot_message(
+                forge_images::InstalledDiskBootDisposition::DiskOnlyPrepared
+            ),
+            "Installed system: disk-only topology prepared; domain not started"
+        );
+        assert!(
+            installed_disk_boot_message(forge_images::InstalledDiskBootDisposition::Started)
+                .contains("running")
+        );
+    }
+
+    #[test]
+    fn workstation_status_routes_only_known_running_boundaries_to_running_proof() {
+        use forge_images::FedoraWorkstationPreparationStatus as Status;
+
+        for status in [
+            Status::InstalledDiskBooting,
+            Status::AwaitingGraphicalBootConfirmation,
+            Status::InstalledSystemProven,
+            Status::NormalizationPlanned,
+            Status::NormalizationRunning,
+            Status::NormalizationGuestComplete,
+        ] {
+            assert!(workstation_status_expects_running_domain(status));
+        }
+        assert!(!workstation_status_expects_running_domain(
+            Status::InstalledDiskBootPending
+        ));
+        assert!(!workstation_status_expects_running_domain(
+            Status::OfflineProofPending
+        ));
+        assert!(!workstation_status_expects_running_domain(
+            Status::ShutdownPending
+        ));
+    }
+
+    fn promoted_workstation_status_fixture() -> (
+        forge_images::FedoraWorkstationPreparationId,
+        forge_images::CanonicalWorkstationBasePlan,
+        forge_images::HostOnlyPromotionEvidence,
+        forge_images::HostOnlyCanonicalEvidence,
+        forge_images::PreparationVolumeEvidence,
+        forge_images::Qcow2VolumeProof,
+    ) {
+        let preparation_id = forge_images::FedoraWorkstationPreparationId::new("a1b2c3d4")
+            .expect("fixture preparation ID");
+        let canonical_plan = forge_images::CanonicalWorkstationBasePlan {
+            volume_name: "forge-base-fedora-workstation.qcow2".to_owned(),
+            path: "/var/lib/libvirt/images/forge-base-fedora-workstation.qcow2".into(),
+            format: "qcow2".to_owned(),
+            capacity_bytes: 80,
+            backing_path: None,
+            role: forge_images::FedoraWorkstationArtifactRole::CanonicalSharedBase,
+            logical_read_only: true,
+            direct_writable_attachment_allowed: false,
+        };
+        let promotion = forge_images::HostOnlyPromotionEvidence {
+            preparation_id: preparation_id.clone(),
+            staging_volume_name: "forge-stage.qcow2".to_owned(),
+            staging_volume_key: "/var/lib/libvirt/images/forge-stage.qcow2".to_owned(),
+            staging_path: "/var/lib/libvirt/images/forge-stage.qcow2".into(),
+            staging_format: "qcow2".to_owned(),
+            staging_capacity_bytes: 80,
+            staging_allocation_bytes: 20,
+            staging_streamed_bytes: 24,
+            staging_sha256: "a".repeat(64),
+            domain_name: "forge-prepare".to_owned(),
+            domain_uuid: "domain-uuid".to_owned(),
+            disk_only_topology_xml_sha256: "b".repeat(64),
+            domain_shutoff: true,
+            qemu_img_check_attested: true,
+        };
+        let canonical = forge_images::HostOnlyCanonicalEvidence {
+            staging_sha256: promotion.staging_sha256.clone(),
+            staging_streamed_bytes: promotion.staging_streamed_bytes,
+            canonical_volume_name: canonical_plan.volume_name.clone(),
+            canonical_volume_key: canonical_plan.path.to_string_lossy().into_owned(),
+            canonical_path: canonical_plan.path.clone(),
+            canonical_format: "qcow2".to_owned(),
+            canonical_capacity_bytes: canonical_plan.capacity_bytes,
+            canonical_allocation_bytes: 18,
+            canonical_streamed_bytes: 22,
+            canonical_sha256: "c".repeat(64),
+        };
+        let volume = forge_images::PreparationVolumeEvidence {
+            name: canonical.canonical_volume_name.clone(),
+            key: canonical.canonical_volume_key.clone(),
+            path: canonical.canonical_path.clone(),
+            format: canonical.canonical_format.clone(),
+            capacity_bytes: canonical.canonical_capacity_bytes,
+            allocation_bytes: canonical.canonical_allocation_bytes,
+            backing_path: None,
+        };
+        let proof = forge_images::Qcow2VolumeProof {
+            volume: volume.clone(),
+            streamed_bytes: canonical.canonical_streamed_bytes,
+            sha256: canonical.canonical_sha256.clone(),
+        };
+        (
+            preparation_id,
+            canonical_plan,
+            promotion,
+            canonical,
+            volume,
+            proof,
+        )
+    }
+
+    #[test]
+    fn promoted_status_accepts_exact_canonical_and_retired_preparation_resources() {
+        let (id, plan, promotion, canonical, volume, proof) = promoted_workstation_status_fixture();
+        assert!(
+            prove_promoted_workstation_status(
+                &id,
+                &plan,
+                Some(&promotion),
+                Some(&canonical),
+                &volume,
+                &proof,
+                true,
+                false,
+                false,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn promoted_status_refuses_canonical_identity_or_representation_drift() {
+        let (id, plan, promotion, canonical, volume, mut proof) =
+            promoted_workstation_status_fixture();
+        proof.sha256 = "d".repeat(64);
+        assert!(
+            prove_promoted_workstation_status(
+                &id,
+                &plan,
+                Some(&promotion),
+                Some(&canonical),
+                &volume,
+                &proof,
+                true,
+                false,
+                false,
+            )
+            .is_err()
+        );
+
+        let (_, _, _, _, mut drifted_volume, proof) = promoted_workstation_status_fixture();
+        drifted_volume.backing_path = Some("/unexpected/backing.qcow2".into());
+        assert!(
+            prove_promoted_workstation_status(
+                &id,
+                &plan,
+                Some(&promotion),
+                Some(&canonical),
+                &drifted_volume,
+                &proof,
+                true,
+                false,
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn promoted_status_refuses_stream_length_or_cleanup_drift() {
+        let (id, plan, promotion, canonical, volume, mut proof) =
+            promoted_workstation_status_fixture();
+        proof.streamed_bytes += 1;
+        assert!(
+            prove_promoted_workstation_status(
+                &id,
+                &plan,
+                Some(&promotion),
+                Some(&canonical),
+                &volume,
+                &proof,
+                true,
+                false,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            prove_promoted_workstation_status(
+                &id,
+                &plan,
+                Some(&promotion),
+                Some(&canonical),
+                &volume,
+                &proof,
+                true,
+                true,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            prove_promoted_workstation_status(
+                &id,
+                &plan,
+                Some(&promotion),
+                Some(&canonical),
+                &volume,
+                &proof,
+                true,
+                false,
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn promoted_status_refuses_each_canonical_identity_and_protection_drift() {
+        let (id, plan, promotion, canonical, volume, proof) = promoted_workstation_status_fixture();
+        let mut cases = Vec::new();
+
+        let mut name = volume.clone();
+        name.name = "foreign.qcow2".to_owned();
+        cases.push(name);
+        let mut key = volume.clone();
+        key.key = "/var/lib/libvirt/images/foreign.qcow2".to_owned();
+        cases.push(key);
+        let mut path = volume.clone();
+        path.path = "/var/lib/libvirt/images/foreign.qcow2".into();
+        cases.push(path);
+        let mut format = volume.clone();
+        format.format = "raw".to_owned();
+        cases.push(format);
+        let mut capacity = volume.clone();
+        capacity.capacity_bytes += 1;
+        cases.push(capacity);
+
+        for drifted in cases {
+            assert!(
+                prove_promoted_workstation_status(
+                    &id,
+                    &plan,
+                    Some(&promotion),
+                    Some(&canonical),
+                    &drifted,
+                    &proof,
+                    true,
+                    false,
+                    false,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            prove_promoted_workstation_status(
+                &id,
+                &plan,
+                Some(&promotion),
+                Some(&canonical),
+                &volume,
+                &proof,
+                false,
+                false,
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn promoted_status_requires_a_canonical_volume_without_mutating_resources() {
+        assert!(require_promoted_canonical_volume(None).is_err());
+        let (_, _, _, _, volume, _) = promoted_workstation_status_fixture();
+        assert_eq!(
+            require_promoted_canonical_volume(Some(volume.clone())).unwrap(),
+            volume
+        );
     }
 
     #[test]
@@ -6578,5 +8636,63 @@ mod tests {
         assert!(!clone_profile_supported(
             &forge_profiles::find("whonix-gateway").unwrap()
         ));
+    }
+
+    #[test]
+    fn workstation_abort_never_removes_a_foreign_active_pointer() {
+        let root = std::env::temp_dir().join(format!(
+            "forge-workstation-abort-pointer-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let state = root.join("fedora-workstation-44-1.7.json");
+        let foreign = root.join("fedora-workstation-44-1.7-other.json");
+        std::fs::write(&state, "state").unwrap();
+        std::fs::write(&foreign, "foreign").unwrap();
+        let pointer = root.join("fedora-workstation-44-1.7.active");
+        std::fs::write(&pointer, format!("{}\n", foreign.display())).unwrap();
+        assert!(validate_workstation_active_pointer(&state).is_err());
+        retire_workstation_preparation_state(&state).unwrap();
+        assert!(!state.exists());
+        assert_eq!(
+            std::fs::read_to_string(&pointer).unwrap(),
+            format!("{}\n", foreign.display())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn built_in_whonix_pair_rejects_noncanonical_instance_names_before_mutation() {
+        let gateway = forge_profiles::whonix_gateway();
+        let workstation = forge_profiles::whonix_workstation();
+        assert!(
+            validate_whonix_canonical_instance(
+                &gateway,
+                &InstanceName::new("whonix-gw-test").unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_whonix_canonical_instance(
+                &workstation,
+                &InstanceName::new("whonix-ws-test").unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_whonix_canonical_instance(
+                &gateway,
+                &InstanceName::new("whonix-gateway").unwrap()
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_whonix_canonical_instance(
+                &workstation,
+                &InstanceName::new("whonix-workstation").unwrap()
+            )
+            .is_ok()
+        );
     }
 }
