@@ -23,11 +23,24 @@ For a simple first-use path, see
 technical and operator guidance, see
 [docs/FORGE_V2_5_USER_GUIDE.md](docs/FORGE_V2_5_USER_GUIDE.md).
 
-## Installation from source
+## Installation
 
-Forge V2.5 is distributed from source. On a Fedora host with Rust/Cargo and
-the required virtualization stack installed, clone the repository and build the
-release binary:
+Forge V2.5.0 is available as a local-install RPM or from source. For the RPM
+path, build or download `forge-2.5.0-1.x86_64.rpm`, then install it by path:
+
+```bash
+sudo dnf install ./forge-2.5.0-1.x86_64.rpm
+forge --help
+forge doctor
+```
+
+There is no Fedora or COPR repository yet, so `sudo dnf install forge` is not
+a supported installation command. See
+[packaging/rpm/README.md](packaging/rpm/README.md) to build the RPM and for
+the package boundary.
+
+To build from source instead, use a Fedora host with Rust/Cargo and the
+required virtualization stack installed:
 
 ```bash
 git clone https://github.com/gogu-glogowski/Forge-v2.git
