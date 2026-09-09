@@ -82,6 +82,7 @@ dependencies = [
  "forge-provisioning",
  "forge-state",
  "forge-storage",
+ "sha2",
 ]
 
 [[package]]
@@ -140,6 +141,7 @@ dependencies = [
  "forge-storage",
  "serde",
  "serde_json",
+ "sha2",
  "virt",
 ]
 

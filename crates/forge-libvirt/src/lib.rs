@@ -2,6 +2,7 @@
 
 use forge_core::{DomainSummary, HostCapabilities, LibvirtInfo, VmState};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
@@ -17,6 +18,7 @@ use virt::stream::Stream;
 use virt::sys;
 
 pub const LOCAL_QEMU_URI: &str = "qemu:///system";
+const CLONE_CREATE_FLAGS: u32 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibvirtError {
@@ -155,6 +157,149 @@ pub fn sorted_domains(mut domains: Vec<DomainSummary>) -> Vec<DomainSummary> {
     domains
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactDomainIdentity {
+    pub name: String,
+    pub uuid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainDeleteObservation {
+    ExactPresent {
+        identity: ExactDomainIdentity,
+        state: VmState,
+        persistent: bool,
+    },
+    Absent,
+    Conflict(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainDeleteError {
+    Conflict(String),
+    UnsafeState(String),
+    Backend(String),
+}
+
+impl fmt::Display for DomainDeleteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Conflict(reason) => write!(formatter, "domain identity conflict: {reason}"),
+            Self::UnsafeState(reason) => formatter.write_str(reason),
+            Self::Backend(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for DomainDeleteError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedVolumeDeleteError {
+    IdentityMismatch(String),
+    Referenced(String),
+    SharedBase,
+    Backend(String),
+}
+
+impl fmt::Display for ManagedVolumeDeleteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IdentityMismatch(reason) => {
+                write!(formatter, "managed volume identity mismatch: {reason}")
+            }
+            Self::Referenced(reason) => {
+                write!(formatter, "managed volume reference conflict: {reason}")
+            }
+            Self::SharedBase => formatter.write_str("shared base deletion is forbidden"),
+            Self::Backend(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for ManagedVolumeDeleteError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedVolumeAbsenceError {
+    Present(String),
+    Backend(String),
+}
+
+impl fmt::Display for ManagedVolumeAbsenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Present(reason) | Self::Backend(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for ManagedVolumeAbsenceError {}
+
+/// Applies the destructive undefine policy to a synthetic observation. The
+/// policy is kept separate from the libvirt adapter so it can be tested
+/// without touching a host domain.
+pub fn authorize_domain_undefine(
+    expected: &ExactDomainIdentity,
+    observed: &DomainDeleteObservation,
+) -> Result<(), DomainDeleteError> {
+    match observed {
+        DomainDeleteObservation::ExactPresent {
+            identity,
+            state,
+            persistent,
+        } if identity == expected && *persistent && *state == VmState::Shutoff => Ok(()),
+        DomainDeleteObservation::ExactPresent { state, .. } if *state != VmState::Shutoff => {
+            Err(DomainDeleteError::UnsafeState(
+                "domain undefine requires the exact domain to be shutoff".to_owned(),
+            ))
+        }
+        DomainDeleteObservation::ExactPresent {
+            persistent: false, ..
+        } => Err(DomainDeleteError::UnsafeState(
+            "domain undefine requires a persistent exact domain".to_owned(),
+        )),
+        DomainDeleteObservation::ExactPresent { .. } => Err(DomainDeleteError::Conflict(
+            "domain identity changed before undefine".to_owned(),
+        )),
+        DomainDeleteObservation::Absent => Err(DomainDeleteError::UnsafeState(
+            "exact domain is already absent".to_owned(),
+        )),
+        DomainDeleteObservation::Conflict(reason) => {
+            Err(DomainDeleteError::Conflict(reason.clone()))
+        }
+    }
+}
+
+/// Classifies a complete libvirt domain listing against one exact expected
+/// identity. Name-only or UUID-only matches are conflicts, never absence.
+#[must_use]
+pub fn classify_domain_delete_observation(
+    expected: &ExactDomainIdentity,
+    domains: &[DomainSummary],
+) -> DomainDeleteObservation {
+    let name_matches = domains
+        .iter()
+        .filter(|domain| domain.name == expected.name)
+        .collect::<Vec<_>>();
+    let uuid_matches = domains
+        .iter()
+        .filter(|domain| domain.uuid == expected.uuid)
+        .collect::<Vec<_>>();
+    if name_matches.len() == 1 && uuid_matches.len() == 1 && name_matches[0] == uuid_matches[0] {
+        let summary = name_matches[0];
+        return DomainDeleteObservation::ExactPresent {
+            identity: expected.clone(),
+            state: summary.state,
+            persistent: summary.persistent,
+        };
+    }
+    if !name_matches.is_empty() || !uuid_matches.is_empty() {
+        return DomainDeleteObservation::Conflict(
+            "domain name and UUID do not identify one exact domain".to_owned(),
+        );
+    }
+    DomainDeleteObservation::Absent
+}
+
 #[must_use]
 pub fn format_version(version: u32) -> String {
     let major = version / 1_000_000;
@@ -183,6 +328,97 @@ impl LibvirtDefineBackend {
             })
     }
 
+    /// Starts one explicitly named preparation domain after its caller has
+    /// completed the read-only identity/topology preflight.
+    ///
+    /// # Errors
+    /// Returns the libvirt lookup or start failure.
+    pub fn start_preparation_domain(&self, name: &str) -> Result<(), String> {
+        let domain =
+            Domain::lookup_by_name(&self.connection, name).map_err(|error| error.to_string())?;
+        domain
+            .create()
+            .map_err(|error| error.to_string())
+            .map(|_| ())
+    }
+
+    /// # Errors
+    /// Returns the libvirt lookup or state-query failure.
+    pub fn preparation_domain_running(&self, name: &str) -> Result<bool, String> {
+        let domain =
+            Domain::lookup_by_name(&self.connection, name).map_err(|error| error.to_string())?;
+        let (state, _) = domain.get_state().map_err(|error| error.to_string())?;
+        Ok(map_domain_state(state).map_err(|error| error.to_string())?
+            == forge_core::VmState::Running)
+    }
+
+    /// Observes a domain for a future exact deletion operation. Listing all
+    /// domains lets this distinguish absence from name or UUID reuse.
+    pub fn observe_domain_for_delete(
+        &self,
+        expected: &ExactDomainIdentity,
+    ) -> Result<DomainDeleteObservation, String> {
+        let domains = self
+            .connection
+            .list_all_domains(0)
+            .map_err(|error| error.to_string())?;
+        let summaries = domains
+            .iter()
+            .map(domain_summary)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(classify_domain_delete_observation(expected, &summaries))
+    }
+
+    /// Re-observes and undefines one exact stopped persistent domain, removing
+    /// only libvirt-managed NVRAM associated with that exact domain.
+    pub fn undefine_domain_exact(
+        &self,
+        expected: &ExactDomainIdentity,
+    ) -> Result<(), DomainDeleteError> {
+        let observed = self
+            .observe_domain_for_delete(expected)
+            .map_err(DomainDeleteError::Backend)?;
+        authorize_domain_undefine(expected, &observed)?;
+        let domain = Domain::lookup_by_uuid_string(&self.connection, &expected.uuid)
+            .map_err(|error| DomainDeleteError::Backend(error.to_string()))?;
+        let identity = ExactDomainIdentity {
+            name: domain
+                .get_name()
+                .map_err(|error| DomainDeleteError::Backend(error.to_string()))?,
+            uuid: domain
+                .get_uuid_string()
+                .map_err(|error| DomainDeleteError::Backend(error.to_string()))?,
+        };
+        let (raw_state, _) = domain
+            .get_state()
+            .map_err(|error| DomainDeleteError::Backend(error.to_string()))?;
+        let immediate = DomainDeleteObservation::ExactPresent {
+            identity,
+            state: map_domain_state(raw_state)
+                .map_err(|error| DomainDeleteError::Backend(error.to_string()))?,
+            persistent: domain
+                .is_persistent()
+                .map_err(|error| DomainDeleteError::Backend(error.to_string()))?,
+        };
+        authorize_domain_undefine(expected, &immediate)?;
+        domain
+            .undefine_flags(domain_undefine_flags())
+            .map_err(|error| DomainDeleteError::Backend(error.to_string()))?;
+        match self
+            .observe_domain_for_delete(expected)
+            .map_err(DomainDeleteError::Backend)?
+        {
+            DomainDeleteObservation::Absent => Ok(()),
+            DomainDeleteObservation::ExactPresent { .. } => Err(DomainDeleteError::UnsafeState(
+                "exact domain remains after undefine".to_owned(),
+            )),
+            DomainDeleteObservation::Conflict(reason) => Err(DomainDeleteError::Conflict(format!(
+                "domain identity changed after undefine: {reason}"
+            ))),
+        }
+    }
+
     fn pool(&self, name: &str) -> Result<StoragePool, forge_storage::StorageError> {
         StoragePool::lookup_by_name(&self.connection, name).map_err(storage_backend_error)
     }
@@ -191,11 +427,13 @@ impl LibvirtDefineBackend {
     ///
     /// # Errors
     /// Refuses missing backing, unavailable libvirt metadata, and referenced resources.
+    #[allow(clippy::too_many_lines)]
     pub fn inspect_preparing_generation(
         &self,
         instance: &forge_core::InstanceName,
         domain_uuid: &str,
         overlay_name: &str,
+        shared_base_name: Option<&str>,
     ) -> Result<forge_state::ObservedGeneration, forge_storage::ImagePrepareError> {
         let pool = self
             .pool(forge_storage::DEFAULT_POOL)
@@ -236,9 +474,78 @@ impl LibvirtDefineBackend {
             &volume_backings,
         )
         .map_err(|error| forge_storage::ImagePrepareError::Backend(error.to_string()))?;
-        let base_path = overlay.backing_path.clone().ok_or_else(|| {
-            forge_storage::ImagePrepareError::Backend("overlay has no backing path".to_owned())
-        })?;
+        let Some(base_path) = overlay.backing_path.clone() else {
+            let volume = StorageVol::lookup_by_path(&self.connection, &overlay.path)
+                .map_err(image_backend_error)?;
+            let mut resources = vec![forge_state::ObservedResource {
+                role: forge_state::ResourceRole::WritableOverlay,
+                volume_name: overlay.name,
+                volume_key: volume.get_key().map_err(image_backend_error)?,
+                path: overlay.path,
+                format: overlay.format.ok_or_else(|| {
+                    forge_storage::ImagePrepareError::Backend(
+                        "volume format unavailable".to_owned(),
+                    )
+                })?,
+                capacity_bytes: overlay.capacity_bytes.ok_or_else(|| {
+                    forge_storage::ImagePrepareError::Backend(
+                        "volume capacity unavailable".to_owned(),
+                    )
+                })?,
+                backing_path: None,
+                referenced_by_domains: overlay.referenced_by_domains,
+                backing_for_volumes: overlay.backing_for_volumes,
+            }];
+            if let Some(base_name) = shared_base_name {
+                let base = generation_volume_status(
+                    &pool,
+                    &pool_path,
+                    base_name,
+                    &domain_references,
+                    &volume_backings,
+                )
+                .map_err(|error| forge_storage::ImagePrepareError::Backend(error.to_string()))?;
+                if !base.exists {
+                    return Err(forge_storage::ImagePrepareError::Backend(
+                        "clone shared base is missing".to_owned(),
+                    ));
+                }
+                let base_volume = StorageVol::lookup_by_path(&self.connection, &base.path)
+                    .map_err(image_backend_error)?;
+                resources.insert(
+                    0,
+                    forge_state::ObservedResource {
+                        role: forge_state::ResourceRole::SharedBase,
+                        volume_name: base.name,
+                        volume_key: base_volume.get_key().map_err(image_backend_error)?,
+                        path: base.path,
+                        format: base.format.ok_or_else(|| {
+                            forge_storage::ImagePrepareError::Backend(
+                                "volume format unavailable".to_owned(),
+                            )
+                        })?,
+                        capacity_bytes: base.capacity_bytes.ok_or_else(|| {
+                            forge_storage::ImagePrepareError::Backend(
+                                "volume capacity unavailable".to_owned(),
+                            )
+                        })?,
+                        backing_path: base.backing_path,
+                        referenced_by_domains: base.referenced_by_domains,
+                        backing_for_volumes: base.backing_for_volumes,
+                    },
+                );
+            }
+            return Ok(forge_state::ObservedGeneration {
+                domain_name: instance.to_string(),
+                domain_uuid: domain_uuid.to_owned(),
+                domain_persistent: true,
+                libvirt_uri: self.connection.get_uri().map_err(image_backend_error)?,
+                storage_pool_name: forge_storage::DEFAULT_POOL.to_owned(),
+                storage_pool_uuid: pool.get_uuid_string().map_err(image_backend_error)?,
+                resources,
+                unmanaged_resources: Vec::new(),
+            });
+        };
         let base_name = std::path::Path::new(&base_path)
             .file_name()
             .and_then(|name| name.to_str())
@@ -306,6 +613,261 @@ impl LibvirtDefineBackend {
             .and_then(|network| network.is_active())
             .map_err(storage_backend_error)
     }
+
+    /// Creates a fully independent qcow2 containing the source disk's visible
+    /// state through the system libvirt storage driver. The resulting volume
+    /// has no backing store and is safe to retain when the source generation
+    /// is later rebuilt or cleaned up.
+    ///
+    /// # Errors
+    /// Refuses conversion failure and removes only the target volume created by
+    /// this call.
+    pub fn clone_flattened_volume(
+        &self,
+        pool_name: &str,
+        source_path: &str,
+        target_name: &str,
+        capacity_bytes: u64,
+    ) -> Result<forge_storage::VolumeInfo, String> {
+        let pool = self.pool(pool_name).map_err(|error| error.to_string())?;
+        let xml = clone_volume_xml(target_name, capacity_bytes);
+        let source = StorageVol::lookup_by_path(&self.connection, source_path)
+            .map_err(|error| format!("exact source volume lookup failed: {error}"))?;
+        // The filesystem storage backend accepts no create-from flags. XML
+        // validation is performed by Forge's typed destination and post-create
+        // identity checks below.
+        let volume = StorageVol::create_xml_from(&pool, &xml, &source, CLONE_CREATE_FLAGS)
+            .map_err(|error| error.to_string())?;
+        pool.refresh(0).map_err(|error| error.to_string())?;
+        let info = volume_info(&volume, target_name).map_err(|error| error.to_string())?;
+        let xml = volume.get_xml_desc(0).map_err(|error| error.to_string())?;
+        let format = xml_attribute(&xml, "format", "type");
+        let backing = backing_store_path(&xml);
+        if format.as_deref() != Some("qcow2")
+            || backing.is_some()
+            || info.capacity_bytes != capacity_bytes
+        {
+            let _ = volume.delete(0);
+            return Err("libvirt create-from produced a non-flat or mismatched target".to_owned());
+        }
+        Ok(info)
+    }
+
+    /// Creates an immutable canonical qcow2 from one exact preparation volume.
+    pub fn clone_protected_workstation_volume(
+        &self,
+        pool_name: &str,
+        source_path: &str,
+        target_name: &str,
+        capacity_bytes: u64,
+    ) -> Result<forge_storage::VolumeInfo, String> {
+        let pool = self.pool(pool_name).map_err(|error| error.to_string())?;
+        let source = StorageVol::lookup_by_path(&self.connection, source_path)
+            .map_err(|error| format!("exact source volume lookup failed: {error}"))?;
+        let xml = format!(
+            "<volume><name>{target_name}</name><capacity unit='bytes'>{capacity_bytes}</capacity><target><format type='qcow2'/><permissions><mode>0444</mode></permissions></target></volume>"
+        );
+        let volume = StorageVol::create_xml_from(&pool, &xml, &source, CLONE_CREATE_FLAGS)
+            .map_err(|error| error.to_string())?;
+        pool.refresh(0).map_err(|error| error.to_string())?;
+        let info = volume_info(&volume, target_name).map_err(|error| error.to_string())?;
+        let volume_xml = volume.get_xml_desc(0).map_err(|error| error.to_string())?;
+        if xml_attribute(&volume_xml, "format", "type").as_deref() != Some("qcow2")
+            || backing_store_path(&volume_xml).is_some()
+            || info.capacity_bytes != capacity_bytes
+        {
+            let _ = volume.delete(0);
+            return Err(
+                "canonical create-from produced a non-flat or mismatched target".to_owned(),
+            );
+        }
+        Ok(info)
+    }
+
+    /// Reads the persistent shutoff domain identity used by Fresh replacement/recovery.
+    ///
+    /// # Errors
+    /// Refuses missing domains, unreadable XML, unsupported state, or a missing primary disk.
+    pub fn inspect_stable_domain(
+        &self,
+        name: &str,
+    ) -> Result<(forge_storage::StableDomainEvidence, String), String> {
+        let domain = Domain::lookup_by_name(&self.connection, name).map_err(|e| e.to_string())?;
+        let persistent = domain.is_persistent().map_err(|e| e.to_string())?;
+        let (state, _) = domain.get_state().map_err(|e| e.to_string())?;
+        let xml = domain.get_xml_desc(0).map_err(|e| e.to_string())?;
+        let disk_path = domain_disk_path(&xml)
+            .ok_or_else(|| "persistent domain XML has no primary file disk".to_owned())?;
+        let topology =
+            persistent_topology(&xml, domain.get_autostart().map_err(|e| e.to_string())?)?;
+        let network_identity = topology.interfaces.first().map(|nic| nic.mac.clone());
+        Ok((
+            forge_storage::StableDomainEvidence {
+                name: domain.get_name().map_err(|e| e.to_string())?,
+                uuid: domain.get_uuid_string().map_err(|e| e.to_string())?,
+                persistent,
+                shutoff: map_domain_state(state).map_err(|e| e.to_string())?
+                    == forge_core::VmState::Shutoff,
+                disk_path,
+                network_identity,
+                topology,
+            },
+            xml,
+        ))
+    }
+}
+
+const fn domain_undefine_flags() -> sys::virDomainUndefineFlagsValues {
+    sys::VIR_DOMAIN_UNDEFINE_NVRAM
+}
+
+/// Produces a define-over-existing document by changing only the exact old disk source.
+///
+/// # Errors
+/// Refuses ambiguous/missing old paths and documents already containing the new path.
+pub fn replace_domain_disk(xml: &str, old_path: &str, new_path: &str) -> Result<String, String> {
+    let single = xml.matches(old_path).count();
+    if single != 1 || xml.contains(new_path) {
+        return Err("domain XML does not contain one exact replaceable old disk source".to_owned());
+    }
+    Ok(xml.replacen(old_path, new_path, 1))
+}
+
+fn xml_blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let start = format!("<{tag}");
+    let end = format!("</{tag}>");
+    let mut rest = xml;
+    let mut blocks = Vec::new();
+    while let Some(offset) = rest.find(&start) {
+        rest = &rest[offset..];
+        let Some(close) = rest.find(&end) else { break };
+        let length = close + end.len();
+        blocks.push(&rest[..length]);
+        rest = &rest[length..];
+    }
+    blocks
+}
+
+fn tag_text(xml: &str, tag: &str) -> Option<String> {
+    let after = &xml[xml.find(&format!("<{tag}"))?..];
+    let open = after.find('>')? + 1;
+    let close = after[open..].find(&format!("</{tag}>"))? + open;
+    Some(after[open..close].trim().to_owned())
+}
+
+fn source_identity(block: &str) -> String {
+    [
+        "file", "network", "bridge", "dev", "address", "path", "name", "type", "mode",
+    ]
+    .iter()
+    .filter_map(|key| xml_attribute(block, "source", key).map(|value| format!("{key}={value}")))
+    .collect::<Vec<_>>()
+    .join(";")
+}
+
+fn direct_child_kinds(xml: &str) -> Vec<String> {
+    let Some(open) = xml.find('>') else {
+        return Vec::new();
+    };
+    let mut rest = &xml[open + 1..];
+    let mut depth = 0usize;
+    let mut kinds = Vec::new();
+    while let Some(start) = rest.find('<') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('>') else { break };
+        let token = &rest[..end];
+        if token.starts_with('/') {
+            depth = depth.saturating_sub(1);
+        } else if !token.starts_with(['?', '!']) {
+            if depth == 0 {
+                kinds.push(
+                    token
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches('/')
+                        .to_owned(),
+                );
+            }
+            if !token.ends_with('/') {
+                depth += 1;
+            }
+        }
+        rest = &rest[end + 1..];
+    }
+    kinds.sort();
+    kinds
+}
+
+fn persistent_topology(
+    xml: &str,
+    autostart: bool,
+) -> Result<forge_storage::PersistentDomainTopology, String> {
+    let os = xml_blocks(xml, "os")
+        .into_iter()
+        .next()
+        .ok_or("domain XML has no os topology")?;
+    let machine = xml_attribute(os, "type", "machine").ok_or("domain XML has no machine type")?;
+    let vcpus = tag_text(xml, "vcpu")
+        .ok_or("domain XML has no vcpu")?
+        .parse()
+        .map_err(|_| "invalid vcpu")?;
+    let memory_kib = tag_text(xml, "memory")
+        .ok_or("domain XML has no memory")?
+        .parse()
+        .map_err(|_| "invalid memory")?;
+    let disks = xml_blocks(xml, "disk")
+        .into_iter()
+        .map(|block| forge_storage::PersistentDisk {
+            device: xml_attribute(block, "disk", "device").unwrap_or_default(),
+            kind: xml_attribute(block, "disk", "type").unwrap_or_default(),
+            driver: xml_attribute(block, "driver", "name").unwrap_or_default(),
+            format: xml_attribute(block, "driver", "type").unwrap_or_default(),
+            source: xml_attribute(block, "source", "file")
+                .unwrap_or_else(|| source_identity(block)),
+            target: xml_attribute(block, "target", "dev").unwrap_or_default(),
+            bus: xml_attribute(block, "target", "bus").unwrap_or_default(),
+            readonly: block.contains("<readonly"),
+        })
+        .collect();
+    let interfaces = xml_blocks(xml, "interface")
+        .into_iter()
+        .map(|block| forge_storage::PersistentInterface {
+            kind: xml_attribute(block, "interface", "type").unwrap_or_default(),
+            model: xml_attribute(block, "model", "type").unwrap_or_default(),
+            mac: xml_attribute(block, "mac", "address").unwrap_or_default(),
+            source: source_identity(block),
+            backend: xml_attribute(block, "backend", "type"),
+        })
+        .collect();
+    let devices = xml_blocks(xml, "devices").into_iter().next().unwrap_or("");
+    let device_kinds = direct_child_kinds(devices);
+    Ok(forge_storage::PersistentDomainTopology {
+        machine,
+        firmware_loader: tag_text(os, "loader"),
+        vcpus,
+        memory_kib,
+        disks,
+        interfaces,
+        graphics: xml_blocks(xml, "graphics")
+            .into_iter()
+            .map(|b| {
+                format!(
+                    "type={};{}",
+                    xml_attribute(b, "graphics", "type").unwrap_or_default(),
+                    source_identity(b)
+                )
+            })
+            .collect(),
+        qga_channels: xml_blocks(xml, "channel")
+            .into_iter()
+            .filter(|b| b.contains("org.qemu.guest_agent.0"))
+            .count(),
+        hostdevs: xml_blocks(devices, "hostdev").len(),
+        filesystems: xml_blocks(devices, "filesystem").len(),
+        device_kinds,
+        autostart,
+    })
 }
 
 impl forge_storage::DefineBackend for LibvirtDefineBackend {
@@ -313,10 +875,16 @@ impl forge_storage::DefineBackend for LibvirtDefineBackend {
         &mut self,
         name: &str,
     ) -> Result<Option<forge_storage::StoragePoolInfo>, forge_storage::StorageError> {
-        let pool = match StoragePool::lookup_by_name(&self.connection, name) {
-            Ok(pool) => pool,
-            Err(error) if error.code() == ErrorNumber::NoStoragePool => return Ok(None),
-            Err(error) => return Err(storage_backend_error(error)),
+        let pool = find_listed_resource_by_name(
+            self.connection
+                .list_all_storage_pools(0)
+                .map_err(storage_backend_error)?,
+            name,
+            StoragePool::get_name,
+        )
+        .map_err(storage_backend_error)?;
+        let Some(pool) = pool else {
+            return Ok(None);
         };
         let active = pool.is_active().map_err(storage_backend_error)?;
         let info = pool.get_info().map_err(storage_backend_error)?;
@@ -335,11 +903,15 @@ impl forge_storage::DefineBackend for LibvirtDefineBackend {
     }
 
     fn domain_exists(&mut self, name: &str) -> Result<bool, forge_storage::StorageError> {
-        match Domain::lookup_by_name(&self.connection, name) {
-            Ok(_) => Ok(true),
-            Err(error) if error.code() == ErrorNumber::NoDomain => Ok(false),
-            Err(error) => Err(storage_backend_error(error)),
-        }
+        Ok(find_listed_resource_by_name(
+            self.connection
+                .list_all_domains(0)
+                .map_err(storage_backend_error)?,
+            name,
+            Domain::get_name,
+        )
+        .map_err(storage_backend_error)?
+        .is_some())
     }
 
     fn volume_exists(
@@ -348,11 +920,13 @@ impl forge_storage::DefineBackend for LibvirtDefineBackend {
         name: &str,
     ) -> Result<bool, forge_storage::StorageError> {
         let pool = self.pool(pool)?;
-        match StorageVol::lookup_by_name(&pool, name) {
-            Ok(_) => Ok(true),
-            Err(error) if error.code() == ErrorNumber::NoStorageVolume => Ok(false),
-            Err(error) => Err(storage_backend_error(error)),
-        }
+        Ok(find_listed_resource_by_name(
+            pool.list_all_volumes(0).map_err(storage_backend_error)?,
+            name,
+            StorageVol::get_name,
+        )
+        .map_err(storage_backend_error)?
+        .is_some())
     }
 
     fn create_volume(
@@ -411,6 +985,285 @@ impl forge_storage::DefineBackend for LibvirtDefineBackend {
     }
 }
 
+impl forge_images::FedoraWorkstationPreparationBackend for LibvirtDefineBackend {
+    fn stream_installer_iso_digest(
+        &mut self,
+        pool: &str,
+        name: &str,
+        expected_bytes: u64,
+    ) -> Result<(forge_images::PreparationVolumeEvidence, u64, String), String> {
+        let pool_obj = self.pool(pool).map_err(|error| error.to_string())?;
+        let volume =
+            StorageVol::lookup_by_name(&pool_obj, name).map_err(|error| error.to_string())?;
+        let evidence = {
+            let info = volume.get_info().map_err(|error| error.to_string())?;
+            let xml = volume.get_xml_desc(0).map_err(|error| error.to_string())?;
+            forge_images::PreparationVolumeEvidence {
+                name: name.to_owned(),
+                key: volume.get_key().map_err(|error| error.to_string())?,
+                path: volume.get_path().map_err(|error| error.to_string())?.into(),
+                format: xml_attribute(&xml, "format", "type").unwrap_or_default(),
+                capacity_bytes: info.capacity,
+                allocation_bytes: info.allocation,
+                backing_path: backing_store_path(&xml).map(Into::into),
+            }
+        };
+        if evidence.capacity_bytes != expected_bytes || evidence.backing_path.is_some() {
+            return Err("runtime installer ISO storage identity mismatch".to_owned());
+        }
+        let stream = Stream::new(&self.connection, 0).map_err(|error| error.to_string())?;
+        volume
+            .download(&stream, 0, expected_bytes, 0)
+            .map_err(|error| error.to_string())?;
+        let mut hash = Sha256::new();
+        let mut bytes = 0u64;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let count = stream
+                .recv(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            bytes = bytes
+                .checked_add(count as u64)
+                .ok_or_else(|| "runtime ISO byte count overflow".to_owned())?;
+            hash.update(&buffer[..count]);
+            if bytes > expected_bytes {
+                return Err("runtime ISO stream exceeded expected size".to_owned());
+            }
+        }
+        stream.finish().map_err(|error| error.to_string())?;
+        Ok((evidence, bytes, format!("{:x}", hash.finalize())))
+    }
+
+    fn materialize_installer_iso(
+        &mut self,
+        pool: &str,
+        name: &str,
+        source_path: &std::path::Path,
+        source_bytes: u64,
+    ) -> Result<forge_images::PreparationVolumeEvidence, String> {
+        let pool_obj = self.pool(pool).map_err(|error| error.to_string())?;
+        if StorageVol::lookup_by_name(&pool_obj, name).is_ok() {
+            return Err("runtime installer ISO volume collision".to_owned());
+        }
+        let xml = format!(
+            "<volume><name>{name}</name><capacity unit='bytes'>{source_bytes}</capacity><target><format type='raw'/></target></volume>"
+        );
+        let volume =
+            StorageVol::create_xml(&pool_obj, &xml, 0).map_err(|error| error.to_string())?;
+        upload_file(
+            &self.connection,
+            &volume,
+            &source_path.to_string_lossy(),
+            source_bytes,
+        )
+        .map_err(|error| error.to_string())?;
+        let info = volume.get_info().map_err(|error| error.to_string())?;
+        let xml = volume.get_xml_desc(0).map_err(|error| error.to_string())?;
+        Ok(forge_images::PreparationVolumeEvidence {
+            name: name.to_owned(),
+            key: volume.get_key().map_err(|error| error.to_string())?,
+            path: volume.get_path().map_err(|error| error.to_string())?.into(),
+            format: xml_attribute(&xml, "format", "type").unwrap_or_default(),
+            capacity_bytes: info.capacity,
+            allocation_bytes: info.allocation,
+            backing_path: backing_store_path(&xml).map(Into::into),
+        })
+    }
+
+    fn inspect_pool(
+        &mut self,
+        name: &str,
+    ) -> Result<forge_images::PreparationPoolEvidence, String> {
+        let pool = self.pool(name).map_err(|error| error.to_string())?;
+        let active = pool.is_active().map_err(|error| error.to_string())?;
+        let xml = pool.get_xml_desc(0).map_err(|error| error.to_string())?;
+        let target = xml_element(&xml, "path")
+            .ok_or_else(|| "storage pool target path is absent".to_owned())?;
+        Ok(forge_images::PreparationPoolEvidence {
+            name: name.to_owned(),
+            active,
+            target_path: target.into(),
+        })
+    }
+
+    fn inspect_volume(
+        &mut self,
+        pool: &str,
+        name: &str,
+    ) -> Result<Option<forge_images::PreparationVolumeEvidence>, String> {
+        let pool = self.pool(pool).map_err(|error| error.to_string())?;
+        let volume = match StorageVol::lookup_by_name(&pool, name) {
+            Ok(volume) => volume,
+            Err(error) if error.code() == ErrorNumber::NoStorageVolume => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        let info = volume.get_info().map_err(|error| error.to_string())?;
+        let xml = volume.get_xml_desc(0).map_err(|error| error.to_string())?;
+        Ok(Some(forge_images::PreparationVolumeEvidence {
+            name: name.to_owned(),
+            key: volume.get_key().map_err(|error| error.to_string())?,
+            path: volume.get_path().map_err(|error| error.to_string())?.into(),
+            format: xml_attribute(&xml, "format", "type").unwrap_or_default(),
+            capacity_bytes: info.capacity,
+            allocation_bytes: info.allocation,
+            backing_path: backing_store_path(&xml).map(Into::into),
+        }))
+    }
+
+    fn create_staging_volume(
+        &mut self,
+        pool: &str,
+        name: &str,
+        capacity_bytes: u64,
+    ) -> Result<(), String> {
+        forge_storage::DefineBackend::create_volume(self, pool, name, capacity_bytes)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn inspect_installer_domain(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<forge_images::InstallerDomainEvidence>, String> {
+        let domain = match Domain::lookup_by_name(&self.connection, name) {
+            Ok(domain) => domain,
+            Err(error) if error.code() == ErrorNumber::NoDomain => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        let (state, _) = domain.get_state().map_err(|error| error.to_string())?;
+        let capabilities = self
+            .connection
+            .get_capabilities()
+            .map_err(|error| error.to_string())?;
+        let q35_alias_canonical = xml_blocks(&capabilities, "machine")
+            .into_iter()
+            .find(|block| tag_text(block, "machine").as_deref() == Some("q35"))
+            .and_then(|block| xml_attribute(block, "machine", "canonical"));
+        let mapped_state = map_domain_state(state).map_err(|error| error.to_string())?;
+        Ok(Some(forge_images::InstallerDomainEvidence {
+            name: domain.get_name().map_err(|error| error.to_string())?,
+            uuid: domain
+                .get_uuid_string()
+                .map_err(|error| error.to_string())?,
+            persistent: domain.is_persistent().map_err(|error| error.to_string())?,
+            shutoff: mapped_state == forge_core::VmState::Shutoff,
+            running: mapped_state == forge_core::VmState::Running,
+            autostart: domain.get_autostart().map_err(|error| error.to_string())?,
+            xml: domain.get_xml_desc(2).map_err(|error| error.to_string())?,
+            q35_alias_canonical,
+        }))
+    }
+
+    fn define_installer_domain(&mut self, xml: &str) -> Result<(), String> {
+        let domain =
+            Domain::define_xml(&self.connection, xml).map_err(|error| error.to_string())?;
+        domain
+            .set_autostart(false)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn start_installer_domain(&mut self, name: &str) -> Result<(), String> {
+        self.start_preparation_domain(name)
+    }
+
+    fn canonical_base_exists(&mut self, pool: &str, name: &str) -> Result<bool, String> {
+        forge_storage::DefineBackend::volume_exists(self, pool, name)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl LibvirtDefineBackend {
+    /// Proves that an exact canonical qcow2 volume retains the Forge read-only mode.
+    ///
+    /// # Errors
+    /// Refuses an absent or identity-drifted volume, a non-flat qcow2, or a mode other than
+    /// the canonical `0444` contract.
+    pub fn verify_exact_protected_qcow2_volume(
+        &self,
+        pool: &str,
+        expected: &forge_images::PreparationVolumeEvidence,
+    ) -> Result<(), String> {
+        let pool_obj = self.pool(pool).map_err(|error| error.to_string())?;
+        let volume = StorageVol::lookup_by_name(&pool_obj, &expected.name)
+            .map_err(|error| error.to_string())?;
+        let info = volume.get_info().map_err(|error| error.to_string())?;
+        let xml = volume.get_xml_desc(0).map_err(|error| error.to_string())?;
+        let observed = forge_images::PreparationVolumeEvidence {
+            name: volume.get_name().map_err(|error| error.to_string())?,
+            key: volume.get_key().map_err(|error| error.to_string())?,
+            path: volume.get_path().map_err(|error| error.to_string())?.into(),
+            format: xml_attribute(&xml, "format", "type").unwrap_or_default(),
+            capacity_bytes: info.capacity,
+            allocation_bytes: info.allocation,
+            backing_path: backing_store_path(&xml).map(Into::into),
+        };
+        if observed != *expected
+            || observed.format != "qcow2"
+            || observed.backing_path.is_some()
+            || xml_element(&xml, "mode").as_deref() != Some("0444")
+        {
+            return Err("exact canonical qcow2 protection or identity drift".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Proves one exact flat qcow2 volume by hashing its libvirt-delivered storage representation.
+    pub fn stream_exact_qcow2_volume(
+        &self,
+        pool: &str,
+        expected: &forge_images::PreparationVolumeEvidence,
+    ) -> Result<forge_images::Qcow2VolumeProof, String> {
+        let pool_obj = self.pool(pool).map_err(|error| error.to_string())?;
+        let volume = StorageVol::lookup_by_name(&pool_obj, &expected.name)
+            .map_err(|error| error.to_string())?;
+        let info = volume.get_info().map_err(|error| error.to_string())?;
+        let xml = volume.get_xml_desc(0).map_err(|error| error.to_string())?;
+        let observed = forge_images::PreparationVolumeEvidence {
+            name: volume.get_name().map_err(|error| error.to_string())?,
+            key: volume.get_key().map_err(|error| error.to_string())?,
+            path: volume.get_path().map_err(|error| error.to_string())?.into(),
+            format: xml_attribute(&xml, "format", "type").unwrap_or_default(),
+            capacity_bytes: info.capacity,
+            allocation_bytes: info.allocation,
+            backing_path: backing_store_path(&xml).map(Into::into),
+        };
+        if observed != *expected || observed.format != "qcow2" || observed.backing_path.is_some() {
+            return Err("exact qcow2 volume identity or shape drift".to_owned());
+        }
+        let stream = Stream::new(&self.connection, 0).map_err(|error| error.to_string())?;
+        // A zero length asks libvirt for the complete storage object, whose sparse
+        // representation length is independent from qcow2 virtual capacity.
+        volume
+            .download(&stream, 0, 0, 0)
+            .map_err(|error| error.to_string())?;
+        let mut hash = Sha256::new();
+        let mut streamed_bytes = 0u64;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let count = stream
+                .recv(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            streamed_bytes = streamed_bytes
+                .checked_add(count as u64)
+                .ok_or_else(|| "qcow2 stream byte count overflow".to_owned())?;
+            hash.update(&buffer[..count]);
+        }
+        stream.finish().map_err(|error| error.to_string())?;
+        Ok(forge_images::Qcow2VolumeProof {
+            volume: observed,
+            streamed_bytes,
+            sha256: format!("{:x}", hash.finalize()),
+        })
+    }
+}
+
 impl forge_storage::ImagePrepareBackend for LibvirtDefineBackend {
     fn inspect_pool(
         &mut self,
@@ -460,10 +1313,14 @@ impl forge_storage::ImagePrepareBackend for LibvirtDefineBackend {
         let pool = self
             .pool(pool)
             .map_err(forge_storage::ImagePrepareError::from)?;
-        let volume = match StorageVol::lookup_by_name(&pool, name) {
-            Ok(volume) => volume,
-            Err(error) if error.code() == ErrorNumber::NoStorageVolume => return Ok(None),
-            Err(error) => return Err(image_backend_error(error)),
+        let volume = find_listed_resource_by_name(
+            pool.list_all_volumes(0).map_err(image_backend_error)?,
+            name,
+            StorageVol::get_name,
+        )
+        .map_err(image_backend_error)?;
+        let Some(volume) = volume else {
+            return Ok(None);
         };
         let info = volume.get_info().map_err(image_backend_error)?;
         let path = volume.get_path().map_err(image_backend_error)?;
@@ -770,22 +1627,18 @@ fn generation_volume_status(
     volume_backings: &[(String, Option<String>)],
 ) -> Result<forge_provisioning::GenerationVolumeStatus, forge_provisioning::ProvisioningError> {
     let expected_path = format!("{pool_path}/{name}");
-    let volume = match StorageVol::lookup_by_name(pool, name) {
-        Ok(volume) => volume,
-        Err(error) if error.code() == ErrorNumber::NoStorageVolume => {
-            return Ok(forge_provisioning::GenerationVolumeStatus {
-                name: name.to_owned(),
-                path: expected_path,
-                exists: false,
-                capacity_bytes: None,
-                format: None,
-                backing_path: None,
-                referenced_by_domains: Vec::new(),
-                backing_for_volumes: Vec::new(),
-                ownership_marker: None,
-            });
-        }
-        Err(error) => return Err(provisioning_backend_error(error)),
+    let volume = find_listed_resource_by_name(
+        pool.list_all_volumes(0)
+            .map_err(provisioning_backend_error)?,
+        name,
+        StorageVol::get_name,
+    )
+    .map_err(provisioning_backend_error)?;
+    let Some(volume) = volume else {
+        return Ok(absent_generation_volume_status_with_path(
+            name,
+            expected_path,
+        ));
     };
     let info = volume.get_info().map_err(provisioning_backend_error)?;
     let path = volume.get_path().map_err(provisioning_backend_error)?;
@@ -811,12 +1664,71 @@ fn generation_volume_status(
     })
 }
 
-fn domain_ip_addresses(domain: &Domain) -> Vec<String> {
+fn absent_generation_volume_status_with_path(
+    name: &str,
+    path: String,
+) -> forge_provisioning::GenerationVolumeStatus {
+    forge_provisioning::GenerationVolumeStatus {
+        name: name.to_owned(),
+        path,
+        exists: false,
+        capacity_bytes: None,
+        format: None,
+        backing_path: None,
+        referenced_by_domains: Vec::new(),
+        backing_for_volumes: Vec::new(),
+        ownership_marker: None,
+    }
+}
+
+fn find_listed_resource_by_name<T, F>(
+    resources: Vec<T>,
+    expected_name: &str,
+    mut name_of: F,
+) -> Result<Option<T>, VirtError>
+where
+    F: FnMut(&T) -> Result<String, VirtError>,
+{
+    for resource in resources {
+        if name_of(&resource)? == expected_name {
+            return Ok(Some(resource));
+        }
+    }
+    Ok(None)
+}
+
+fn observe_legacy_fedora_resources(active_manifest_present: bool) -> bool {
+    !active_manifest_present
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterfaceAddressSource {
+    Agent,
+    Lease,
+}
+
+fn interface_address_sources(qga_channel: bool) -> &'static [InterfaceAddressSource] {
+    if qga_channel {
+        &[InterfaceAddressSource::Agent, InterfaceAddressSource::Lease]
+    } else {
+        &[]
+    }
+}
+
+fn unconfigured_qga_status_observation() -> (forge_provisioning::GuestAgentStatus, Vec<String>) {
+    (
+        forge_provisioning::GuestAgentStatus::Unavailable,
+        Vec::new(),
+    )
+}
+
+fn domain_ip_addresses(domain: &Domain, qga_channel: bool) -> Vec<String> {
     let mut addresses = Vec::new();
-    for source in [
-        sys::VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT,
-        sys::VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE,
-    ] {
+    for source in interface_address_sources(qga_channel) {
+        let source = match source {
+            InterfaceAddressSource::Agent => sys::VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT,
+            InterfaceAddressSource::Lease => sys::VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE,
+        };
         if let Ok(interfaces) = domain.interface_addresses(source, 0) {
             addresses.extend(
                 interfaces
@@ -1065,22 +1977,25 @@ impl LibvirtBootBackend {
                 &volume_backings,
             )
         };
-        let ip_addresses = if domain_state == VmState::Running {
-            domain_ip_addresses(&domain)
-        } else {
-            Vec::new()
-        };
         let guest_agent_channel = domain_xml.contains("org.qemu.guest_agent.0");
-        let guest_agent_status = if !guest_agent_channel {
-            forge_provisioning::GuestAgentStatus::Unavailable
-        } else if domain_state == VmState::Running
-            && domain
-                .qemu_agent_command("{\"execute\":\"guest-ping\"}", 5, 0)
-                .is_ok()
-        {
-            forge_provisioning::GuestAgentStatus::Available
+        let (guest_agent_status, ip_addresses) = if !guest_agent_channel {
+            unconfigured_qga_status_observation()
         } else {
-            forge_provisioning::GuestAgentStatus::Unavailable
+            let ip_addresses = if domain_state == VmState::Running {
+                domain_ip_addresses(&domain, true)
+            } else {
+                Vec::new()
+            };
+            let guest_agent_status = if domain_state == VmState::Running
+                && domain
+                    .qemu_agent_command("{\"execute\":\"guest-ping\"}", 5, 0)
+                    .is_ok()
+            {
+                forge_provisioning::GuestAgentStatus::Available
+            } else {
+                forge_provisioning::GuestAgentStatus::Unavailable
+            };
+            (guest_agent_status, ip_addresses)
         };
         let default_network_active = Network::lookup_by_name(&self.connection, "default")
             .and_then(|network| network.is_active())
@@ -1153,8 +2068,24 @@ impl LibvirtBootBackend {
             base: volume_status(&base_name)?,
             current_overlay: volume_status(&overlay_name)?,
             current_seed,
-            legacy_overlay: volume_status(forge_provisioning::OVERLAY_VOLUME)?,
-            legacy_seed: volume_status(forge_provisioning::SEED_VOLUME)?,
+            // Literal Fedora Cloud/NoCloud artifacts are observable only through
+            // the explicit legacy path (which has no V2.5 generation manifest).
+            legacy_overlay: if !observe_legacy_fedora_resources(active.is_some()) {
+                absent_generation_volume_status_with_path(
+                    forge_provisioning::OVERLAY_VOLUME,
+                    "not-observed".to_owned(),
+                )
+            } else {
+                volume_status(forge_provisioning::OVERLAY_VOLUME)?
+            },
+            legacy_seed: if !observe_legacy_fedora_resources(active.is_some()) {
+                absent_generation_volume_status_with_path(
+                    forge_provisioning::SEED_VOLUME,
+                    "not-observed".to_owned(),
+                )
+            } else {
+                volume_status(forge_provisioning::SEED_VOLUME)?
+            },
         })
     }
 
@@ -1201,6 +2132,8 @@ impl LibvirtBootBackend {
             forge_storage::DEFAULT_POOL,
             overlay_path,
             Some(seed_path),
+            true,
+            None,
         )
     }
 
@@ -1212,7 +2145,50 @@ impl LibvirtBootBackend {
         &self,
         overlay_path: &str,
     ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
-        self.inspect_generation_paths_in_pool(forge_storage::DEFAULT_POOL, overlay_path, None)
+        self.inspect_generation_paths_in_pool(
+            forge_storage::DEFAULT_POOL,
+            overlay_path,
+            None,
+            true,
+            None,
+        )
+    }
+
+    /// Reads exact identities for an independently flattened generation disk.
+    /// The disk is generation-owned and intentionally has no backing volume.
+    ///
+    /// # Errors
+    /// Returns a typed discovery error when domain or volume identities cannot be read.
+    pub fn inspect_generation_flat_overlay_only(
+        &self,
+        overlay_path: &str,
+    ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
+        self.inspect_generation_paths_in_pool(
+            forge_storage::DEFAULT_POOL,
+            overlay_path,
+            None,
+            false,
+            None,
+        )
+    }
+
+    /// Reads a flattened generation disk while retaining the shared base as a
+    /// protected profile identity in durable ownership state.
+    ///
+    /// # Errors
+    /// Returns a typed discovery error when domain, volume, or base identities cannot be read.
+    pub fn inspect_generation_flat_overlay_with_shared_base(
+        &self,
+        overlay_path: &str,
+        base_path: &str,
+    ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
+        self.inspect_generation_paths_in_pool(
+            forge_storage::DEFAULT_POOL,
+            overlay_path,
+            None,
+            false,
+            Some(base_path),
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1221,6 +2197,8 @@ impl LibvirtBootBackend {
         pool_name: &str,
         overlay_path: &str,
         seed_path: Option<&str>,
+        require_backing: bool,
+        shared_base_path: Option<&str>,
     ) -> Result<forge_state::ObservedGeneration, forge_provisioning::ProvisioningError> {
         let domain = self.domain()?;
         let domain_uuid = domain
@@ -1281,22 +2259,42 @@ impl LibvirtBootBackend {
             &domain_references,
             &volume_backings,
         )?;
-        let base_path = overlay_status.backing_path.as_deref().ok_or_else(|| {
-            forge_provisioning::ProvisioningError::Backend(
-                "generation overlay has no backing volume".to_owned(),
-            )
-        })?;
-        let base_status = generation_volume_status(
-            &pool,
-            &pool_path,
-            &name(base_path)?,
-            &domain_references,
-            &volume_backings,
-        )?;
-        let mut statuses = vec![
-            (forge_state::ResourceRole::SharedBase, base_status),
-            (forge_state::ResourceRole::WritableOverlay, overlay_status),
-        ];
+        let mut statuses = Vec::new();
+        if require_backing {
+            let base_path = overlay_status.backing_path.as_deref().ok_or_else(|| {
+                forge_provisioning::ProvisioningError::Backend(
+                    "generation overlay has no backing volume".to_owned(),
+                )
+            })?;
+            let base_status = generation_volume_status(
+                &pool,
+                &pool_path,
+                &name(base_path)?,
+                &domain_references,
+                &volume_backings,
+            )?;
+            statuses.push((forge_state::ResourceRole::SharedBase, base_status));
+        } else if overlay_status.backing_path.is_some() {
+            return Err(forge_provisioning::ProvisioningError::Backend(
+                "flat generation disk unexpectedly has a backing volume".to_owned(),
+            ));
+        }
+        statuses.push((forge_state::ResourceRole::WritableOverlay, overlay_status));
+        if let Some(base_path) = shared_base_path {
+            statuses.insert(
+                0,
+                (
+                    forge_state::ResourceRole::SharedBase,
+                    generation_volume_status(
+                        &pool,
+                        &pool_path,
+                        &name(base_path)?,
+                        &domain_references,
+                        &volume_backings,
+                    )?,
+                ),
+            );
+        }
         if let Some(seed_path) = seed_path {
             statuses.push((
                 forge_state::ResourceRole::NoCloudSeed,
@@ -1393,6 +2391,13 @@ impl LibvirtBootBackend {
             &active.storage_pool_name,
             resource_path(forge_state::ResourceRole::WritableOverlay)?,
             seed,
+            active
+                .resources
+                .iter()
+                .find(|resource| resource.role == forge_state::ResourceRole::WritableOverlay)
+                .and_then(|resource| resource.backing_path.as_ref())
+                .is_some(),
+            None,
         )
     }
 
@@ -1403,56 +2408,70 @@ impl LibvirtBootBackend {
     pub fn delete_managed_volume_exact(
         &self,
         expected: &forge_state::ManagedResource,
-    ) -> Result<(), forge_provisioning::ProvisioningError> {
+    ) -> Result<(), ManagedVolumeDeleteError> {
         if expected.role == forge_state::ResourceRole::SharedBase {
-            return Err(forge_provisioning::ProvisioningError::Backend(
-                "shared base deletion is forbidden".to_owned(),
-            ));
+            return Err(ManagedVolumeDeleteError::SharedBase);
         }
         for domain in self
             .connection
             .list_all_domains(0)
-            .map_err(provisioning_backend_error)?
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?
         {
-            let xml = domain.get_xml_desc(0).map_err(provisioning_backend_error)?;
+            let xml = domain
+                .get_xml_desc(0)
+                .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?;
             if domain_source_paths(&xml)
                 .iter()
                 .any(|path| path == &expected.path)
             {
-                return Err(forge_provisioning::ProvisioningError::Backend(
+                return Err(ManagedVolumeDeleteError::Referenced(
                     "volume gained a domain reference before delete".to_owned(),
                 ));
             }
         }
-        let pool = self.pool()?;
+        let pool = self
+            .pool()
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?;
         for candidate in pool
             .list_all_volumes(0)
-            .map_err(provisioning_backend_error)?
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?
         {
             let xml = candidate
                 .get_xml_desc(0)
-                .map_err(provisioning_backend_error)?;
+                .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?;
             if backing_store_path(&xml).as_deref() == Some(expected.path.as_str()) {
-                return Err(forge_provisioning::ProvisioningError::Backend(
+                return Err(ManagedVolumeDeleteError::Referenced(
                     "volume gained a backing-store reference before delete".to_owned(),
                 ));
             }
         }
         let volume = StorageVol::lookup_by_path(&self.connection, &expected.path)
-            .map_err(provisioning_backend_error)?;
-        let info = volume.get_info().map_err(provisioning_backend_error)?;
-        let xml = volume.get_xml_desc(0).map_err(provisioning_backend_error)?;
-        if volume.get_name().map_err(provisioning_backend_error)? != expected.volume_name
-            || volume.get_key().map_err(provisioning_backend_error)? != expected.volume_key
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?;
+        let info = volume
+            .get_info()
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?;
+        let xml = volume
+            .get_xml_desc(0)
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?;
+        if volume
+            .get_name()
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?
+            != expected.volume_name
+            || volume
+                .get_key()
+                .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))?
+                != expected.volume_key
             || info.capacity != expected.capacity_bytes
             || xml_attribute(&xml, "format", "type").as_deref() != Some(expected.format.as_str())
             || backing_store_path(&xml) != expected.backing_path
         {
-            return Err(forge_provisioning::ProvisioningError::Backend(
+            return Err(ManagedVolumeDeleteError::IdentityMismatch(
                 "volume identity changed immediately before delete".to_owned(),
             ));
         }
-        volume.delete(0).map_err(provisioning_backend_error)
+        volume
+            .delete(0)
+            .map_err(|error| ManagedVolumeDeleteError::Backend(error.to_string()))
     }
 
     /// Proves that no libvirt storage volume remains at an exact managed path.
@@ -1461,13 +2480,15 @@ impl LibvirtBootBackend {
     pub fn verify_managed_volume_absent(
         &self,
         expected: &forge_state::ManagedResource,
-    ) -> Result<(), forge_provisioning::ProvisioningError> {
+    ) -> Result<(), ManagedVolumeAbsenceError> {
         match StorageVol::lookup_by_path(&self.connection, &expected.path) {
             Err(error) if error.code() == ErrorNumber::NoStorageVolume => Ok(()),
-            Err(error) => Err(provisioning_backend_error(error)),
+            Err(error) => Err(ManagedVolumeAbsenceError::Backend(error.to_string())),
             Ok(volume) => {
-                let key = volume.get_key().map_err(provisioning_backend_error)?;
-                Err(forge_provisioning::ProvisioningError::Backend(format!(
+                let key = volume
+                    .get_key()
+                    .map_err(|error| ManagedVolumeAbsenceError::Backend(error.to_string()))?;
+                Err(ManagedVolumeAbsenceError::Present(format!(
                     "managed volume still exists after delete: path={} key={key}",
                     expected.path
                 )))
@@ -2150,6 +3171,12 @@ fn xml_element(xml: &str, name: &str) -> Option<String> {
     Some(xml[start..end].trim().to_owned())
 }
 
+fn clone_volume_xml(name: &str, capacity_bytes: u64) -> String {
+    format!(
+        "<volume><name>{name}</name><capacity unit='bytes'>{capacity_bytes}</capacity><allocation unit='bytes'>0</allocation><target><format type='qcow2'/><permissions><mode>0600</mode></permissions></target></volume>"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2162,6 +3189,121 @@ mod tests {
             state: VmState::Shutoff,
             persistent: true,
         }
+    }
+
+    fn expected() -> ExactDomainIdentity {
+        ExactDomainIdentity {
+            name: "fedora-lab".into(),
+            uuid: "domain-uuid".into(),
+        }
+    }
+
+    fn exact_present(state: VmState) -> DomainDeleteObservation {
+        DomainDeleteObservation::ExactPresent {
+            identity: expected(),
+            state,
+            persistent: true,
+        }
+    }
+
+    #[test]
+    fn exact_domain_undefine_policy_accepts_only_stopped_exact_identity() {
+        assert!(authorize_domain_undefine(&expected(), &exact_present(VmState::Shutoff)).is_ok());
+        assert!(authorize_domain_undefine(&expected(), &exact_present(VmState::Running)).is_err());
+        assert!(
+            authorize_domain_undefine(
+                &expected(),
+                &DomainDeleteObservation::ExactPresent {
+                    identity: expected(),
+                    state: VmState::Shutoff,
+                    persistent: false,
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_domain_undefine_requests_only_libvirt_managed_nvram_retirement() {
+        assert_eq!(domain_undefine_flags(), sys::VIR_DOMAIN_UNDEFINE_NVRAM);
+    }
+
+    #[test]
+    fn domain_delete_observation_distinguishes_absence_and_conflict() {
+        assert!(matches!(
+            classify_domain_delete_observation(&expected(), &[]),
+            DomainDeleteObservation::Absent
+        ));
+        assert!(matches!(
+            classify_domain_delete_observation(
+                &expected(),
+                &[domain("fedora-lab", "different-uuid")]
+            ),
+            DomainDeleteObservation::Conflict(_)
+        ));
+        assert!(matches!(
+            classify_domain_delete_observation(
+                &expected(),
+                &[domain("different-name", "domain-uuid")]
+            ),
+            DomainDeleteObservation::Conflict(_)
+        ));
+        assert!(matches!(
+            classify_domain_delete_observation(&expected(), &[domain("fedora-lab", "domain-uuid")]),
+            DomainDeleteObservation::ExactPresent { .. }
+        ));
+    }
+
+    #[test]
+    fn domain_absence_cannot_be_used_as_undefine_authorization() {
+        assert!(authorize_domain_undefine(&expected(), &DomainDeleteObservation::Absent).is_err());
+    }
+
+    #[test]
+    fn domain_delete_errors_preserve_integrity_vs_backend_classification() {
+        assert!(matches!(
+            authorize_domain_undefine(
+                &expected(),
+                &DomainDeleteObservation::Conflict("UUID mismatch".to_owned())
+            ),
+            Err(DomainDeleteError::Conflict(_))
+        ));
+        assert!(matches!(
+            authorize_domain_undefine(&expected(), &exact_present(VmState::Running)),
+            Err(DomainDeleteError::UnsafeState(_))
+        ));
+        assert!(matches!(
+            DomainDeleteError::Backend("libvirt unavailable".to_owned()),
+            DomainDeleteError::Backend(_)
+        ));
+    }
+
+    #[test]
+    fn volume_delete_errors_preserve_integrity_vs_backend_classification() {
+        assert!(matches!(
+            ManagedVolumeDeleteError::IdentityMismatch("wrong key".to_owned()),
+            ManagedVolumeDeleteError::IdentityMismatch(_)
+        ));
+        assert!(matches!(
+            ManagedVolumeDeleteError::Referenced("domain reference".to_owned()),
+            ManagedVolumeDeleteError::Referenced(_)
+        ));
+        assert_eq!(
+            ManagedVolumeDeleteError::SharedBase.to_string(),
+            "shared base deletion is forbidden"
+        );
+        assert!(matches!(
+            ManagedVolumeDeleteError::Backend("storage unavailable".to_owned()),
+            ManagedVolumeDeleteError::Backend(_)
+        ));
+        assert!(matches!(
+            ManagedVolumeAbsenceError::Present("still exists".to_owned()),
+            ManagedVolumeAbsenceError::Present(_)
+        ));
+        assert!(matches!(
+            ManagedVolumeAbsenceError::Backend("lookup failed".to_owned()),
+            ManagedVolumeAbsenceError::Backend(_)
+        ));
     }
 
     #[test]
@@ -2233,6 +3375,23 @@ mod tests {
     }
 
     #[test]
+    fn clone_volume_xml_requests_standalone_qcow2() {
+        let xml = clone_volume_xml("clone.qcow2", 64);
+        assert_eq!(
+            xml_attribute(&xml, "format", "type").as_deref(),
+            Some("qcow2")
+        );
+        assert!(backing_store_path(&xml).is_none());
+        assert!(xml.contains("<capacity unit='bytes'>64</capacity>"));
+        assert!(xml.contains("<mode>0600</mode>"));
+    }
+
+    #[test]
+    fn clone_create_from_uses_backend_compatible_empty_flags() {
+        assert_eq!(CLONE_CREATE_FLAGS, 0);
+    }
+
+    #[test]
     fn shutoff_domain_backing_is_recovered_from_storage_metadata() {
         let domain_xml = "<domain><devices><disk type='file' device='disk'><source file='/pool/fedora-lab.rebuild.qcow2'/><target dev='vda'/></disk></devices></domain>";
         let volumes = vec![
@@ -2261,6 +3420,55 @@ mod tests {
             validate_managed_seed_topology(Some("/pool/expected.iso"), Some("/pool/other.iso"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn managed_profiles_never_observe_legacy_fedora_resources() {
+        for profile in ["kali", "fedora-workstation", "whonix"] {
+            assert!(
+                !observe_legacy_fedora_resources(true),
+                "managed {profile} lifecycle must not query legacy Fedora artifacts"
+            );
+        }
+        assert!(observe_legacy_fedora_resources(false));
+    }
+
+    #[test]
+    fn status_without_qga_channel_performs_no_interface_address_probes() {
+        assert_eq!(interface_address_sources(false), []);
+        assert_eq!(
+            interface_address_sources(true),
+            [InterfaceAddressSource::Agent, InterfaceAddressSource::Lease]
+        );
+        assert_eq!(
+            unconfigured_qga_status_observation(),
+            (
+                forge_provisioning::GuestAgentStatus::Unavailable,
+                Vec::new()
+            )
+        );
+    }
+
+    #[test]
+    fn listed_absence_is_non_failing() {
+        let absent =
+            find_listed_resource_by_name(vec!["other-volume"], "missing-volume", |value| {
+                Ok::<_, VirtError>((*value).to_owned())
+            })
+            .unwrap();
+        assert!(absent.is_none());
+    }
+
+    #[test]
+    fn normalized_topology_detects_every_persistent_device_surprise() {
+        let xml = "<domain><memory unit='KiB'>1024</memory><vcpu>2</vcpu><os><type machine='pc-q35-10.2'>hvm</type></os><devices><emulator>/usr/bin/qemu</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='/old.qcow2'/><target dev='vda' bus='virtio'/></disk><interface type='network'><mac address='52:54:00:00:00:01'/><source network='default'/><model type='virtio'/></interface><graphics type='spice'/><hostdev mode='subsystem'></hostdev></devices></domain>";
+        let topology = persistent_topology(xml, false).unwrap();
+        assert_eq!(topology.machine, "pc-q35-10.2");
+        assert_eq!(topology.disks[0].source, "/old.qcow2");
+        assert_eq!(topology.interfaces[0].source, "network=default");
+        assert_eq!(topology.hostdevs, 1);
+        assert!(topology.device_kinds.contains(&"hostdev".to_owned()));
+        assert!(forge_storage::validate_kali_topology(&topology, "/old.qcow2").is_err());
     }
 
     #[test]

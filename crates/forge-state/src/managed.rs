@@ -61,6 +61,61 @@ pub struct GenerationIndex {
     pub generations: Vec<GenerationEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cleanup_progress: Vec<CleanupProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_state: Option<DeleteState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteDomainProgress {
+    UndefinePending,
+    Absent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteResourceProgress {
+    DeletePending,
+    Absent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteResourcePlan {
+    pub generation_id: String,
+    pub resource: ManagedResource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeletePlan {
+    pub domain_name: String,
+    pub domain_uuid: String,
+    pub storage_pool_name: String,
+    pub storage_pool_uuid: String,
+    pub generation_id: String,
+    pub resources: Vec<DeleteResourcePlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteInProgress {
+    pub plan: DeletePlan,
+    pub domain: DeleteDomainProgress,
+    pub resources: Vec<DeleteResourceProgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteTombstone {
+    pub plan: DeletePlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum DeleteState {
+    Deleting(DeleteInProgress),
+    Deleted(DeleteTombstone),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +123,7 @@ pub struct GenerationIndex {
 pub enum CleanupPhase {
     SeedDeletePending,
     OverlayDeletePending,
+    FlatOverlayDeletePending,
     IncompleteAfterSeed,
 }
 
@@ -84,6 +140,9 @@ pub enum ManagedState {
     Missing,
     Legacy(GenerationManifest),
     Current(GenerationIndex),
+    /// The immutable first-create intent was published, but its initial Active
+    /// index was never committed. This is an explicit recovery boundary.
+    InitialCreateRecoveryRequired(GenerationManifest),
     Conflict(String),
 }
 
@@ -100,6 +159,10 @@ pub enum ManagedRecoveryReason {
         durable_active_generation_id: String,
         preparing_generation_id: String,
         observed_generation_id: Option<String>,
+    },
+    FreshReplacementPending {
+        durable_active_generation_id: String,
+        preparing_generation_id: String,
     },
 }
 
@@ -249,16 +312,32 @@ pub fn execute_cleanup_candidate<B: CleanupBackend>(
     candidate: &ManagedCleanupCandidate,
 ) -> Result<CleanupExecution, String> {
     backend.revalidate(plan, candidate)?;
-    let seed = candidate
-        .resources
-        .iter()
-        .find(|resource| resource.role == ResourceRole::NoCloudSeed)
-        .ok_or_else(|| "cleanup candidate has no exact seed".to_owned())?;
     let overlay = candidate
         .resources
         .iter()
         .find(|resource| resource.role == ResourceRole::WritableOverlay)
         .ok_or_else(|| "cleanup candidate has no exact overlay".to_owned())?;
+    if candidate.resources.len() == 1 {
+        let current = begin_flat_cleanup(&plan.source_index, &candidate.generation_id)
+            .map_err(|error| error.to_string())?;
+        backend.persist_index(&plan.source_index, &current)?;
+        if let Err(error) = backend.delete_exact(overlay) {
+            return Err(format!("overlay-only generation delete failed: {error}"));
+        }
+        backend.verify_absent(overlay)?;
+        let next_index = complete_flat_cleanup(&current, &candidate.generation_id)
+            .map_err(|error| error.to_string())?;
+        backend.persist_index(&current, &next_index)?;
+        return Ok(CleanupExecution {
+            next_index,
+            deleted: vec![overlay.path.clone()],
+        });
+    }
+    let seed = candidate
+        .resources
+        .iter()
+        .find(|resource| resource.role == ResourceRole::NoCloudSeed)
+        .ok_or_else(|| "cleanup candidate has no exact seed".to_owned())?;
     if candidate.resources.len() != 2 {
         return Err("cleanup candidate must contain exactly seed and overlay".to_owned());
     }
@@ -296,6 +375,381 @@ pub fn execute_cleanup_candidate<B: CleanupBackend>(
     })
 }
 
+/// Builds the first-version VM deletion plan. Only one consistent Active
+/// generation is eligible; retained, preparing, failed, or ambiguous state is
+/// deliberately outside this contract.
+///
+/// # Errors
+/// Refuses every state that cannot prove one exact VM and its disposable
+/// resources from durable state plus the current libvirt observation.
+pub fn plan_instance_delete(
+    index: &GenerationIndex,
+    manifests: &[GenerationManifest],
+    observed: &ObservedGeneration,
+    reconciliation: ManagedReconciliationStatus,
+) -> Result<DeletePlan, StateError> {
+    validate_index(index)?;
+    if reconciliation != ManagedReconciliationStatus::Consistent {
+        return Err(StateError::InvalidObservedState(
+            "delete requires Consistent managed reconciliation".to_owned(),
+        ));
+    }
+    if index.delete_state.is_some() {
+        return Err(StateError::InvalidObservedState(
+            "delete already has durable state; resume that exact plan".to_owned(),
+        ));
+    }
+    if !index.cleanup_progress.is_empty() {
+        return Err(StateError::InvalidObservedState(
+            "delete is refused while retained cleanup progress exists".to_owned(),
+        ));
+    }
+    if index.generations.iter().any(|entry| {
+        matches!(
+            entry.status,
+            GenerationStatus::Retained | GenerationStatus::Preparing | GenerationStatus::Failed
+        )
+    }) {
+        return Err(StateError::InvalidObservedState(
+            "delete requires one Active generation without retained, preparing, or failed generations"
+                .to_owned(),
+        ));
+    }
+    let active = manifests
+        .iter()
+        .find(|manifest| manifest.generation_id == index.active_generation_id)
+        .ok_or_else(|| {
+            StateError::InvalidObservedState("Active generation manifest is missing".to_owned())
+        })?;
+    // Generation manifests are immutable create intent: an initially
+    // Preparing manifest remains so after the index atomically publishes it
+    // Active. The validated index is the lifecycle-status authority.
+    if !generation_identity_matches_exact(active, observed)
+        || observed.unmanaged_resources.len() != 0
+    {
+        return Err(StateError::InvalidObservedState(
+            "delete ownership or active libvirt identity is not exact".to_owned(),
+        ));
+    }
+    let mut resources = Vec::new();
+    for expected in &active.resources {
+        if expected.role == ResourceRole::SharedBase {
+            continue;
+        }
+        let actual = observed
+            .resources
+            .iter()
+            .find(|resource| resource.role == expected.role)
+            .ok_or_else(|| {
+                StateError::InvalidObservedState(format!(
+                    "delete resource {:?} is missing from libvirt evidence",
+                    expected.role
+                ))
+            })?;
+        if actual
+            .referenced_by_domains
+            .iter()
+            .any(|domain| domain != &active.domain_name)
+            || !actual.backing_for_volumes.is_empty()
+        {
+            return Err(StateError::InvalidObservedState(format!(
+                "delete resource {:?} has an external reference",
+                expected.role
+            )));
+        }
+        resources.push(DeleteResourcePlan {
+            generation_id: active.generation_id.clone(),
+            resource: expected.clone(),
+        });
+    }
+    if resources.is_empty() {
+        return Err(StateError::InvalidObservedState(
+            "delete plan has no disposable VM-owned resources".to_owned(),
+        ));
+    }
+    resources.sort_by_key(|item| {
+        let role_order = match item.resource.role {
+            ResourceRole::NoCloudSeed => 0,
+            ResourceRole::WritableOverlay => 1,
+            ResourceRole::SharedBase => 2,
+        };
+        (role_order, item.resource.path.clone())
+    });
+    let plan = DeletePlan {
+        domain_name: active.domain_name.clone(),
+        domain_uuid: active.domain_uuid.clone(),
+        storage_pool_name: active.storage_pool_name.clone(),
+        storage_pool_uuid: active.storage_pool_uuid.clone(),
+        generation_id: active.generation_id.clone(),
+        resources,
+    };
+    validate_delete_plan(index, &plan)?;
+    Ok(plan)
+}
+
+fn validate_delete_plan(index: &GenerationIndex, plan: &DeletePlan) -> Result<(), StateError> {
+    if plan.domain_name.is_empty()
+        || plan.domain_uuid.is_empty()
+        || plan.storage_pool_name.is_empty()
+        || plan.storage_pool_uuid.is_empty()
+        || plan.generation_id.is_empty()
+        || plan.resources.is_empty()
+    {
+        return Err(StateError::InvalidObservedState(
+            "delete plan has incomplete exact identity".to_owned(),
+        ));
+    }
+    if index.domain_name != plan.domain_name
+        || index.domain_uuid != plan.domain_uuid
+        || index.active_generation_id != plan.generation_id
+    {
+        return Err(StateError::InvalidObservedState(
+            "delete plan does not match the durable Active identity".to_owned(),
+        ));
+    }
+    let mut identities = BTreeSet::new();
+    for item in &plan.resources {
+        if item.generation_id != plan.generation_id
+            || item.resource.role == ResourceRole::SharedBase
+            || !identities.insert((item.resource.volume_key.clone(), item.resource.path.clone()))
+        {
+            return Err(StateError::InvalidObservedState(
+                "delete plan contains an invalid or duplicate resource".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn same_delete_plan_identity(left: &DeletePlan, right: &DeletePlan) -> bool {
+    left.domain_name == right.domain_name
+        && left.domain_uuid == right.domain_uuid
+        && left.storage_pool_name == right.storage_pool_name
+        && left.storage_pool_uuid == right.storage_pool_uuid
+        && left.generation_id == right.generation_id
+        && left.resources.len() == right.resources.len()
+        && left
+            .resources
+            .iter()
+            .zip(&right.resources)
+            .all(|(left, right)| {
+                left.generation_id == right.generation_id && left.resource == right.resource
+            })
+}
+
+/// Publishes deletion intent before any domain or storage mutation.
+pub fn begin_instance_delete(
+    index: &GenerationIndex,
+    plan: &DeletePlan,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    validate_delete_plan(index, plan)?;
+    if index.delete_state.is_some() {
+        return Err(StateError::InvalidObservedState(
+            "delete intent already exists".to_owned(),
+        ));
+    }
+    if !index.cleanup_progress.is_empty()
+        || index.generations.iter().any(|entry| {
+            matches!(
+                entry.status,
+                GenerationStatus::Retained | GenerationStatus::Preparing | GenerationStatus::Failed
+            )
+        })
+    {
+        return Err(StateError::InvalidObservedState(
+            "delete intent requires one Active generation without recovery or retained state"
+                .to_owned(),
+        ));
+    }
+    let mut next = index.clone();
+    next.delete_state = Some(DeleteState::Deleting(DeleteInProgress {
+        plan: plan.clone(),
+        domain: DeleteDomainProgress::UndefinePending,
+        resources: vec![DeleteResourceProgress::DeletePending; plan.resources.len()],
+    }));
+    validate_index(&next)?;
+    Ok(next)
+}
+
+/// Records exact domain absence after the caller has re-observed the exact
+/// domain identity. This cannot be called before durable delete intent.
+pub fn record_delete_domain_absent(
+    index: &GenerationIndex,
+    plan: &DeletePlan,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    let Some(DeleteState::Deleting(progress)) = &index.delete_state else {
+        return Err(StateError::InvalidObservedState(
+            "domain delete checkpoint requires durable delete intent".to_owned(),
+        ));
+    };
+    if !same_delete_plan_identity(&progress.plan, plan)
+        || progress.domain != DeleteDomainProgress::UndefinePending
+    {
+        return Err(StateError::InvalidObservedState(
+            "domain delete checkpoint does not match the immutable plan".to_owned(),
+        ));
+    }
+    let mut next = index.clone();
+    if let Some(DeleteState::Deleting(progress)) = &mut next.delete_state {
+        progress.domain = DeleteDomainProgress::Absent;
+    }
+    validate_index(&next)?;
+    Ok(next)
+}
+
+/// Records exact absence of one planned volume after immediate identity
+/// revalidation. A missing volume is accepted only after the durable plan
+/// exists and the caller has proved its exact absence.
+pub fn record_delete_resource_absent(
+    index: &GenerationIndex,
+    plan: &DeletePlan,
+    resource: &ManagedResource,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    let Some(DeleteState::Deleting(progress)) = &index.delete_state else {
+        return Err(StateError::InvalidObservedState(
+            "resource checkpoint requires durable delete intent".to_owned(),
+        ));
+    };
+    if !same_delete_plan_identity(&progress.plan, plan)
+        || progress.domain != DeleteDomainProgress::Absent
+    {
+        return Err(StateError::InvalidObservedState(
+            "resource checkpoint requires a completed domain checkpoint".to_owned(),
+        ));
+    }
+    let mut next = index.clone();
+    let Some(DeleteState::Deleting(progress)) = &mut next.delete_state else {
+        unreachable!();
+    };
+    let item = progress
+        .plan
+        .resources
+        .iter_mut()
+        .position(|item| item.resource == *resource)
+        .ok_or_else(|| {
+            StateError::InvalidObservedState(
+                "resource is not part of the immutable delete plan".to_owned(),
+            )
+        })?;
+    if progress.resources[item] != DeleteResourceProgress::DeletePending {
+        return Err(StateError::InvalidObservedState(
+            "resource already has a delete checkpoint".to_owned(),
+        ));
+    }
+    progress.resources[item] = DeleteResourceProgress::Absent;
+    validate_index(&next)?;
+    Ok(next)
+}
+
+/// Publishes the final tombstone only after the domain and every exact
+/// disposable resource have been checkpointed absent.
+pub fn complete_instance_delete(
+    index: &GenerationIndex,
+    plan: &DeletePlan,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    let Some(DeleteState::Deleting(progress)) = &index.delete_state else {
+        return Err(StateError::InvalidObservedState(
+            "delete completion requires durable delete intent".to_owned(),
+        ));
+    };
+    if !same_delete_plan_identity(&progress.plan, plan)
+        || progress.domain != DeleteDomainProgress::Absent
+    {
+        return Err(StateError::InvalidObservedState(
+            "delete completion is missing the domain checkpoint".to_owned(),
+        ));
+    }
+    if progress
+        .resources
+        .iter()
+        .any(|progress| *progress != DeleteResourceProgress::Absent)
+    {
+        return Err(StateError::InvalidObservedState(
+            "delete completion is missing a resource checkpoint".to_owned(),
+        ));
+    }
+    let mut next = index.clone();
+    let completed_plan = progress.plan.clone();
+    next.delete_state = Some(DeleteState::Deleted(DeleteTombstone {
+        plan: completed_plan,
+    }));
+    validate_index(&next)?;
+    Ok(next)
+}
+
+fn begin_flat_cleanup(
+    index: &GenerationIndex,
+    generation_id: &str,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    let entry = index
+        .generations
+        .iter()
+        .find(|entry| entry.generation_id == generation_id)
+        .ok_or_else(|| StateError::InvalidObservedState("cleanup generation is absent".into()))?;
+    if entry.status != GenerationStatus::Retained {
+        return Err(StateError::InvalidObservedState(
+            "cleanup requires a Retained generation".into(),
+        ));
+    }
+    if index
+        .cleanup_progress
+        .iter()
+        .any(|progress| progress.generation_id == generation_id)
+    {
+        return Err(StateError::InvalidObservedState(
+            "generation already has durable cleanup progress".into(),
+        ));
+    }
+    let mut next = index.clone();
+    next.cleanup_progress.push(CleanupProgress {
+        generation_id: generation_id.to_owned(),
+        phase: CleanupPhase::FlatOverlayDeletePending,
+        deleted_roles: Vec::new(),
+    });
+    validate_index(&next)?;
+    Ok(next)
+}
+
+fn complete_flat_cleanup(
+    index: &GenerationIndex,
+    generation_id: &str,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    let progress = index
+        .cleanup_progress
+        .iter()
+        .find(|progress| progress.generation_id == generation_id)
+        .ok_or_else(|| StateError::InvalidObservedState("cleanup progress is absent".into()))?;
+    if progress.phase != CleanupPhase::FlatOverlayDeletePending
+        || !progress.deleted_roles.is_empty()
+    {
+        return Err(StateError::InvalidObservedState(
+            "flat cleanup is not ready for final completion".into(),
+        ));
+    }
+    let mut next = index.clone();
+    let entry = next
+        .generations
+        .iter_mut()
+        .find(|entry| entry.generation_id == generation_id)
+        .ok_or_else(|| StateError::InvalidObservedState("cleanup generation is absent".into()))?;
+    if entry.status != GenerationStatus::Retained {
+        return Err(StateError::InvalidObservedState(
+            "only Retained generation can become Cleaned".into(),
+        ));
+    }
+    entry.status = GenerationStatus::Cleaned;
+    next.cleanup_progress
+        .retain(|progress| progress.generation_id != generation_id);
+    validate_index(&next)?;
+    Ok(next)
+}
+
 /// Detects the old single-manifest layout or the current index without changing either.
 /// # Errors
 /// Returns corrupt, unsupported, or I/O state errors.
@@ -303,10 +757,46 @@ pub fn inspect_layout(layout: &StateLayout) -> Result<ManagedState, StateError> 
     let legacy = read_manifest(&layout.legacy_manifest)?;
     let index = read_index(&layout.index)?;
     match (legacy, index) {
-        (None, None) => Ok(ManagedState::Missing),
+        (None, None) => inspect_initial_create_recovery(layout),
         (Some(manifest), None) => Ok(ManagedState::Legacy(manifest)),
         (_, Some(index)) => Ok(ManagedState::Current(index)),
     }
+}
+
+fn inspect_initial_create_recovery(layout: &StateLayout) -> Result<ManagedState, StateError> {
+    if !layout.generations.exists() {
+        return Ok(ManagedState::Missing);
+    }
+    let mut manifests = Vec::new();
+    for entry in fs::read_dir(&layout.generations)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            return Ok(ManagedState::Conflict(
+                "initial create state contains a non-generation entry".to_owned(),
+            ));
+        }
+        let Some(manifest) = read_manifest(&entry.path())? else {
+            return Ok(ManagedState::Conflict(
+                "initial create generation disappeared during inspection".to_owned(),
+            ));
+        };
+        if entry.path() != layout.generation_path(&manifest.generation_id) {
+            return Ok(ManagedState::Conflict(
+                "initial create generation manifest is not at its canonical path".to_owned(),
+            ));
+        }
+        manifests.push(manifest);
+    }
+    if manifests.len() == 1 && manifests[0].status == GenerationStatus::Preparing {
+        return Ok(ManagedState::InitialCreateRecoveryRequired(
+            manifests.remove(0),
+        ));
+    }
+    Ok(ManagedState::Conflict(
+        "initial create state requires exactly one Preparing generation and no index".to_owned(),
+    ))
 }
 
 /// Classifies the complete durable generation index against persistent libvirt observation.
@@ -349,14 +839,23 @@ pub fn reconcile_managed(
         .iter()
         .find(|entry| entry.status == GenerationStatus::Preparing)
     {
+        let recovery_reason =
+            if observed_generation_id.as_deref() == Some(preparing.generation_id.as_str()) {
+                ManagedRecoveryReason::FreshReplacementPending {
+                    durable_active_generation_id: index.active_generation_id.clone(),
+                    preparing_generation_id: preparing.generation_id.clone(),
+                }
+            } else {
+                ManagedRecoveryReason::PreparingGenerationPresent {
+                    durable_active_generation_id: index.active_generation_id.clone(),
+                    preparing_generation_id: preparing.generation_id.clone(),
+                    observed_generation_id: observed_generation_id.clone(),
+                }
+            };
         return ManagedReconciliation {
             status: ManagedReconciliationStatus::RecoveryRequired,
             observed_generation_id: observed_generation_id.clone(),
-            recovery_reason: Some(ManagedRecoveryReason::PreparingGenerationPresent {
-                durable_active_generation_id: index.active_generation_id.clone(),
-                preparing_generation_id: preparing.generation_id.clone(),
-                observed_generation_id,
-            }),
+            recovery_reason: Some(recovery_reason),
             conflict_reason: None,
             detail: "durable Preparing generation requires recovery; libvirt attachment is not proof of successful first boot or authorization to finalize state".to_owned(),
         };
@@ -548,14 +1047,17 @@ fn generation_identity_matches_exact(
     manifest: &GenerationManifest,
     observed: &ObservedGeneration,
 ) -> bool {
-    manifest.domain_name == observed.domain_name
-        && manifest.domain_uuid == observed.domain_uuid
-        && observed.domain_persistent
-        && manifest.libvirt_uri == observed.libvirt_uri
-        && manifest.storage_pool_name == observed.storage_pool_name
-        && manifest.storage_pool_uuid == observed.storage_pool_uuid
-        && matches!(manifest.resources.len(), 2 | 3)
-        && manifest.resources.len() == observed.resources.len()
+    let flat_clone = manifest.resources.len() == 1
+        && observed.resources.len() == 1
+        && manifest
+            .resources
+            .iter()
+            .all(|resource| resource.role == ResourceRole::WritableOverlay)
+        && observed
+            .resources
+            .iter()
+            .all(|resource| resource.role == ResourceRole::WritableOverlay);
+    let backed_generation = manifest.resources.len() >= 2
         && manifest
             .resources
             .iter()
@@ -563,7 +1065,15 @@ fn generation_identity_matches_exact(
         && manifest
             .resources
             .iter()
-            .any(|resource| resource.role == ResourceRole::WritableOverlay)
+            .any(|resource| resource.role == ResourceRole::WritableOverlay);
+    manifest.domain_name == observed.domain_name
+        && manifest.domain_uuid == observed.domain_uuid
+        && observed.domain_persistent
+        && manifest.libvirt_uri == observed.libvirt_uri
+        && manifest.storage_pool_name == observed.storage_pool_name
+        && manifest.storage_pool_uuid == observed.storage_pool_uuid
+        && (flat_clone || matches!(manifest.resources.len(), 2 | 3) && backed_generation)
+        && manifest.resources.len() == observed.resources.len()
         && manifest.resources.iter().all(|expected| {
             observed.resources.iter().any(|actual| {
                 expected.role == actual.role
@@ -667,9 +1177,51 @@ pub fn activate_initial_generation(
             manifest_file: format!("generations/{}.json", manifest.generation_id),
         }],
         cleanup_progress: Vec::new(),
+        delete_state: None,
     };
     write_index_atomic(&layout.index, &index)?;
     Ok(index)
+}
+
+/// Plans the only supported recovery for an interrupted first create.
+///
+/// The immutable Preparing intent and independently observed libvirt/storage
+/// identities must still match exactly. This function performs no mutation.
+pub fn plan_initial_create_recovery(
+    layout: &StateLayout,
+    manifest: &GenerationManifest,
+    observed: &ObservedGeneration,
+) -> Result<GenerationIndex, StateError> {
+    match inspect_layout(layout)? {
+        ManagedState::InitialCreateRecoveryRequired(current)
+            if current == *manifest
+                && manifest.domain_name == observed.domain_name
+                && generation_identity_matches_exact(manifest, observed) => {}
+        ManagedState::InitialCreateRecoveryRequired(_) => {
+            return Err(StateError::InvalidObservedState(
+                "initial recovery durable intent changed".to_owned(),
+            ));
+        }
+        _ => {
+            return Err(StateError::InvalidObservedState(
+                "initial recovery requires exactly one durable Preparing generation and no index"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(GenerationIndex {
+        schema_version: INDEX_SCHEMA_VERSION,
+        domain_name: manifest.domain_name.clone(),
+        domain_uuid: manifest.domain_uuid.clone(),
+        active_generation_id: manifest.generation_id.clone(),
+        generations: vec![GenerationEntry {
+            generation_id: manifest.generation_id.clone(),
+            status: GenerationStatus::Active,
+            manifest_file: format!("generations/{}.json", manifest.generation_id),
+        }],
+        cleanup_progress: Vec::new(),
+        delete_state: None,
+    })
 }
 
 /// Plans a lossless migration. The legacy manifest remains as a recovery source.
@@ -695,6 +1247,7 @@ pub fn plan_migration(
             manifest_file: format!("generations/{}.json", manifest.generation_id),
         }],
         cleanup_progress: Vec::new(),
+        delete_state: None,
     };
     validate_index(&index)?;
     Ok(MigrationPlan {
@@ -867,6 +1420,7 @@ pub fn manifest_from_observed(
                 backing_path: resource.backing_path.clone(),
             })
             .collect(),
+        fresh_domain_evidence: None,
     }
 }
 
@@ -903,6 +1457,54 @@ pub fn finalize_switch(
     new_id.clone_into(&mut next.active_generation_id);
     validate_index(&next)?;
     Ok(next)
+}
+
+/// Commits a Fresh replacement only when both expected generation identities
+/// still match the durable index. The single returned index is the atomic
+/// publication value: old Active becomes Retained and new Preparing becomes
+/// Active together.
+///
+/// # Errors
+///
+/// Refuses stale identities, invalid indexes, or any state without exactly one
+/// expected Active and one expected Preparing generation.
+pub fn commit_fresh_switch(
+    index: &GenerationIndex,
+    expected_old_active_id: &str,
+    expected_new_preparing_id: &str,
+) -> Result<GenerationIndex, StateError> {
+    validate_index(index)?;
+    if index.active_generation_id != expected_old_active_id {
+        return Err(StateError::InvalidObservedState(
+            "Fresh switch refused: Active generation changed".to_owned(),
+        ));
+    }
+    let active_count = index
+        .generations
+        .iter()
+        .filter(|entry| entry.status == GenerationStatus::Active)
+        .count();
+    if active_count != 1 {
+        return Err(StateError::InvalidObservedState(
+            "Fresh switch refused: expected exactly one Active generation".to_owned(),
+        ));
+    }
+    let preparing_count = index
+        .generations
+        .iter()
+        .filter(|entry| entry.status == GenerationStatus::Preparing)
+        .count();
+    if preparing_count != 1
+        || !index.generations.iter().any(|entry| {
+            entry.generation_id == expected_new_preparing_id
+                && entry.status == GenerationStatus::Preparing
+        })
+    {
+        return Err(StateError::InvalidObservedState(
+            "Fresh switch refused: expected one exact Preparing generation".to_owned(),
+        ));
+    }
+    finalize_switch(index, expected_new_preparing_id)
 }
 
 /// Marks a Preparing generation Failed while preserving the current Active.
@@ -984,7 +1586,7 @@ pub fn validate_index(index: &GenerationIndex) -> Result<(), StateError> {
             ));
         }
         let expected_deleted = match progress.phase {
-            CleanupPhase::SeedDeletePending => &[][..],
+            CleanupPhase::SeedDeletePending | CleanupPhase::FlatOverlayDeletePending => &[][..],
             CleanupPhase::OverlayDeletePending | CleanupPhase::IncompleteAfterSeed => {
                 &[ResourceRole::NoCloudSeed][..]
             }
@@ -994,6 +1596,45 @@ pub fn validate_index(index: &GenerationIndex) -> Result<(), StateError> {
                 "cleanup progress roles do not match its phase".to_owned(),
             ));
         }
+    }
+    if let Some(delete_state) = &index.delete_state {
+        match delete_state {
+            DeleteState::Deleting(progress) => {
+                validate_delete_plan(index, &progress.plan)?;
+                if progress.resources.len() != progress.plan.resources.len() {
+                    return Err(StateError::InvalidObservedState(
+                        "delete progress does not match the immutable plan".to_owned(),
+                    ));
+                }
+            }
+            DeleteState::Deleted(tombstone) => {
+                validate_delete_plan(index, &tombstone.plan)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses every normal mutation while an explicit recovery boundary exists.
+///
+/// # Errors
+/// Returns a typed refusal for an invalid index or any durable Preparing generation.
+pub fn require_normal_lifecycle(index: &GenerationIndex) -> Result<(), StateError> {
+    validate_index(index)?;
+    if index.delete_state.is_some() {
+        return Err(StateError::InvalidObservedState(
+            "normal lifecycle refused: VM deletion is in progress or completed".to_owned(),
+        ));
+    }
+    if index
+        .generations
+        .iter()
+        .any(|entry| entry.status == GenerationStatus::Preparing)
+    {
+        return Err(StateError::InvalidObservedState(
+            "normal lifecycle refused: a Preparing generation requires explicit recovery"
+                .to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1254,7 +1895,9 @@ pub fn plan_managed_cleanup(
             .iter()
             .filter(|item| item.resource.role != ResourceRole::SharedBase)
             .collect::<Vec<_>>();
-        let safe = disposable.len() == 2
+        let overlay_only =
+            disposable.len() == 1 && disposable[0].resource.role == ResourceRole::WritableOverlay;
+        let safe = (overlay_only || disposable.len() == 2)
             && disposable.iter().all(|item| {
                 item.exists
                     && item.observed_resource.as_ref() == Some(&item.resource)
@@ -1414,7 +2057,37 @@ mod tests {
                     backing_path: None,
                 },
             ],
+            fresh_domain_evidence: None,
         }
+    }
+
+    #[test]
+    fn flat_clone_generation_identity_requires_one_exact_writable_disk() {
+        let mut expected = manifest("clone", GenerationStatus::Preparing);
+        expected.resources = vec![ManagedResource {
+            role: ResourceRole::WritableOverlay,
+            volume_name: "clone.qcow2".into(),
+            volume_key: "clone-key".into(),
+            path: "/p/clone.qcow2".into(),
+            format: "qcow2".into(),
+            capacity_bytes: 64,
+            backing_path: None,
+        }];
+        let mut actual = observed("clone");
+        actual.resources = vec![crate::ObservedResource {
+            role: ResourceRole::WritableOverlay,
+            volume_name: "clone.qcow2".into(),
+            volume_key: "clone-key".into(),
+            path: "/p/clone.qcow2".into(),
+            format: "qcow2".into(),
+            capacity_bytes: 64,
+            backing_path: None,
+            referenced_by_domains: vec!["fedora-lab".into()],
+            backing_for_volumes: vec![],
+        }];
+        assert!(generation_identity_matches_exact(&expected, &actual));
+        actual.resources[0].backing_path = Some("/p/source.qcow2".into());
+        assert!(!generation_identity_matches_exact(&expected, &actual));
     }
     fn index() -> GenerationIndex {
         GenerationIndex {
@@ -1428,8 +2101,172 @@ mod tests {
                 manifest_file: "generations/old.json".into(),
             }],
             cleanup_progress: Vec::new(),
+            delete_state: None,
         }
     }
+
+    fn delete_fixture() -> (
+        GenerationIndex,
+        GenerationManifest,
+        ObservedGeneration,
+        DeletePlan,
+    ) {
+        let index = index();
+        // Immutable initial-create manifests retain Preparing; the index is
+        // the durable authority that publishes this generation Active.
+        let manifest = manifest("old", GenerationStatus::Preparing);
+        let observed = observed("old");
+        let plan = plan_instance_delete(
+            &index,
+            std::slice::from_ref(&manifest),
+            &observed,
+            ManagedReconciliationStatus::Consistent,
+        )
+        .unwrap();
+        (index, manifest, observed, plan)
+    }
+
+    #[test]
+    fn delete_plan_contains_only_exact_disposable_active_resources() {
+        let (_, _, _, plan) = delete_fixture();
+        assert_eq!(plan.resources.len(), 2);
+        assert!(
+            plan.resources
+                .iter()
+                .all(|item| item.resource.role != ResourceRole::SharedBase)
+        );
+        assert!(plan.resources.iter().all(|item| {
+            item.generation_id == plan.generation_id
+                && item.resource.role != ResourceRole::SharedBase
+        }));
+    }
+
+    #[test]
+    fn recovered_initial_create_active_index_passes_exact_delete_preflight() {
+        let root = temp();
+        fs::create_dir_all(&root).unwrap();
+        let layout = StateLayout::new(&root, "fedora-lab");
+        let preparing = manifest("initial", GenerationStatus::Preparing);
+        let observed = observed("initial");
+        write_manifest_atomic(&layout.generation_path("initial"), &preparing).unwrap();
+        let active_index = plan_initial_create_recovery(&layout, &preparing, &observed).unwrap();
+        write_index_atomic(&layout.index, &active_index).unwrap();
+        let plan = plan_instance_delete(
+            &active_index,
+            std::slice::from_ref(&preparing),
+            &observed,
+            ManagedReconciliationStatus::Consistent,
+        )
+        .unwrap();
+        assert_eq!(plan.generation_id, "initial");
+        assert!(
+            plan.resources
+                .iter()
+                .all(|item| item.resource.role != ResourceRole::SharedBase)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_preflight_still_refuses_exact_identity_drift_after_recovery() {
+        let root = temp();
+        fs::create_dir_all(&root).unwrap();
+        let layout = StateLayout::new(&root, "fedora-lab");
+        let preparing = manifest("initial", GenerationStatus::Preparing);
+        let observed = observed("initial");
+        write_manifest_atomic(&layout.generation_path("initial"), &preparing).unwrap();
+        let index = plan_initial_create_recovery(&layout, &preparing, &observed).unwrap();
+        let mut drifted = observed.clone();
+        drifted.resources[1].backing_path = Some("/p/foreign-base".into());
+        assert!(
+            plan_instance_delete(
+                &index,
+                std::slice::from_ref(&preparing),
+                &drifted,
+                ManagedReconciliationStatus::Consistent,
+            )
+            .is_err()
+        );
+        assert!(
+            plan_instance_delete(
+                &index,
+                std::slice::from_ref(&preparing),
+                &observed,
+                ManagedReconciliationStatus::Conflict,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_plan_refuses_non_active_generation_states_and_conflicts() {
+        let (index, manifest, observed, _) = delete_fixture();
+        for status in [
+            GenerationStatus::Retained,
+            GenerationStatus::Preparing,
+            GenerationStatus::Failed,
+        ] {
+            let mut blocked = index.clone();
+            blocked.generations.push(GenerationEntry {
+                generation_id: format!("{status:?}"),
+                status,
+                manifest_file: "x".into(),
+            });
+            assert!(
+                plan_instance_delete(
+                    &blocked,
+                    std::slice::from_ref(&manifest),
+                    &observed,
+                    ManagedReconciliationStatus::Consistent,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            plan_instance_delete(
+                &index,
+                std::slice::from_ref(&manifest),
+                &observed,
+                ManagedReconciliationStatus::Conflict,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn delete_checkpoints_require_order_and_immutable_plan() {
+        let (index, _, _, plan) = delete_fixture();
+        assert!(record_delete_domain_absent(&index, &plan).is_err());
+        let intent = begin_instance_delete(&index, &plan).unwrap();
+        assert!(complete_instance_delete(&intent, &plan).is_err());
+        let after_domain = record_delete_domain_absent(&intent, &plan).unwrap();
+        assert!(complete_instance_delete(&after_domain, &plan).is_err());
+        let first = &plan.resources[0].resource;
+        let after_first = record_delete_resource_absent(&after_domain, &plan, first).unwrap();
+        assert!(complete_instance_delete(&after_first, &plan).is_err());
+        let second = &plan.resources[1].resource;
+        let completed = record_delete_resource_absent(&after_first, &plan, second).unwrap();
+        let tombstone = complete_instance_delete(&completed, &plan).unwrap();
+        assert!(matches!(
+            tombstone.delete_state,
+            Some(DeleteState::Deleted(_))
+        ));
+        assert!(begin_instance_delete(&tombstone, &plan).is_err());
+
+        let mut changed = plan.clone();
+        changed.domain_uuid = "different".into();
+        assert!(record_delete_domain_absent(&intent, &changed).is_err());
+    }
+
+    #[test]
+    fn old_index_json_without_delete_state_remains_readable() {
+        let mut value = serde_json::to_value(index()).unwrap();
+        value.as_object_mut().unwrap().remove("delete_state");
+        let parsed: GenerationIndex = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.delete_state, None);
+    }
+
     fn observed(id: &str) -> ObservedGeneration {
         let manifest = manifest(id, GenerationStatus::Preparing);
         ObservedGeneration {
@@ -1481,6 +2318,7 @@ mod tests {
                 },
             ],
             cleanup_progress: Vec::new(),
+            delete_state: None,
         }
     }
     fn recovery_manifests() -> Vec<GenerationManifest> {
@@ -1542,6 +2380,70 @@ mod tests {
                 .active_generation_id,
             "old"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initial_preparing_without_index_is_explicit_recovery_not_missing() {
+        let root = temp();
+        fs::create_dir_all(&root).unwrap();
+        let layout = StateLayout::new(&root, "fedora-lab");
+        let preparing = manifest("initial", GenerationStatus::Preparing);
+        write_manifest_atomic(&layout.generation_path("initial"), &preparing).unwrap();
+        assert!(matches!(
+            inspect_layout(&layout).unwrap(),
+            ManagedState::InitialCreateRecoveryRequired(value) if value == preparing
+        ));
+        assert!(!layout.index.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initial_create_recovery_requires_exact_single_preparing_identity() {
+        let root = temp();
+        fs::create_dir_all(&root).unwrap();
+        let layout = StateLayout::new(&root, "fedora-lab");
+        let preparing = manifest("initial", GenerationStatus::Preparing);
+        write_manifest_atomic(&layout.generation_path("initial"), &preparing).unwrap();
+        let observed = observed("initial");
+        let index = plan_initial_create_recovery(&layout, &preparing, &observed).unwrap();
+        assert_eq!(index.active_generation_id, "initial");
+        assert!(!layout.index.exists());
+        for drift in [
+            |value: &mut ObservedGeneration| value.domain_uuid = "other".into(),
+            |value: &mut ObservedGeneration| value.storage_pool_uuid = "other".into(),
+            |value: &mut ObservedGeneration| value.resources[0].path = "/other".into(),
+            |value: &mut ObservedGeneration| {
+                value.resources[1].backing_path = Some("/other".into())
+            },
+        ] {
+            let mut changed = observed.clone();
+            drift(&mut changed);
+            assert!(plan_initial_create_recovery(&layout, &preparing, &changed).is_err());
+        }
+        let second = manifest("second", GenerationStatus::Preparing);
+        write_manifest_atomic(&layout.generation_path("second"), &second).unwrap();
+        assert!(matches!(
+            inspect_layout(&layout).unwrap(),
+            ManagedState::Conflict(_)
+        ));
+        assert!(plan_initial_create_recovery(&layout, &preparing, &observed).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initial_create_recovery_refuses_a_preparing_manifest_at_a_noncanonical_path() {
+        let root = temp();
+        fs::create_dir_all(&root).unwrap();
+        let layout = StateLayout::new(&root, "fedora-lab");
+        let preparing = manifest("initial", GenerationStatus::Preparing);
+        write_manifest_atomic(&layout.generations.join("random-name.json"), &preparing).unwrap();
+        assert!(matches!(
+            inspect_layout(&layout).unwrap(),
+            ManagedState::Conflict(reason) if reason.contains("canonical path")
+        ));
+        assert!(plan_initial_create_recovery(&layout, &preparing, &observed("initial")).is_err());
+        assert!(!layout.index.exists());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1711,13 +2613,11 @@ mod tests {
         assert_eq!(next.active_generation_id, "old");
         assert!(matches!(
             report.recovery_reason,
-            Some(ManagedRecoveryReason::PreparingGenerationPresent {
+            Some(ManagedRecoveryReason::FreshReplacementPending {
                 durable_active_generation_id,
                 preparing_generation_id,
-                observed_generation_id: Some(observed_generation_id),
             }) if durable_active_generation_id == "old"
                 && preparing_generation_id == "new"
-                && observed_generation_id == "new"
         ));
     }
     #[test]
@@ -1734,6 +2634,28 @@ mod tests {
         assert_eq!(report.status, ManagedReconciliationStatus::RecoveryRequired);
         assert_eq!(next.generations[0].status, GenerationStatus::Active);
         assert_eq!(next.generations[1].status, GenerationStatus::Preparing);
+    }
+
+    #[test]
+    fn preparing_blocks_every_normal_mutation_surface() {
+        let pending =
+            add_preparing(&index(), &manifest("new", GenerationStatus::Preparing)).unwrap();
+        for operation in [
+            "start",
+            "shutdown",
+            "force-stop",
+            "clone",
+            "fresh",
+            "rebuild",
+            "cleanup",
+            "adoption",
+        ] {
+            assert!(
+                require_normal_lifecycle(&pending).is_err(),
+                "{operation} must route only to explicit recovery"
+            );
+        }
+        assert!(require_normal_lifecycle(&index()).is_ok());
     }
     #[test]
     fn observed_generation_uses_exact_libvirt_identities_not_names_or_shape() {
@@ -1837,6 +2759,7 @@ mod tests {
                 },
             ],
             cleanup_progress: Vec::new(),
+            delete_state: None,
         }
     }
     #[test]
@@ -1901,6 +2824,40 @@ mod tests {
         )
         .unwrap();
         assert!(!plan.mutation);
+    }
+
+    #[test]
+    fn flat_clone_cleanup_selects_only_target_owned_overlay() {
+        let mut manifest = manifest("old", GenerationStatus::Retained);
+        manifest
+            .resources
+            .retain(|resource| resource.role == ResourceRole::WritableOverlay);
+        manifest.resources[0].backing_path = None;
+        let resource = manifest.resources[0].clone();
+        let evidence = RetainedEvidence {
+            manifest,
+            observed_pool_uuid: "pu".into(),
+            resources: vec![ResourceEvidence {
+                observed_resource: Some(resource.clone()),
+                resource,
+                exists: true,
+                referenced_by_domains: vec![],
+                backing_for_volumes: vec![],
+            }],
+        };
+        let plan = plan_managed_cleanup(
+            &retained_index(),
+            &[evidence],
+            vec![],
+            ManagedReconciliationStatus::Consistent,
+        )
+        .unwrap();
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].resources.len(), 1);
+        assert_eq!(
+            plan.candidates[0].resources[0].role,
+            ResourceRole::WritableOverlay
+        );
     }
     #[test]
     fn cleanup_refuses_non_retained_and_reports_unmanaged_without_candidates() {
@@ -2041,6 +2998,19 @@ mod tests {
             fs::metadata(&layout.index).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_index_publication_validation_preserves_old_active() {
+        let root = temp();
+        let layout = StateLayout::new(&root, "fedora-lab");
+        let original = index();
+        write_index_atomic(&layout.index, &original).unwrap();
+        let mut invalid = original.clone();
+        invalid.active_generation_id = "not-the-active-generation".to_owned();
+        assert!(write_index_atomic(&layout.index, &invalid).is_err());
+        assert_eq!(read_index(&layout.index).unwrap(), Some(original));
         fs::remove_dir_all(root).unwrap();
     }
     struct CleanupMock {

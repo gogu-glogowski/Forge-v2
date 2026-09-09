@@ -212,11 +212,24 @@ pub enum GuestProfileKind {
     LunaDevFedora,
     LunaLabFedora,
     FedoraLab,
+    FedoraWorkstation,
     DebianClean,
     KaliLab,
     TsurugiLab,
     WhonixGateway,
     WhonixWorkstation,
+}
+
+/// Product eligibility is distinct from compatibility readability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductAvailability {
+    Supported,
+    LegacyCompatibility(LegacyProductClassification),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyProductClassification {
+    LegacyFedoraCloudNoCloud,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +279,7 @@ pub enum FirmwareMachinePolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageSourcePolicy {
     FedoraCloudBase { release: String },
+    PromotedFedoraWorkstation { release: String, compose: String },
     KaliQemuArchive { release: String },
     WhonixLibvirtBundle { release: String },
     VerifiedQcow2 { source_id: String },
@@ -399,6 +413,7 @@ pub struct VmProfile {
     pub network_policy: NetworkPolicy,
     pub graphics_policy: GraphicsPolicy,
     pub persistence: PersistencePolicy,
+    pub availability: ProductAvailability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -10,6 +10,13 @@ debug
 
 # Mutation testing output
 **/mutants.out*/
+# Local VM/image artifacts are runtime data, never source fixtures.
+*.qcow2
+*.iso
+*.img
+*.raw
+*.qcow2.tmp
+*.iso.tmp
 
 # RustRover / IntelliJ IDEA (optional)
 # .idea/

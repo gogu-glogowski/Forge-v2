@@ -3,9 +3,10 @@
 use forge_core::{
     FirmwareMachinePolicy, FirstBootSuccessPolicy, GenerationResourceNames, GpuMode,
     GraphicsPolicy, GuestArchitecture, GuestFamily, GuestProfileKind, HardwareInfo,
-    ImageSourcePolicy, ImageVerificationPolicy, InstanceKind, InstanceName, NetworkMode,
-    NetworkPolicy, PersistencePolicy, PointToPointEndpoint, ProfileId, ProvisioningPolicy,
-    ResourcePlanError, UdpPointToPointLink, VmProfile, VmResourcePlan, VmResources, WhonixPairId,
+    ImageSourcePolicy, ImageVerificationPolicy, InstanceKind, InstanceName,
+    LegacyProductClassification, NetworkMode, NetworkPolicy, PersistencePolicy,
+    PointToPointEndpoint, ProductAvailability, ProfileId, ProvisioningPolicy, ResourcePlanError,
+    UdpPointToPointLink, VmProfile, VmResourcePlan, VmResources, WhonixPairId,
 };
 use std::fmt;
 
@@ -17,6 +18,7 @@ const RATIO_SCALE_USIZE: usize = 1000;
 pub fn built_in_profiles() -> Vec<VmProfile> {
     vec![
         fedora_lab(),
+        fedora_workstation(),
         kali_lab(),
         whonix_gateway(),
         whonix_workstation(),
@@ -37,6 +39,9 @@ pub fn base_volume_name(profile: &VmProfile) -> String {
     match &profile.image_source {
         ImageSourcePolicy::FedoraCloudBase { release } => {
             format!("forge-base-fedora-{release}.qcow2")
+        }
+        ImageSourcePolicy::PromotedFedoraWorkstation { release, compose } => {
+            format!("forge-base-fedora-workstation-{release}-{compose}.qcow2")
         }
         ImageSourcePolicy::KaliQemuArchive { release } => {
             format!("forge-base-kali-{release}.qcow2")
@@ -214,6 +219,38 @@ pub fn fedora_lab() -> VmProfile {
 }
 
 #[must_use]
+pub fn fedora_workstation() -> VmProfile {
+    profile(
+        ProfileMetadata {
+            id: "fedora-workstation",
+            display_name: "Fedora Workstation",
+            kind: GuestProfileKind::FedoraWorkstation,
+            instance_kind: InstanceKind::Lab,
+            guest_family: GuestFamily::Fedora,
+        },
+        VmResources {
+            cpu_ratio_per_mille: 250,
+            min_vcpus: 2,
+            max_vcpus: 8,
+            memory_start_ratio_per_mille: 250,
+            memory_max_ratio_per_mille: 375,
+            min_memory_bytes: 4 * GIB,
+            host_memory_reserve_bytes: 4 * GIB,
+            disk_bytes: 80 * GIB,
+        },
+        ImagePolicy {
+            source: ImageSourcePolicy::PromotedFedoraWorkstation {
+                release: "44".to_owned(),
+                compose: "1.7".to_owned(),
+            },
+            verification: ImageVerificationPolicy::Sha256Digest,
+        },
+        ProvisioningPolicy::None,
+        FirstBootSuccessPolicy::ManualGuest,
+    )
+}
+
+#[must_use]
 pub fn luna_dev_fedora() -> VmProfile {
     profile(
         ProfileMetadata {
@@ -296,6 +333,13 @@ fn profile(
     provisioning: ProvisioningPolicy,
     first_boot_success: FirstBootSuccessPolicy,
 ) -> VmProfile {
+    let availability = if matches!(image.source, ImageSourcePolicy::FedoraCloudBase { .. }) {
+        ProductAvailability::LegacyCompatibility(
+            LegacyProductClassification::LegacyFedoraCloudNoCloud,
+        )
+    } else {
+        ProductAvailability::Supported
+    };
     VmProfile {
         id: ProfileId::new(metadata.id).expect("built-in profile ID must be valid"),
         display_name: metadata.display_name.to_owned(),
@@ -312,6 +356,7 @@ fn profile(
         network_policy: NetworkPolicy::DefaultNat,
         graphics_policy: GraphicsPolicy::Virtual,
         persistence: PersistencePolicy::Persistent,
+        availability,
     }
 }
 
@@ -352,6 +397,7 @@ pub struct InstancePlan {
     pub network: NetworkPolicy,
     pub graphics: GraphicsPolicy,
     pub lifecycle: LifecyclePlan,
+    pub availability: ProductAvailability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,6 +413,7 @@ pub enum PrepareBaseStrategy {
     SevenZipSingleQcow2,
     WhonixBundleGateway,
     WhonixBundleWorkstation,
+    PromotedFedoraWorkstationCanonical,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -496,6 +543,7 @@ pub struct GenericCreatePlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FactoryPlanError {
+    LegacyFedoraProductRetired,
     ProfileIdentityMismatch,
     IncompatibleProvisioningPolicy,
     GenerationResourceMismatch,
@@ -505,6 +553,9 @@ pub enum FactoryPlanError {
 impl fmt::Display for FactoryPlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::LegacyFedoraProductRetired => formatter.write_str(
+                "Legacy Fedora Cloud/NoCloud is retired in Forge V2.5. Fedora Workstation support is being introduced through the new Workstation architecture.",
+            ),
             Self::ProfileIdentityMismatch => {
                 formatter.write_str("instance profile identity does not match selected profile")
             }
@@ -530,6 +581,13 @@ pub fn plan_instance(
     profile: &VmProfile,
     identity: InstanceIdentity,
 ) -> Result<InstancePlan, FactoryPlanError> {
+    if profile.availability
+        == ProductAvailability::LegacyCompatibility(
+            LegacyProductClassification::LegacyFedoraCloudNoCloud,
+        )
+    {
+        return Err(FactoryPlanError::LegacyFedoraProductRetired);
+    }
     if identity.profile_id != profile.id {
         return Err(FactoryPlanError::ProfileIdentityMismatch);
     }
@@ -580,6 +638,7 @@ pub fn plan_instance(
         network: profile.network_policy.clone(),
         graphics: profile.graphics_policy,
         lifecycle,
+        availability: profile.availability,
     })
 }
 
@@ -593,6 +652,14 @@ pub fn plan_create(
     instance: InstancePlan,
     generation: GenerationResourceNames,
 ) -> Result<GenericCreatePlan, FactoryPlanError> {
+    if matches!(
+        instance.availability,
+        ProductAvailability::LegacyCompatibility(
+            LegacyProductClassification::LegacyFedoraCloudNoCloud
+        )
+    ) {
+        return Err(FactoryPlanError::LegacyFedoraProductRetired);
+    }
     let seed_required = matches!(instance.provisioning, ProvisioningPolicy::NoCloud { .. });
     if seed_required != generation.seed.is_some() {
         return Err(FactoryPlanError::GenerationResourceMismatch);
@@ -651,6 +718,7 @@ pub fn plan_create(
                 ImageSourcePolicy::WhonixLibvirtBundle { .. } => {
                     SourceImageFormat::TarXzMultiArtifactBundle
                 }
+                ImageSourcePolicy::PromotedFedoraWorkstation { .. } => SourceImageFormat::Qcow2,
                 _ => SourceImageFormat::Qcow2,
             },
             preparation: match &instance.image.source {
@@ -662,6 +730,9 @@ pub fn plan_create(
                         "whonix-workstation" => PrepareBaseStrategy::WhonixBundleWorkstation,
                         _ => PrepareBaseStrategy::WhonixBundleGateway,
                     }
+                }
+                ImageSourcePolicy::PromotedFedoraWorkstation { .. } => {
+                    PrepareBaseStrategy::PromotedFedoraWorkstationCanonical
                 }
                 _ => PrepareBaseStrategy::VerifiedQcow2,
             },
@@ -811,6 +882,58 @@ mod tests {
         assert_eq!(plan.vcpus, 4);
         assert_eq!(plan.network, NetworkMode::Nat);
         assert_eq!(plan.gpu, GpuMode::Virtual);
+    }
+
+    #[test]
+    fn fedora_workstation_is_supported_manual_promoted_base_profile() {
+        let profile = find("fedora-workstation").unwrap();
+        assert_eq!(profile.kind, GuestProfileKind::FedoraWorkstation);
+        assert_eq!(profile.availability, ProductAvailability::Supported);
+        assert_eq!(profile.provisioning, ProvisioningPolicy::None);
+        assert_eq!(
+            profile.first_boot_success,
+            FirstBootSuccessPolicy::ManualGuest
+        );
+        assert_eq!(profile.firmware_machine, FirmwareMachinePolicy::UefiQ35);
+        assert_eq!(profile.network_policy, NetworkPolicy::DefaultNat);
+        assert_eq!(
+            profile.image_source,
+            ImageSourcePolicy::PromotedFedoraWorkstation {
+                release: "44".to_owned(),
+                compose: "1.7".to_owned(),
+            }
+        );
+        assert_eq!(
+            base_volume_name(&profile),
+            "forge-base-fedora-workstation-44-1.7.qcow2"
+        );
+    }
+
+    #[test]
+    fn fedora_workstation_plan_uses_promoted_base_without_provisioning() {
+        let profile = fedora_workstation();
+        let plan = plan_instance(
+            &hardware(16, 32),
+            &profile,
+            InstanceIdentity {
+                name: InstanceName::new("fedora-workstation-1").unwrap(),
+                profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plan.image.base_volume_name,
+            "forge-base-fedora-workstation-44-1.7.qcow2"
+        );
+        assert_eq!(plan.provisioning, ProvisioningPolicy::None);
+        assert_eq!(plan.first_boot_success, FirstBootSuccessPolicy::ManualGuest);
+        assert_eq!(plan.storage.seed_volume_name, None);
+        assert_eq!(
+            plan.lifecycle,
+            LifecyclePlan::PersistentManaged {
+                state_directory_name: "fedora-workstation-1".to_owned(),
+            }
+        );
     }
 
     #[test]
@@ -1091,6 +1214,7 @@ mod tests {
             names,
             [
                 "fedora-lab",
+                "fedora-workstation",
                 "kali-lab",
                 "whonix-gateway",
                 "whonix-workstation",
@@ -1100,9 +1224,38 @@ mod tests {
         );
     }
 
+    // Exercises retained compatibility primitives without making the built-in
+    // legacy profile selectable as a new V2.5 product.
+    fn legacy_runtime_fixture() -> VmProfile {
+        let mut profile = fedora_lab();
+        profile.availability = ProductAvailability::Supported;
+        profile
+    }
+
+    #[test]
+    fn legacy_fedora_is_typed_compatibility_and_new_planning_refuses() {
+        let profile = fedora_lab();
+        assert_eq!(
+            profile.availability,
+            ProductAvailability::LegacyCompatibility(
+                LegacyProductClassification::LegacyFedoraCloudNoCloud
+            )
+        );
+        let error = plan_instance(
+            &hardware(16, 32),
+            &profile,
+            InstanceIdentity {
+                name: InstanceName::new("not-named-fedora").unwrap(),
+                profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, FactoryPlanError::LegacyFedoraProductRetired);
+    }
+
     #[test]
     fn one_profile_plans_isolated_instance_identities_and_state_paths() {
-        let profile = fedora_lab();
+        let profile = legacy_runtime_fixture();
         let first = plan_instance(
             &hardware(16, 32),
             &profile,
@@ -1131,7 +1284,7 @@ mod tests {
 
     #[test]
     fn non_fedora_profile_uses_generic_planning_without_guest_provisioning() {
-        let mut profile = fedora_lab();
+        let mut profile = legacy_runtime_fixture();
         profile.id = ProfileId::new("mock-debian").unwrap();
         profile.display_name = "Mock Debian".to_owned();
         profile.guest_family = GuestFamily::Debian;
@@ -1158,7 +1311,7 @@ mod tests {
 
     #[test]
     fn disposable_policy_never_receives_persistent_lifecycle() {
-        let mut profile = fedora_lab();
+        let mut profile = legacy_runtime_fixture();
         profile.persistence = PersistencePolicy::Disposable;
         let plan = plan_instance(
             &hardware(16, 32),
@@ -1174,7 +1327,7 @@ mod tests {
 
     #[test]
     fn default_nat_and_isolated_are_typed_network_policies() {
-        let profile = fedora_lab();
+        let profile = legacy_runtime_fixture();
         assert_eq!(profile.network_policy, NetworkPolicy::DefaultNat);
 
         let mut isolated = profile;
@@ -1194,7 +1347,7 @@ mod tests {
 
     #[test]
     fn profile_instance_mismatch_is_typed_conflict() {
-        let profile = fedora_lab();
+        let profile = legacy_runtime_fixture();
         let error = plan_instance(
             &hardware(16, 32),
             &profile,
@@ -1218,7 +1371,7 @@ mod tests {
 
     #[test]
     fn fedora_create_plan_keeps_full_verified_nocloud_policy() {
-        let profile = fedora_lab();
+        let profile = legacy_runtime_fixture();
         let instance = plan_instance(
             &hardware(16, 32),
             &profile,
@@ -1247,7 +1400,7 @@ mod tests {
 
     #[test]
     fn manual_guest_has_no_seed_boot_or_guest_observations() {
-        let mut profile = fedora_lab();
+        let mut profile = legacy_runtime_fixture();
         profile.id = ProfileId::new("mock-manual").unwrap();
         profile.guest_family = GuestFamily::Debian;
         profile.provisioning = ProvisioningPolicy::None;
@@ -1278,7 +1431,7 @@ mod tests {
 
     #[test]
     fn create_refuses_seed_role_mismatch_and_incoherent_cloud_policy() {
-        let profile = fedora_lab();
+        let profile = legacy_runtime_fixture();
         let instance = plan_instance(
             &hardware(16, 32),
             &profile,
