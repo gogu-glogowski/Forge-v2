@@ -18,6 +18,10 @@ provisioning, or automatic guest personalization for these paths. V2.5 has no
 Disposable mode, GME, custom privileged broker, or helper service.
 
 For Fedora host prerequisites, see [docs/FEDORA_SETUP.md](docs/FEDORA_SETUP.md).
+For a simple first-use path, see
+[docs/FORGE_V2_5_QUICKSTART.md](docs/FORGE_V2_5_QUICKSTART.md). For detailed
+technical and operator guidance, see
+[docs/FORGE_V2_5_USER_GUIDE.md](docs/FORGE_V2_5_USER_GUIDE.md).
 
 ## Installation from source
 

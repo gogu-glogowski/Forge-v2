@@ -111,7 +111,7 @@ cd ~
 git clone https://github.com/gogu-glogowski/Forge-v2.git
 cd Forge-v2
 git fetch --all --tags
-git switch v2.5-dev
+git checkout v2.5.0
 ```
 
 Then perform the first clean-host build:
