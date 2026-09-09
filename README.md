@@ -26,13 +26,17 @@ technical and operator guidance, see
 ## Installation
 
 Forge V2.5.0 is available as a local-install RPM or from source. For the RPM
-path, build or download `forge-2.5.0-1.x86_64.rpm`, then install it by path:
+path, download `forge-2.5.0-1.x86_64.rpm` from the official
+[Forge V2.5.0 GitHub Release](https://github.com/gogu-glogowski/Forge-v2/releases/tag/v2.5.0),
+then install the downloaded file by path:
 
 ```bash
 sudo dnf install ./forge-2.5.0-1.x86_64.rpm
 forge --help
 forge doctor
 ```
+
+**RPM download:** [Forge V2.5.0 Release — `forge-2.5.0-1.x86_64.rpm`](https://github.com/gogu-glogowski/Forge-v2/releases/tag/v2.5.0)
 
 There is no Fedora or COPR repository yet, so `sudo dnf install forge` is not
 a supported installation command. See
@@ -59,7 +63,7 @@ forge doctor
 ```
 
 If `command -v forge` prints a path such as `~/.local/bin/forge`, the CLI is
-ready to use from any directory. Forge V2.5 does not provide an RPM/DNF package.
+ready to use from any directory.
 
 ## Everyday workflow
 
