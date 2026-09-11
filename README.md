@@ -1,16 +1,25 @@
 # Forge V2.5
 
-Forge is a Fedora-first Rust management layer for persistent KVM/QEMU/libvirt
-VMs. It keeps durable ownership of VM generations, verifies image provenance,
-checks backing chains, and fails closed when identity or destructive ownership
-cannot be proven exactly.
+Forge is a Rust management layer for persistent KVM/QEMU/libvirt VMs. It keeps
+durable ownership of VM generations, verifies image provenance, checks backing
+chains, and fails closed when identity or destructive ownership cannot be proven
+exactly.
 
-Forge V2.5 manages these supported primary paths:
+Forge V2.5 is usable for its supported VM workflows. Kali Lab and Whonix are the
+recommended primary paths for normal use.
+
+Supported profiles include:
 
 - Kali Lab
-- Fedora Workstation
 - Whonix Gateway
 - Whonix Workstation
+- Fedora Workstation (experimental / not recommended for normal use)
+
+> **Fedora Workstation note:** Fedora support is currently not recommended as a
+> normal end-user path. Forge can create and manage the VM, but guest-side setup
+> still requires manual configuration. If you choose to use Fedora Workstation,
+> expect to complete the required guest configuration yourself, including via
+> SSH where appropriate.
 
 The current desktop and security profiles are persistent `ManualGuest`s.
 Forge does not use guest-exec, SSH/QGA guest management, cloud-init
@@ -107,12 +116,18 @@ forge delete <instance>
 resources after durable-state, UUID, storage, and backing-chain validation.
 Trusted reusable bases are not disposable generation resources.
 
-## Fedora Workstation
+## Fedora Workstation (experimental)
 
-Fedora Workstation preparation is operator-assisted. Forge verifies the
-installation source, creates an exact temporary installer topology, and guides
-the operator through graphical Anaconda installation. After explicit graphical
-confirmation and promotion, the result is a protected canonical reusable base.
+Fedora Workstation support remains available, but it is currently not the
+recommended normal-use path. Preparation is operator-assisted and guest-side
+configuration remains manual. Users choosing this profile should be comfortable
+finishing configuration themselves, including connecting to the guest over SSH
+when needed.
+
+Forge verifies the installation source, creates an exact temporary installer
+topology, and guides the operator through graphical Anaconda installation. After
+explicit graphical confirmation and promotion, the result is a protected
+canonical reusable base.
 
 ```bash
 forge image fetch fedora-workstation
